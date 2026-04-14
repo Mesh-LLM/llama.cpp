@@ -274,6 +274,18 @@ task_params server_task::params_from_json_cmpl(
     params.t_max_predict_ms = json_value(data,       "t_max_predict_ms",   defaults.t_max_predict_ms);
     params.response_fields  = json_value(data,       "response_fields",    std::vector<std::string>());
 
+    // mesh hooks
+    params.mesh_hooks       = json_value(data,       "mesh_hooks",         params_base.mesh_port > 0);
+    params.mesh_port        = json_value(data,       "mesh_port",          params_base.mesh_port);
+    params.mesh_request_id  = json_value(data,       "mesh_request_id",    std::string());
+    // store conversation messages for hook payloads
+    if (data.contains("messages") && data["messages"].is_array()) {
+        params.mesh_n_turns = (int)data["messages"].size();
+        if (params.mesh_hooks) {
+            params.mesh_messages = data["messages"];
+        }
+    }
+
     params.sampling.top_k              = json_value(data, "top_k",               defaults.sampling.top_k);
     params.sampling.top_p              = json_value(data, "top_p",               defaults.sampling.top_p);
     params.sampling.min_p              = json_value(data, "min_p",               defaults.sampling.min_p);

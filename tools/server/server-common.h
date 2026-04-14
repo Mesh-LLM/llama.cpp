@@ -196,6 +196,9 @@ public:
 
     bool empty() const { return tokens.empty(); }
 
+    // true if the token sequence contains any media (images/audio)
+    bool has_media() const { return !map_idx_to_media.empty(); }
+
     void clear() {
         map_idx_to_media.clear();
         tokens.clear();
@@ -286,6 +289,7 @@ struct server_chat_params {
     common_chat_templates_ptr tmpls;
     bool allow_image;
     bool allow_audio;
+    bool mesh_hooks = false;  // when true, don't reject unsupported media — strip to text placeholder
     bool enable_thinking = true;
     int  reasoning_budget = -1;
     std::string reasoning_budget_message;

@@ -3009,6 +3009,20 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_ENDPOINT_SLOTS"));
     add_opt(common_arg(
+        {"--mesh-port"}, "PORT",
+        "port for mesh hook callbacks to mesh-llm (default: disabled)",
+        [](common_params & params, int value) {
+            params.mesh_port = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--mesh-hook-debug"},
+        "lower mesh hook thresholds so hooks fire on almost any request (for testing)",
+        [](common_params & params) {
+            params.mesh_hook_debug = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"--slot-save-path"}, "PATH",
         "path to save slot kv cache (default: disabled)",
         [](common_params & params, const std::string & value) {

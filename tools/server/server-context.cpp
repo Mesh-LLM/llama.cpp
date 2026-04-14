@@ -3,6 +3,7 @@
 #include "server-http.h"
 #include "server-task.h"
 #include "server-queue.h"
+#include "server-mesh-hook.h"
 
 #include "common.h"
 #include "llama.h"
@@ -100,6 +101,9 @@ struct server_slot {
     // state
     slot_state state = SLOT_STATE_IDLE;
 
+    // mesh hook context — callbacks to mesh-llm
+    mesh_hook_ctx mesh_hook;
+
     server_prompt prompt;
 
     void prompt_save(server_prompt_cache & prompt_cache) const {
@@ -194,6 +198,9 @@ struct server_slot {
 
         // clear alora start
         alora_invocation_start = -1;
+
+        // reset mesh hook state (keeps client/port, clears per-request state)
+        mesh_hook.reset();
     }
 
     void init_sampler() const {
@@ -799,6 +806,14 @@ private:
 
             SLT_INF(slot, "new slot, n_ctx = %d\n", slot.n_ctx);
 
+            // initialize mesh hooks if --mesh-port was set
+            if (params_base.mesh_port > 0) {
+                slot.mesh_hook.init(params_base.mesh_port, params_base.mesh_hook_debug);
+                SLT_INF(slot, "mesh hooks enabled, callback port = %d%s\n",
+                        params_base.mesh_port,
+                        params_base.mesh_hook_debug ? " (DEBUG: low thresholds)" : "");
+            }
+
             slot.callback_on_release = [this](int id_slot) {
                 queue_tasks.pop_deferred_task(id_slot);
             };
@@ -935,6 +950,7 @@ private:
                 /* tmpls                 */ std::move(chat_templates),
                 /* allow_image           */ mctx ? mtmd_support_vision(mctx) : false,
                 /* allow_audio           */ mctx ? mtmd_support_audio (mctx) : false,
+                /* mesh_hooks            */ params_base.mesh_port > 0,
                 /* enable_thinking       */ enable_thinking,
                 /* reasoning_budget      */ params_base.reasoning_budget,
                 /* reasoning_budget_msg  */ params_base.reasoning_budget_message,
@@ -1210,6 +1226,68 @@ private:
             SLT_INF(slot, "sampler chain: %s\n", common_sampler_print(slot.smpl.get()).c_str());
         } else {
             slot.smpl.reset();
+        }
+
+        // --- Mesh Hook 1: pre-inference ---
+        // Evaluate triggers and call mesh-llm before tokenization/prefill.
+        if (slot.mesh_hook.enabled && task.params.mesh_hooks) {
+            slot.mesh_hook.request_id = task.params.mesh_request_id.empty()
+                ? task.params.oaicompat_cmpl_id
+                : task.params.mesh_request_id;
+
+            // evaluate pre-inference triggers
+            // Check if messages contained images but model has no multimodal.
+            // When mesh_hooks strips images to "[image attached]", has_media() is false,
+            // so we check mesh_messages for mesh_image_url (preserved by the parser).
+            if (!task.tokens.has_mtmd) {
+                for (const auto & msg : task.params.mesh_messages) {
+                    if (!msg.contains("content") || !msg["content"].is_array()) continue;
+                    for (const auto & part : msg["content"]) {
+                        if (part.contains("mesh_image_url") || part.value("type", "") == "image_url") {
+                            slot.mesh_hook.has_images_no_multimodal = true;
+                            break;
+                        }
+                    }
+                    if (slot.mesh_hook.has_images_no_multimodal) break;
+                }
+            }
+
+            // TODO: wire has_audio_no_support when audio input lands
+
+            // fire if any trigger matched
+            if (slot.mesh_hook.any_pre_inference_trigger()) {
+                json payload = {
+                    {"hook",               "pre_inference"},
+                    {"trigger",            slot.mesh_hook.first_trigger_name()},
+                    {"request_id",         slot.mesh_hook.request_id},
+                    {"model",              task.params.oaicompat_model},
+                    {"n_prompt_tokens",    task.n_tokens()},
+                    {"n_ctx",              slot.n_ctx},
+                    {"messages",           task.params.mesh_messages},
+                };
+
+                SLT_INF(slot, "mesh hook 1: pre_inference, trigger = %s\n",
+                        slot.mesh_hook.first_trigger_name().c_str());
+
+                auto resp = slot.mesh_hook.call_hook(payload);
+                auto inject_text = slot.mesh_hook.process_response(resp);
+
+                SLT_DBG(slot, "mesh hook 1: response action=%s entropy_threshold=%.2f\n",
+                        resp.value("action", "none").c_str(),
+                        slot.mesh_hook.entropy_threshold);
+
+                if (!inject_text.empty()) {
+                    // Tokenize the inject text and append to prompt tokens.
+                    // This inserts context just before generation begins —
+                    // like an invisible system note the model sees as part of the conversation.
+                    llama_tokens inject_tokens = common_tokenize(ctx, inject_text, false);
+                    if (!inject_tokens.empty() && !task.tokens.has_mtmd) {
+                        SLT_INF(slot, "mesh hook 1: injecting %zu tokens (%zu chars) into prompt\n",
+                                inject_tokens.size(), inject_text.size());
+                        task.tokens.insert(inject_tokens);
+                    }
+                }
+            }
         }
 
         slot.task = std::make_unique<const server_task>(std::move(task));
@@ -2853,6 +2931,109 @@ private:
                     // prompt evaluated for next-token prediction
                     slot.state = SLOT_STATE_GENERATING;
 
+                    // --- Mesh Hook 2: post-prefill ---
+                    // Check first-token entropy/margin, call mesh-llm if uncertain.
+                    if (slot.mesh_hook.enabled && slot.mesh_hook.entropy_threshold >= 0) {
+                        auto probs = get_token_probabilities(ctx, slot.i_batch - i);
+                        float entropy = mesh_compute_entropy(probs);
+                        float margin  = probs.size() >= 2 ? probs[0].p - probs[1].p : 1.0f;
+
+                        SLT_DBG(slot, "mesh hook 2: check entropy=%.2f threshold=%.2f margin=%.3f\n",
+                                entropy, slot.mesh_hook.entropy_threshold, margin);
+
+                        if (slot.mesh_hook.debug || entropy > slot.mesh_hook.entropy_threshold || margin < 0.05f) {
+                            // build top tokens list
+                            json top_tokens = json::array();
+                            for (int t = 0; t < std::min((int)probs.size(), 5); t++) {
+                                top_tokens.push_back({
+                                    {"text", common_token_to_piece(ctx, probs[t].id, false)},
+                                    {"prob", probs[t].p},
+                                });
+                            }
+
+                            json payload = {
+                                {"hook",            "post_prefill"},
+                                {"trigger",         entropy > slot.mesh_hook.entropy_threshold ? "high_entropy" : "low_margin"},
+                                {"request_id",      slot.mesh_hook.request_id},
+                                {"model",           slot.task->params.oaicompat_model},
+                                {"n_prompt_tokens",  slot.prompt.n_tokens()},
+                                {"messages",        slot.task->params.mesh_messages},
+                                {"signals", {
+                                    {"first_token_entropy", entropy},
+                                    {"first_token_margin",  margin},
+                                    {"top_tokens",          top_tokens},
+                                }},
+                            };
+
+                            SLT_INF(slot, "mesh hook 2: post_prefill, entropy = %.2f, margin = %.3f\n", entropy, margin);
+
+                            auto resp = slot.mesh_hook.call_hook(payload);
+                            auto inject_text = slot.mesh_hook.process_response(resp);
+
+                            if (!inject_text.empty()) {
+                                // Tokenize the inject text and decode it into the KV cache.
+                                // After this, the model has "seen" the injected context and
+                                // will generate from a different (hopefully more confident) state.
+                                //
+                                // We use a temporary batch so the main batch iteration is not
+                                // disturbed. After decoding, the KV cache is extended for this
+                                // slot's sequence, and ctx holds logits from the last inject token.
+                                llama_tokens inject_toks = common_tokenize(ctx, inject_text, false);
+                                if (!inject_toks.empty()) {
+                                    SLT_INF(slot, "mesh hook 2: injecting %zu tokens (%zu chars) into KV cache\n",
+                                            inject_toks.size(), inject_text.size());
+
+                                    const int32_t n_batch_inject = llama_n_batch(ctx);
+                                    llama_batch batch_inject = llama_batch_init(n_batch_inject, 0, 1);
+                                    int last_logit_idx = 0;
+                                    bool decode_ok = true;
+
+                                    // Process inject tokens in chunks, same as normal prefill.
+                                    // Only the last token needs logits (for sampling the first generated token).
+                                    for (size_t j = 0; j < inject_toks.size(); j++) {
+                                        bool need_logits = (j == inject_toks.size() - 1);
+                                        common_batch_add(batch_inject, inject_toks[j],
+                                                         slot.prompt.tokens.pos_next(), { slot.id }, need_logits);
+                                        slot.prompt.tokens.push_back(inject_toks[j]);
+
+                                        // Decode when batch is full or on the last token.
+                                        if (batch_inject.n_tokens >= n_batch_inject || j == inject_toks.size() - 1) {
+                                            if (need_logits) {
+                                                // The last token is in this chunk — remember its
+                                                // position within the batch for sampling below.
+                                                last_logit_idx = batch_inject.n_tokens - 1;
+                                            }
+                                            int ret = llama_decode(ctx, batch_inject);
+                                            if (ret != 0) {
+                                                SLT_ERR(slot, "mesh hook 2: llama_decode failed (%d), aborting injection\n", ret);
+                                                decode_ok = false;
+                                                break;
+                                            }
+                                            common_batch_clear(batch_inject);
+                                        }
+                                    }
+
+                                    llama_batch_free(batch_inject);
+
+                                    if (decode_ok) {
+                                        // After decoding the inject batch, ctx holds logits from
+                                        // that batch — not from the original prefill batch. We
+                                        // set i_batch so that tok_idx (= i_batch - i) equals
+                                        // last_logit_idx, which is where the last inject token's
+                                        // logits are in the context.
+                                        slot.i_batch = i + last_logit_idx;
+
+                                        // Reset signal window — fresh start after injection.
+                                        slot.mesh_hook.signals.reset();
+
+                                        SLT_INF(slot, "mesh hook 2: injection complete, prompt now %d tokens\n",
+                                                slot.prompt.n_tokens());
+                                    }
+                                }
+                            }
+                        }
+                    }
+
                     if (slot.can_speculate()) {
                         common_speculative_begin(slot.spec, slot.prompt.tokens.get_text_tokens());
                     }
@@ -2871,6 +3052,96 @@ private:
                 slot.i_batch = -1;
 
                 common_sampler_accept(slot.smpl.get(), id, true);
+
+                // --- Mesh: update signal window ---
+                if (slot.mesh_hook.enabled) {
+                    // Per-token entropy + margin — cheap arithmetic, ~1μs.
+                    // Accumulated here, sent to mesh-llm at Hook 3.
+                    auto probs = get_token_probabilities(ctx, tok_idx);
+                    float entropy = mesh_compute_entropy(probs);
+                    float margin  = probs.size() >= 2 ? probs[0].p - probs[1].p : 1.0f;
+                    slot.mesh_hook.signals.push(entropy, margin);
+
+                    // Find chosen token's probability for surprise tracking
+                    float p_chosen = 0.0f;
+                    for (const auto & p : probs) {
+                        if (p.id == id) { p_chosen = p.p; break; }
+                    }
+                    slot.mesh_hook.signals.push_token(id, p_chosen);
+
+                    // --- Mesh Hook 2b: mid-generation ---
+                    // Three independent triggers: entropy spike, repetition loop, surprise break.
+                    // Cooldown prevents spamming (min 32 tokens between fires, 8 in debug).
+                    if (slot.mesh_hook.should_fire_midgen()) {
+                        std::string trigger = slot.mesh_hook.midgen_trigger_name();
+                        slot.mesh_hook.last_midgen_token = slot.mesh_hook.signals.count;
+
+                        json midgen_payload = {
+                            {"hook",            "mid_generation"},
+                            {"trigger",         trigger},
+                            {"request_id",      slot.mesh_hook.request_id},
+                            {"model",           slot.task->params.oaicompat_model},
+                            {"generated_text",  slot.generated_text},
+                            {"n_decoded",       slot.n_decoded},
+                            {"messages",        slot.task->params.mesh_messages},
+                            {"signals",         slot.mesh_hook.signals.to_json()},
+                        };
+
+                        SLT_INF(slot, "mesh hook 2b: %s, n_decoded=%d tail_entropy=%.2f rep=%.2f\n",
+                                trigger.c_str(), slot.n_decoded,
+                                slot.mesh_hook.signals.tail_entropy_mean(),
+                                slot.mesh_hook.signals.repetition_ratio());
+
+                        auto resp = slot.mesh_hook.call_hook(midgen_payload);
+                        auto inject_text = slot.mesh_hook.process_response(resp);
+
+                        if (!inject_text.empty()) {
+                            // Same KV injection as Hook 2: tokenize, decode into KV via temp batch.
+                            // Model continues generating but now "remembers" the injected context.
+                            llama_tokens inject_toks = common_tokenize(ctx, inject_text, false);
+                            if (!inject_toks.empty()) {
+                                SLT_INF(slot, "mesh hook 2b: injecting %zu tokens into KV cache mid-generation\n",
+                                        inject_toks.size());
+
+                                const int32_t n_batch_inject = llama_n_batch(ctx);
+                                llama_batch batch_inject = llama_batch_init(n_batch_inject, 0, 1);
+                                int last_logit_idx = 0;
+                                bool decode_ok = true;
+
+                                for (size_t j = 0; j < inject_toks.size(); j++) {
+                                    bool need_logits = (j == inject_toks.size() - 1);
+                                    common_batch_add(batch_inject, inject_toks[j],
+                                                     slot.prompt.tokens.pos_next(), { slot.id }, need_logits);
+                                    slot.prompt.tokens.push_back(inject_toks[j]);
+
+                                    if (batch_inject.n_tokens >= n_batch_inject || j == inject_toks.size() - 1) {
+                                        if (need_logits) {
+                                            last_logit_idx = batch_inject.n_tokens - 1;
+                                        }
+                                        int ret = llama_decode(ctx, batch_inject);
+                                        if (ret != 0) {
+                                            SLT_ERR(slot, "mesh hook 2b: llama_decode failed (%d)\n", ret);
+                                            decode_ok = false;
+                                            break;
+                                        }
+                                        common_batch_clear(batch_inject);
+                                    }
+                                }
+
+                                llama_batch_free(batch_inject);
+
+                                if (decode_ok) {
+                                    // After injection, we need to resample from the new state.
+                                    // The next iteration of the generation loop will decode the
+                                    // next token using the extended KV cache.
+                                    slot.mesh_hook.signals.reset();
+                                    SLT_INF(slot, "mesh hook 2b: injection complete, prompt now %d tokens\n",
+                                            slot.prompt.n_tokens());
+                                }
+                            }
+                        }
+                    }
+                }
 
                 // here we have synchronized the llama_context (due to the sampling above), so we can do time measurement
                 const int64_t t_current = ggml_time_us();

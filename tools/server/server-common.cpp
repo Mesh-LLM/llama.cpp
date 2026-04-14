@@ -968,6 +968,18 @@ json oaicompat_chat_params_parse(
             std::string type      = json_value(p, "type", std::string());
             if (type == "image_url") {
                 if (!opt.allow_image) {
+                    if (opt.mesh_hooks) {
+                        // Mesh hooks enabled: strip image to text placeholder so the
+                        // request can proceed. Hook 1 will detect the original image
+                        // in mesh_messages and consult a vision peer for a caption.
+                        // Keep original image_url under mesh_image_url so hook payload
+                        // has the data URL for forwarding to a vision peer.
+                        p["mesh_image_url"] = p["image_url"];
+                        p["type"] = "text";
+                        p["text"] = "[image attached]";
+                        p.erase("image_url");
+                        continue;
+                    }
                     throw std::runtime_error("image input is not supported - hint: if this is unexpected, you may need to provide the mmproj");
                 }
 
@@ -980,6 +992,12 @@ json oaicompat_chat_params_parse(
 
             } else if (type == "input_audio") {
                 if (!opt.allow_audio) {
+                    if (opt.mesh_hooks) {
+                        p["type"] = "text";
+                        p["text"] = "[audio attached]";
+                        p.erase("input_audio");
+                        continue;
+                    }
                     throw std::runtime_error("audio input is not supported - hint: if this is unexpected, you may need to provide the mmproj");
                 }
 

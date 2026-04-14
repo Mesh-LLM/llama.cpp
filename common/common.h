@@ -613,6 +613,10 @@ struct common_params {
     bool webui_mcp_proxy = false;
     std::string webui_config_json;
 
+    // mesh hook callback port (0 = disabled)
+    int32_t mesh_port = 0;
+    bool    mesh_hook_debug = false;
+
     // "advanced" endpoints are disabled by default for better security
     bool endpoint_slots   = true;
     bool endpoint_props   = false; // only control POST requests, not GET
