@@ -274,8 +274,8 @@ task_params server_task::params_from_json_cmpl(
     params.t_max_predict_ms = json_value(data,       "t_max_predict_ms",   defaults.t_max_predict_ms);
     params.response_fields  = json_value(data,       "response_fields",    std::vector<std::string>());
 
-    // mesh hooks
-    params.mesh_hooks       = json_value(data,       "mesh_hooks",         params_base.mesh_port > 0);
+    // mesh hooks — default OFF; proxy injects mesh_hooks:true only for model=mesh
+    params.mesh_hooks       = json_value(data,       "mesh_hooks",         false);
     params.mesh_port        = json_value(data,       "mesh_port",          params_base.mesh_port);
     params.mesh_request_id  = json_value(data,       "mesh_request_id",    std::string());
     // store conversation messages for hook payloads
