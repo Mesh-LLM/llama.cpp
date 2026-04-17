@@ -469,6 +469,11 @@ static void write_group(
     auto * ctx_out = gguf_init_empty();
     gguf_set_kv(ctx_out, ctx_in);
 
+    // MoE split outputs are standalone derived GGUFs, not members of the
+    // original upstream split set.
+    gguf_remove_key(ctx_out, "split.no");
+    gguf_remove_key(ctx_out, "split.count");
+    gguf_remove_key(ctx_out, "split.tensors.count");
     // Find architecture
     int arch_key = gguf_find_key(ctx_in, "general.architecture");
     std::string arch_name;
