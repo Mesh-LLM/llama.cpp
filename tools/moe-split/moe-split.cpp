@@ -496,12 +496,13 @@ static void write_group(
         }
     }
 
-    // Create ggml context for ALL tensors (trunk + experts).
-    // Previously used n_expert_tensors which underallocated for models where the
-    // total tensor count far exceeds the expert tensor count (e.g. GLM-5.1 has
-    // 1809 total tensors but only ~237 expert tensors), causing SIGABRT at the
-    // last block when the context overflows.
-    size_t ctx_size = (size_t)(n_tensors + 64) * ggml_tensor_overhead() + 4096;
+    // Create ggml context for ALL tensors (trunk + experts) across every input
+    // shard. The multi-shard path no longer has a single ctx_in tensor count.
+    int n_tensors_total = 0;
+    for (const auto & input_shard : input_shards) {
+        n_tensors_total += gguf_get_n_tensors(input_shard.ctx_gguf);
+    }
+    size_t ctx_size = (size_t)(n_tensors_total + 64) * ggml_tensor_overhead() + 4096;
     struct ggml_init_params ctx_params = {
         /*.mem_size   =*/ ctx_size,
         /*.mem_buffer =*/ nullptr,
