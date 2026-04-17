@@ -212,7 +212,8 @@ static void parse_args(int argc, const char ** argv, moe_split_params & params) 
 static bool is_expert_tensor(const char * name) {
     return strstr(name, "ffn_gate_exps") != nullptr
         || strstr(name, "ffn_up_exps")   != nullptr
-        || strstr(name, "ffn_down_exps") != nullptr;
+        || strstr(name, "ffn_down_exps") != nullptr
+        || strstr(name, "exp_probs_b")   != nullptr;
 }
 
 // Check if tensor is a shared-expert tensor (trunk, not sliced)
