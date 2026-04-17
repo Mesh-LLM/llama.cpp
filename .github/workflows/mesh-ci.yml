@@ -1,0 +1,71 @@
+name: mesh-ci
+
+# Minimal build check for the Mesh-LLM/llama.cpp fork.
+#
+# Why this exists:
+# Upstream's build.yml is large and has path filters that can skip entire
+# matrix legs for small changes. That let a bad merge (de21992e6 → e88186e78)
+# ship a moe-split.cpp that didn't compile, because no build lane actually
+# ran for the commit that merged it.
+#
+# This workflow runs on every push and every PR, with no path filter, and
+# builds the exact set of binaries mesh-llm consumes, using the same cmake
+# flags mesh-llm uses. If the fork breaks for mesh-llm's use case, this
+# catches it here rather than downstream.
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
+
+concurrency:
+  group: mesh-ci-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-linux-cpu:
+    name: Build (Linux CPU + RPC)
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: ccache
+        uses: ggml-org/ccache-action@v1.2.21
+        with:
+          key: mesh-ci-linux-cpu
+          evict-old-files: 7d
+          save: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake git
+
+      - name: Configure
+        run: |
+          cmake -B build -S . \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DGGML_METAL=OFF \
+            -DGGML_CUDA=OFF \
+            -DGGML_NATIVE=OFF \
+            -DGGML_RPC=ON \
+            -DBUILD_SHARED_LIBS=OFF \
+            -DLLAMA_OPENSSL=OFF \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+
+      - name: Build mesh-llm targets
+        run: |
+          cmake --build build --config Release -j"$(nproc)" \
+            --target rpc-server llama-server llama-moe-analyze llama-moe-split
+
+      - name: Verify binaries exist
+        run: |
+          set -e
+          for bin in rpc-server llama-server llama-moe-analyze llama-moe-split; do
+            test -x "build/bin/$bin" && echo "ok: $bin"
+          done
