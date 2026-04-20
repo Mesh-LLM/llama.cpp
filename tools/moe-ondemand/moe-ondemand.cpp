@@ -1,4 +1,5 @@
 #include "arg.h"
+#include "chat.h"
 #include "common.h"
 #include "ggml.h"
 #include "gguf.h"
@@ -75,6 +76,8 @@ struct callback_data {
     manual_model_source * source = nullptr;
     std::set<int> step_selected;
     std::set<int> step_newly_fetched;
+    std::map<int, std::set<int>> step_selected_by_layer;
+    std::map<int, std::set<int>> step_newly_fetched_by_layer;
 };
 
 struct tensor_region {
@@ -83,12 +86,19 @@ struct tensor_region {
     size_t bytes = 0;
 };
 
+struct layer_step_metrics {
+    int layer_id = -1;
+    std::vector<int> selected_experts;
+    std::vector<int> newly_fetched_experts;
+};
+
 struct step_metrics {
     std::string phase;
     int token_index = -1;
     double elapsed_s = 0.0;
     std::vector<int> selected_experts;
     std::vector<int> newly_fetched_experts;
+    std::vector<layer_step_metrics> layers;
     uint64_t resident_expert_bytes_before_eviction = 0;
     uint64_t resident_expert_bytes_after_eviction = 0;
 };
@@ -191,6 +201,28 @@ static uint8_t * allocate_host_backing(size_t size, size_t * alloc_size_out) {
     *alloc_size_out = size;
     return reinterpret_cast<uint8_t *>(ptr);
 #endif
+}
+
+static std::pair<std::string, bool> build_generation_prompt(
+        const llama_model * model,
+        const std::string & raw_prompt) {
+    auto chat_templates = common_chat_templates_init(model, "");
+    if (!chat_templates || !common_chat_templates_was_explicit(chat_templates.get())) {
+        return { raw_prompt, false };
+    }
+
+    common_chat_msg user_msg;
+    user_msg.role = "user";
+    user_msg.content = raw_prompt;
+
+    common_chat_templates_inputs inputs;
+    inputs.messages = { std::move(user_msg) };
+    inputs.use_jinja = true;
+    inputs.add_generation_prompt = true;
+    inputs.reasoning_format = COMMON_REASONING_FORMAT_NONE;
+    inputs.enable_thinking = false;
+
+    return { common_chat_templates_apply(chat_templates.get(), inputs).prompt, true };
 }
 
 static void free_host_backing(uint8_t * ptr, size_t alloc_size) {
@@ -389,6 +421,7 @@ static bool moe_callback(struct ggml_tensor * t, bool ask, void * user_data) {
         for (int i = 0; i < std::min(cb->top_k, n_expert); ++i) {
             int expert_id = ids[i];
             cb->step_selected.insert(expert_id);
+            cb->step_selected_by_layer[layer_id].insert(expert_id);
             if (cb->hot_experts && cb->hot_experts->count(expert_id) > 0) {
                 continue;
             }
@@ -402,6 +435,7 @@ static bool moe_callback(struct ggml_tensor * t, bool ask, void * user_data) {
                 cb->resident_cold->insert(expert_id);
             }
             cb->step_newly_fetched.insert(expert_id);
+            cb->step_newly_fetched_by_layer[layer_id].insert(expert_id);
         }
     }
     return true;
@@ -1077,6 +1111,33 @@ static void write_result_json(
             out << step.newly_fetched_experts[j];
         }
         out << "],\n";
+        out << "      \"layers\": [";
+        if (!step.layers.empty()) {
+            out << "\n";
+            for (size_t j = 0; j < step.layers.size(); ++j) {
+                const auto & layer = step.layers[j];
+                out << "        {\n";
+                out << "          \"layer_id\": " << layer.layer_id << ",\n";
+                out << "          \"selected_experts\": [";
+                for (size_t k = 0; k < layer.selected_experts.size(); ++k) {
+                    if (k > 0) out << ", ";
+                    out << layer.selected_experts[k];
+                }
+                out << "],\n";
+                out << "          \"newly_fetched_experts\": [";
+                for (size_t k = 0; k < layer.newly_fetched_experts.size(); ++k) {
+                    if (k > 0) out << ", ";
+                    out << layer.newly_fetched_experts[k];
+                }
+                out << "]\n";
+                out << "        }";
+                if (j + 1 < step.layers.size()) out << ",";
+                out << "\n";
+            }
+            out << "      ],\n";
+        } else {
+            out << "],\n";
+        }
         out << "      \"resident_expert_bytes_before_eviction\": " << step.resident_expert_bytes_before_eviction << ",\n";
         out << "      \"resident_expert_bytes_after_eviction\": " << step.resident_expert_bytes_after_eviction << "\n";
         out << "    }";
@@ -1221,7 +1282,12 @@ int main(int argc, char ** argv) {
 
     apply_hot_cold_state(ranges, hot_experts, n_expert);
 
-    std::vector<llama_token> prompt_tokens = common_tokenize(ctx, params.prompt, add_bos);
+    auto [generation_prompt, used_chat_template] = build_generation_prompt(model, params.prompt);
+    std::vector<llama_token> prompt_tokens = common_tokenize(
+        ctx,
+        generation_prompt,
+        used_chat_template ? true : add_bos,
+        true);
 
     experiment_stats stats;
     stats.hot_expert_count = hot_expert_count;
@@ -1244,6 +1310,16 @@ int main(int argc, char ** argv) {
         step.token_index = token_index;
         step.elapsed_s = elapsed_s;
         step.selected_experts.assign(cb_data.step_selected.begin(), cb_data.step_selected.end());
+        for (const auto & item : cb_data.step_selected_by_layer) {
+            layer_step_metrics layer;
+            layer.layer_id = item.first;
+            layer.selected_experts.assign(item.second.begin(), item.second.end());
+            auto fetched_it = cb_data.step_newly_fetched_by_layer.find(item.first);
+            if (fetched_it != cb_data.step_newly_fetched_by_layer.end()) {
+                layer.newly_fetched_experts.assign(fetched_it->second.begin(), fetched_it->second.end());
+            }
+            step.layers.push_back(std::move(layer));
+        }
         step.resident_expert_bytes_before_eviction = resident_bytes_for_expert_regions(expert_regions);
 
         std::vector<int> accessed_cold;
@@ -1302,6 +1378,8 @@ int main(int argc, char ** argv) {
 
     cb_data.step_selected.clear();
     cb_data.step_newly_fetched.clear();
+    cb_data.step_selected_by_layer.clear();
+    cb_data.step_newly_fetched_by_layer.clear();
     cb_data.collect = true;
     double t0 = ggml_time_us() / 1e6;
     if (llama_decode(ctx, llama_batch_get_one(prompt_tokens.data(), prompt_tokens.size()))) {
@@ -1327,6 +1405,8 @@ int main(int argc, char ** argv) {
         resident_cold.clear();
         cb_data.step_selected.clear();
         cb_data.step_newly_fetched.clear();
+        cb_data.step_selected_by_layer.clear();
+        cb_data.step_newly_fetched_by_layer.clear();
 
         stats.generated_tokens = 0;
         stats.cold_activation_count = 0;
@@ -1398,6 +1478,8 @@ int main(int argc, char ** argv) {
 
         cb_data.step_selected.clear();
         cb_data.step_newly_fetched.clear();
+        cb_data.step_selected_by_layer.clear();
+        cb_data.step_newly_fetched_by_layer.clear();
         double step_t0 = ggml_time_us() / 1e6;
         if (llama_decode(ctx, llama_batch_get_one(&next, 1))) {
             LOG_ERR("decode failed at token %d\n", i);
