@@ -964,6 +964,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     samplers         (params.samplers),
     il_start         (params.il_start),
     il_end           (params.il_end),
+    il_skip_stride   (params.il_skip_stride),
     cb_func          (params.cb),
     res              (params.res),
     ctx0             (res->get_ctx()),

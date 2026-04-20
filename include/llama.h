@@ -1014,6 +1014,9 @@ extern "C" {
     // Restrict execution to a half-open layer range [il_start, il_end).
     // Use (-1, -1) to restore full-model execution.
     LLAMA_API void llama_set_compute_range(struct llama_context * ctx, int32_t il_start, int32_t il_end);
+    // Execute only every Nth layer inside the compute range.
+    // Use <= 1 to execute all layers.
+    LLAMA_API void llama_set_compute_skip_stride(struct llama_context * ctx, int32_t stride);
 
     // Set whether the model is in warmup mode or not
     // If true, all model tensors are activated during llama_decode() to load and cache their weights.

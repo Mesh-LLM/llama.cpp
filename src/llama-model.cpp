@@ -693,6 +693,10 @@ void llama_model::load_arch(llama_model_loader & ml) {
 
 void llama_model::load_hparams(llama_model_loader & ml) {
     const gguf_context * ctx = ml.metadata;
+    if (ml.has_layer_shard()) {
+        layer_shard_start = ml.layer_shard_start;
+        layer_shard_end   = ml.layer_shard_end;
+    }
 
     // get metadata as string
     for (int i = 0; i < gguf_get_n_kv(ctx); i++) {
@@ -3066,6 +3070,8 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
         const int64_t n_expert      = hparams.n_expert;
         const int64_t n_expert_used = hparams.n_expert_used;
         const int64_t n_ctx_train   = hparams.n_ctx_train;
+        const bool layer_shard_active = ml.has_layer_shard();
+        const bool layer_shard_is_last = ml.layer_shard_is_last(n_layer);
 
         if (n_expert > 0 && hparams.n_expert_used == 0) {
             throw std::runtime_error("model has expert layers but no expert layers are used");
@@ -7720,11 +7726,11 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                     tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, 0);
 
                     // output
-                    output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), { n_embd }, 0);
+                    output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), { n_embd }, layer_shard_active && !layer_shard_is_last ? TENSOR_NOT_REQUIRED : 0);
                     output = create_tensor(tn(LLM_TENSOR_OUTPUT, "weight"), { n_embd, n_vocab }, TENSOR_NOT_REQUIRED);
 
                     // if output is NULL, init from the input tok embed
-                    if (output == NULL) {
+                    if (output == NULL && (!layer_shard_active || layer_shard_is_last)) {
                         output = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, TENSOR_DUPLICATED);
                     }
 
@@ -7787,11 +7793,11 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                     tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, 0);
 
                     // output
-                    output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), { n_embd }, 0);
+                    output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), { n_embd }, layer_shard_active && !layer_shard_is_last ? TENSOR_NOT_REQUIRED : 0);
                     output = create_tensor(tn(LLM_TENSOR_OUTPUT, "weight"), { n_embd, n_vocab }, TENSOR_NOT_REQUIRED);
 
                     // if output is NULL, init from the input tok embed
-                    if (output == NULL) {
+                    if (output == NULL && (!layer_shard_active || layer_shard_is_last)) {
                         output = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, TENSOR_DUPLICATED);
                     }
 

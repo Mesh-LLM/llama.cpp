@@ -31,6 +31,13 @@ llm_build_qwen35moe::llm_build_qwen35moe(const llama_model & model, const llm_gr
     ggml_tensor * inp_out_ids = build_inp_out_ids();
 
     for (int il = layer_start; il < layer_end; ++il) {
+        if (il_skip_stride > 1 && il != layer_end - 1) {
+            const int rel = il - layer_start;
+            if (rel % il_skip_stride != 0) {
+                continue;
+            }
+        }
+
         ggml_tensor * inpSA = inpL;
 
         cur = build_norm(inpL, model.layers[il].attn_norm, nullptr, LLM_NORM_RMS, il);

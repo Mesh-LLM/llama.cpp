@@ -105,6 +105,7 @@ struct llama_context {
     void set_causal_attn(bool value);
     void set_warmup(bool value);
     void set_compute_range(int32_t il_start, int32_t il_end);
+    void set_compute_skip_stride(int32_t stride);
 
     void set_adapters_lora(llama_adapter_lora ** adapters, size_t n_adapters, float * scales);
 
@@ -297,6 +298,7 @@ private:
 
     int32_t compute_il_start = -1;
     int32_t compute_il_end   = -1;
+    int32_t compute_skip_stride = 1;
 
     // sequence embeddings output (map of [n_embd] vectors)
     // populated only when pooling_type != LLAMA_POOLING_TYPE_NONE

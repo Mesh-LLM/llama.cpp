@@ -165,6 +165,13 @@ llama_context::llama_context(
     cparams.op_offload = params.op_offload;
     cparams.kv_unified = params.kv_unified;
 
+    if (model.has_layer_shard()) {
+        compute_il_start = model.layer_shard_start;
+        compute_il_end   = model.layer_shard_end;
+        LLAMA_LOG_INFO("%s: default compute range from model shard = [%d, %d)\n",
+                __func__, compute_il_start, compute_il_end);
+    }
+
     // initialized later
     cparams.pipeline_parallel = false;
 
@@ -1074,6 +1081,20 @@ void llama_context::set_compute_range(int32_t il_start, int32_t il_end) {
 
     compute_il_start = il_start;
     compute_il_end   = il_end;
+
+    sched_need_reserve = true;
+    gf_res_prev->reset();
+}
+
+void llama_context::set_compute_skip_stride(int32_t stride) {
+    stride = stride <= 1 ? 1 : stride;
+    LLAMA_LOG_DEBUG("%s: stride = %d\n", __func__, stride);
+
+    if (compute_skip_stride == stride) {
+        return;
+    }
+
+    compute_skip_stride = stride;
 
     sched_need_reserve = true;
     gf_res_prev->reset();
@@ -2179,6 +2200,7 @@ llm_graph_params llama_context::graph_params(
         /*.samplers    =*/ sampling.samplers,
         /*.il_start    =*/ compute_il_start,
         /*.il_end      =*/ compute_il_end,
+        /*.il_skip_stride =*/ compute_skip_stride,
         /*.n_outputs   =*/ n_outputs,
         /*.cb          =*/ graph_get_cb(),
         /*.res         =*/ res,
@@ -3109,6 +3131,10 @@ void llama_set_causal_attn(llama_context * ctx, bool causal_attn) {
 
 void llama_set_compute_range(llama_context * ctx, int32_t il_start, int32_t il_end) {
     ctx->set_compute_range(il_start, il_end);
+}
+
+void llama_set_compute_skip_stride(llama_context * ctx, int32_t stride) {
+    ctx->set_compute_skip_stride(stride);
 }
 
 void llama_set_warmup(llama_context * ctx, bool warmup) {

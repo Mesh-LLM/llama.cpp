@@ -79,6 +79,9 @@ struct llama_model_loader {
     bool use_direct_io = false;
     bool check_tensors;
     bool no_alloc;
+    bool layer_shard_active = false;
+    int32_t layer_shard_start = -1;
+    int32_t layer_shard_end   = -1;
 
     llama_files files;
     llama_ftype ftype;
@@ -167,6 +170,18 @@ struct llama_model_loader {
     std::string get_arch_name() const;
 
     enum llm_arch get_arch() const;
+
+    bool has_layer_shard() const {
+        return layer_shard_active;
+    }
+
+    bool layer_in_shard(int32_t il) const {
+        return !layer_shard_active || (il >= layer_shard_start && il < layer_shard_end);
+    }
+
+    bool layer_shard_is_last(int32_t n_layer) const {
+        return layer_shard_active && layer_shard_end >= n_layer;
+    }
 
     const llama_tensor_weight * get_weight(const char * name) const;
 
