@@ -694,6 +694,7 @@ llama_model_loader::llama_model_loader(
     } else {
         get_key(llm_kv(LLM_KV_GENERAL_ARCHITECTURE), arch_name, false);
         llm_kv = LLM_KV(llm_arch_from_string(arch_name));
+        n_tensors = gguf_get_n_tensors(metadata);
     }
 
     n_kv      = gguf_get_n_kv(metadata);
@@ -1216,9 +1217,13 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         }
         ggml_type type = GGML_TYPE_F32;
         const int64_t tid = gguf_find_tensor(metadata, tn.str().c_str());
-        if (tid != -1) {
-            type = gguf_get_tensor_type(metadata, tid);
+        if (tid == -1) {
+            if (flags & TENSOR_NOT_REQUIRED) {
+                return nullptr;
+            }
+            throw std::runtime_error(format("missing tensor '%s'", tn.str().c_str()));
         }
+        type = gguf_get_tensor_type(metadata, tid);
 
         // for tensors that are not required some of the dimensions can be invalid:
         if (flags & TENSOR_NOT_REQUIRED) {
