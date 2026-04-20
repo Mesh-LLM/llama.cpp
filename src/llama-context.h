@@ -104,6 +104,7 @@ struct llama_context {
     void set_embeddings (bool value);
     void set_causal_attn(bool value);
     void set_warmup(bool value);
+    void set_compute_range(int32_t il_start, int32_t il_end);
 
     void set_adapters_lora(llama_adapter_lora ** adapters, size_t n_adapters, float * scales);
 
@@ -140,6 +141,9 @@ struct llama_context {
     size_t state_seq_get_size(llama_seq_id seq_id, llama_state_seq_flags flags);
     size_t state_seq_get_data(llama_seq_id seq_id,       uint8_t * dst, size_t size, llama_state_seq_flags flags);
     size_t state_seq_set_data(llama_seq_id seq_id, const uint8_t * src, size_t size, llama_state_seq_flags flags);
+    size_t state_seq_get_size_range(llama_seq_id seq_id, llama_state_seq_flags flags, int32_t il_start, int32_t il_end);
+    size_t state_seq_get_data_range(llama_seq_id seq_id, uint8_t * dst, size_t size, llama_state_seq_flags flags, int32_t il_start, int32_t il_end);
+    size_t state_seq_set_data_range(llama_seq_id seq_id, const uint8_t * src, size_t size, llama_state_seq_flags flags, int32_t il_start, int32_t il_end);
 
     bool state_load_file(
             const char * filepath,
@@ -247,8 +251,8 @@ private:
     size_t state_write_data(llama_io_write_i & io);
     size_t state_read_data (llama_io_read_i  & io);
 
-    size_t state_seq_write_data(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags);
-    size_t state_seq_read_data (llama_io_read_i  & io, llama_seq_id seq_id, llama_state_seq_flags flags);
+    size_t state_seq_write_data(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags, int32_t il_start = -1, int32_t il_end = -1);
+    size_t state_seq_read_data (llama_io_read_i  & io, llama_seq_id seq_id, llama_state_seq_flags flags, int32_t il_start = -1, int32_t il_end = -1);
 
     //
     // members
@@ -290,6 +294,9 @@ private:
     };
 
     sampling_info sampling;
+
+    int32_t compute_il_start = -1;
+    int32_t compute_il_end   = -1;
 
     // sequence embeddings output (map of [n_embd] vectors)
     // populated only when pooling_type != LLAMA_POOLING_TYPE_NONE

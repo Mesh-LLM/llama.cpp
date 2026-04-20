@@ -962,6 +962,8 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     mctx             (params.mctx),
     cross            (params.cross),
     samplers         (params.samplers),
+    il_start         (params.il_start),
+    il_end           (params.il_end),
     cb_func          (params.cb),
     res              (params.res),
     ctx0             (res->get_ctx()),

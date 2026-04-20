@@ -1841,7 +1841,11 @@ ggml_cgraph * llama_kv_cache::build_graph_shift(llm_graph_result * res, llama_co
     return gf;
 }
 
-void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
+static bool llama_layer_in_range(int32_t il, int32_t il_start, int32_t il_end) {
+    return il_start < 0 || il_end < 0 || (il >= il_start && il < il_end);
+}
+
+void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags, int32_t il_start, int32_t il_end) const {
     GGML_UNUSED(flags);
 
     io.write(&n_stream, sizeof(n_stream));
@@ -1890,11 +1894,11 @@ void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, lla
         }
 
         state_write_meta(io, cr, seq_id);
-        state_write_data(io, cr);
+        state_write_data(io, cr, il_start, il_end);
     }
 }
 
-void llama_kv_cache::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
+void llama_kv_cache::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags, int32_t il_start, int32_t il_end) {
     GGML_UNUSED(flags);
 
     GGML_ASSERT(seq_id == -1 || (seq_id >= 0 && (size_t) seq_id < seq_to_stream.size()));
@@ -1919,7 +1923,7 @@ void llama_kv_cache::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama
 
         bool res = true;
         res = res && state_read_meta(io, strm, cell_count, sinfo, seq_id);
-        res = res && state_read_data(io, strm, cell_count, sinfo);
+        res = res && state_read_data(io, strm, cell_count, sinfo, il_start, il_end);
 
         if (!res) {
             if (seq_id == -1) {
@@ -1965,18 +1969,26 @@ void llama_kv_cache::state_write_meta(llama_io_write_i & io, const cell_ranges_t
     }
 }
 
-void llama_kv_cache::state_write_data(llama_io_write_i & io, const cell_ranges_t & cr) const {
+void llama_kv_cache::state_write_data(llama_io_write_i & io, const cell_ranges_t & cr, int32_t il_start, int32_t il_end) const {
     const auto & cells = v_cells[cr.strm];
 
     const uint32_t v_trans = this->v_trans ? 1 : 0;
-    const uint32_t n_layer = layers.size();
+    std::vector<std::reference_wrapper<const kv_layer>> selected_layers;
+    selected_layers.reserve(layers.size());
+    for (const auto & layer : layers) {
+        if (llama_layer_in_range(layer.il, il_start, il_end)) {
+            selected_layers.push_back(std::cref(layer));
+        }
+    }
+    const uint32_t n_layer = selected_layers.size();
 
     io.write(&v_trans, sizeof(v_trans));
     io.write(&n_layer, sizeof(n_layer));
 
     // Iterate and write all the keys first, each row is a cell
     // Get whole range at a time
-    for (const auto & layer : layers) {
+    for (const auto & layer_ref : selected_layers) {
+        const auto & layer = layer_ref.get();
         const uint32_t il = layer.il;
 
         const uint32_t n_embd_k_gqa = hparams.n_embd_k_gqa(il);
@@ -2000,7 +2012,8 @@ void llama_kv_cache::state_write_data(llama_io_write_i & io, const cell_ranges_t
     }
 
     if (!v_trans) {
-        for (const auto & layer : layers) {
+        for (const auto & layer_ref : selected_layers) {
+            const auto & layer = layer_ref.get();
             const uint32_t il = layer.il;
 
             const uint32_t n_embd_v_gqa = hparams.n_embd_v_gqa(il);
@@ -2029,7 +2042,8 @@ void llama_kv_cache::state_write_data(llama_io_write_i & io, const cell_ranges_t
         // When v is transposed, we also need the element size and get the element ranges from each row
         const uint32_t kv_size = cells.size();
 
-        for (const auto & layer : layers) {
+        for (const auto & layer_ref : selected_layers) {
+            const auto & layer = layer_ref.get();
             const uint32_t il = layer.il;
 
             const uint32_t n_embd_v_gqa = hparams.n_embd_v_gqa(il);
@@ -2183,7 +2197,7 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
     return true;
 }
 
-bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32_t cell_count, const slot_info & sinfo) {
+bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32_t cell_count, const slot_info & sinfo, int32_t il_start, int32_t il_end) {
     auto & cells = v_cells[strm];
 
     uint32_t v_trans;
@@ -2192,8 +2206,16 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
     io.read_to(&v_trans, sizeof(v_trans));
     io.read_to(&n_layer, sizeof(n_layer));
 
-    if (n_layer != layers.size()) {
-        LLAMA_LOG_ERROR("%s: mismatched layer count (%u instead of %u)\n", __func__, n_layer, (uint32_t) layers.size());
+    std::vector<std::reference_wrapper<const kv_layer>> selected_layers;
+    selected_layers.reserve(layers.size());
+    for (const auto & layer : layers) {
+        if (llama_layer_in_range(layer.il, il_start, il_end)) {
+            selected_layers.push_back(std::cref(layer));
+        }
+    }
+
+    if (n_layer != selected_layers.size()) {
+        LLAMA_LOG_ERROR("%s: mismatched layer count (%u instead of %u)\n", __func__, n_layer, (uint32_t) selected_layers.size());
         return false;
     }
 
@@ -2208,7 +2230,8 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
     }
 
     // For each layer, read the keys for each cell, one row is one cell, read as one contiguous block
-    for (const auto & layer : layers) {
+    for (const auto & layer_ref : selected_layers) {
+        const auto & layer = layer_ref.get();
         const uint32_t il = layer.il;
 
         const uint32_t n_embd_k_gqa = hparams.n_embd_k_gqa(il);
@@ -2249,7 +2272,8 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
     }
 
     if (!this->v_trans) {
-        for (const auto & layer : layers) {
+        for (const auto & layer_ref : selected_layers) {
+            const auto & layer = layer_ref.get();
             const uint32_t il = layer.il;
 
             const uint32_t n_embd_v_gqa = hparams.n_embd_v_gqa(il);
@@ -2293,7 +2317,8 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
         }
     } else {
         // For each layer, read the values for each cell (transposed)
-        for (const auto & layer : layers) {
+        for (const auto & layer_ref : selected_layers) {
+            const auto & layer = layer_ref.get();
             const uint32_t il = layer.il;
 
             const uint32_t n_embd_v_gqa = hparams.n_embd_v_gqa(il);

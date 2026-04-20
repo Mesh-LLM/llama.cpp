@@ -912,6 +912,31 @@ extern "C" {
                     llama_seq_id   dest_seq_id,
            llama_state_seq_flags   flags);
 
+    LLAMA_API size_t llama_state_seq_get_size_range(
+            struct llama_context * ctx,
+                    llama_seq_id   seq_id,
+                         int32_t    il_start,
+                         int32_t    il_end,
+           llama_state_seq_flags   flags);
+
+    LLAMA_API size_t llama_state_seq_get_data_range(
+            struct llama_context * ctx,
+                         uint8_t * dst,
+                          size_t   size,
+                    llama_seq_id   seq_id,
+                         int32_t    il_start,
+                         int32_t    il_end,
+           llama_state_seq_flags   flags);
+
+    LLAMA_API size_t llama_state_seq_set_data_range(
+            struct llama_context * ctx,
+                   const uint8_t * src,
+                          size_t   size,
+                    llama_seq_id   dest_seq_id,
+                         int32_t    il_start,
+                         int32_t    il_end,
+           llama_state_seq_flags   flags);
+
     //
     // Decoding
     //
@@ -985,6 +1010,10 @@ extern "C" {
     // Set whether to use causal attention or not
     // If set to true, the model will only attend to the past tokens
     LLAMA_API void llama_set_causal_attn(struct llama_context * ctx, bool causal_attn);
+
+    // Restrict execution to a half-open layer range [il_start, il_end).
+    // Use (-1, -1) to restore full-model execution.
+    LLAMA_API void llama_set_compute_range(struct llama_context * ctx, int32_t il_start, int32_t il_end);
 
     // Set whether the model is in warmup mode or not
     // If true, all model tensors are activated during llama_decode() to load and cache their weights.

@@ -62,8 +62,8 @@ public:
 
     // state write/load
 
-    void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) const override;
-    void state_read (llama_io_read_i  & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) override;
+    void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0, int32_t il_start = -1, int32_t il_end = -1) const override;
+    void state_read (llama_io_read_i  & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0, int32_t il_start = -1, int32_t il_end = -1) override;
 
     uint32_t head = 0; // the location where the batch will be placed in the cache (see find_slot())
     uint32_t size = 0; // total number of cells, shared across all sequences
@@ -118,10 +118,10 @@ private:
     size_t size_s_bytes() const;
 
     void state_write_meta(llama_io_write_i & io, const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges, llama_seq_id seq_id = -1) const;
-    void state_write_data(llama_io_write_i & io, const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges) const;
+    void state_write_data(llama_io_write_i & io, const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges, int32_t il_start = -1, int32_t il_end = -1) const;
 
     bool state_read_meta(llama_io_read_i & io, uint32_t cell_count, llama_seq_id dest_seq_id = -1);
-    bool state_read_data(llama_io_read_i & io, uint32_t cell_count);
+    bool state_read_data(llama_io_read_i & io, uint32_t cell_count, int32_t il_start = -1, int32_t il_end = -1);
 };
 
 class llama_memory_recurrent_context : public llama_memory_context_i {

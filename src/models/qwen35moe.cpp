@@ -14,6 +14,13 @@ llm_build_qwen35moe::llm_build_qwen35moe(const llama_model & model, const llm_gr
     ggml_tensor * cur;
     ggml_tensor * inpL;
 
+    const int32_t layer_start = il_start < 0 ? 0 : il_start;
+    const int32_t layer_end   = il_end   < 0 ? n_layer : il_end;
+
+    GGML_ASSERT(layer_start >= 0);
+    GGML_ASSERT(layer_start <= layer_end);
+    GGML_ASSERT(layer_end <= n_layer);
+
     inpL = build_inp_embd(model.tok_embd);
 
     cb(inpL, "model.input_embed", -1);
@@ -23,7 +30,7 @@ llm_build_qwen35moe::llm_build_qwen35moe(const llama_model & model, const llm_gr
     ggml_tensor * inp_pos     = build_inp_pos();
     ggml_tensor * inp_out_ids = build_inp_out_ids();
 
-    for (int il = 0; il < n_layer; ++il) {
+    for (int il = layer_start; il < layer_end; ++il) {
         ggml_tensor * inpSA = inpL;
 
         cur = build_norm(inpL, model.layers[il].attn_norm, nullptr, LLM_NORM_RMS, il);
@@ -40,7 +47,7 @@ llm_build_qwen35moe::llm_build_qwen35moe(const llama_model & model, const llm_gr
             cur = build_layer_attn(inp->get_attn(), cur, inp_pos, sections, il);
         }
 
-        if (il == n_layer - 1 && inp_out_ids) {
+        if (il == layer_end - 1 && inp_out_ids) {
             cur   = ggml_get_rows(ctx0, cur, inp_out_ids);
             inpSA = ggml_get_rows(ctx0, inpSA, inp_out_ids);
         }
@@ -71,6 +78,13 @@ llm_build_qwen35moe::llm_build_qwen35moe(const llama_model & model, const llm_gr
         inpL = cur;
     }
     cur = inpL;
+
+    if (layer_end < n_layer) {
+        cb(cur, "result_embd", layer_end - 1);
+        res->t_embd = cur;
+        ggml_build_forward_expand(gf, cur);
+        return;
+    }
 
     // Final norm
     cur = build_norm(cur, model.output_norm, nullptr, LLM_NORM_RMS, -1);

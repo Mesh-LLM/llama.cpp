@@ -17,6 +17,7 @@
 #include <fstream>
 #include <map>
 #include <list>
+#include <deque>
 #include <numeric>
 #include <random>
 #include <set>
@@ -103,6 +104,61 @@ struct step_metrics {
     uint64_t resident_expert_bytes_after_eviction = 0;
 };
 
+enum class kv_handoff_mode {
+    off,
+    bulk,
+    stream,
+};
+
+struct kv_stage_assignment {
+    int stage_id = -1;
+    int layer_start = 0;
+    int layer_end = 0;
+    uint64_t kv_bytes_per_token = 0;
+    uint64_t total_kv_bytes = 0;
+};
+
+struct kv_chunk_metrics {
+    int stage_id = -1;
+    int decode_owner_id = -1;
+    int layer_start = 0;
+    int layer_end = 0;
+    int token_start = 0;
+    int token_end = 0;
+    uint64_t bytes = 0;
+    double ready_time_s = 0.0;
+    double send_start_s = 0.0;
+    double receive_time_s = 0.0;
+    double assemble_start_s = 0.0;
+    double assemble_complete_s = 0.0;
+    double ack_time_s = 0.0;
+};
+
+struct kv_handoff_metrics {
+    std::string mode = "off";
+    int stage_count = 0;
+    int decode_owner_count = 0;
+    int chunk_tokens = 0;
+    uint64_t max_inflight_bytes = 0;
+    uint64_t receiver_max_queued_bytes = 0;
+    double network_latency_ms = 0.0;
+    double bandwidth_gbps = 0.0;
+    double receiver_assembly_gbps = 0.0;
+    bool ack_required = true;
+    uint64_t total_kv_bytes = 0;
+    uint64_t durable_bytes_by_prefill_end = 0;
+    uint64_t bytes_remaining_after_prefill = 0;
+    uint64_t peak_inflight_bytes = 0;
+    uint64_t peak_receiver_queued_bytes = 0;
+    uint64_t peak_duplicate_bytes = 0;
+    double prefill_elapsed_s = 0.0;
+    double handoff_complete_s = 0.0;
+    double sender_release_complete_s = 0.0;
+    double handoff_stall_s = 0.0;
+    std::vector<kv_stage_assignment> stage_assignments;
+    std::vector<kv_chunk_metrics> chunks;
+};
+
 struct experiment_stats {
     int hot_expert_count = 0;
     int prompt_tokens = 0;
@@ -127,6 +183,7 @@ struct experiment_stats {
     int decode_fetch_event_count = 0;
     double prefill_fetch_stall_upper_bound_s = 0.0;
     double decode_fetch_stall_upper_bound_s = 0.0;
+    kv_handoff_metrics kv_handoff;
     std::vector<int> post_prefill_probe_expert_ids;
     std::vector<uint64_t> post_prefill_probe_resident_bytes;
     long minor_faults_delta = 0;
@@ -155,6 +212,16 @@ static uint32_t hot_seed = 0;
 static bool decode_only_measurement = false;
 static bool hard_evict = false;
 static bool custom_expert_backing = false;
+static kv_handoff_mode kv_handoff_mode_value = kv_handoff_mode::off;
+static int kv_handoff_stage_count = 4;
+static int kv_handoff_decode_owner_count = 2;
+static int kv_handoff_chunk_tokens = 64;
+static double kv_handoff_network_latency_ms = 0.5;
+static double kv_handoff_bandwidth_gbps = 40.0;
+static double kv_handoff_receiver_assembly_gbps = 80.0;
+static uint64_t kv_handoff_max_inflight_bytes = 256ull * 1024ull * 1024ull;
+static uint64_t kv_handoff_receiver_max_queued_bytes = 256ull * 1024ull * 1024ull;
+static bool kv_handoff_ack_required = true;
 static uint64_t hard_evict_attempt_count = 0;
 static uint64_t hard_evict_success_count = 0;
 
@@ -1028,6 +1095,257 @@ static void write_json_string(std::ofstream & out, const std::string & value) {
     out << '"';
 }
 
+static const char * kv_handoff_mode_name(kv_handoff_mode mode) {
+    switch (mode) {
+        case kv_handoff_mode::off:   return "off";
+        case kv_handoff_mode::bulk:  return "bulk";
+        case kv_handoff_mode::stream:return "stream";
+    }
+    return "off";
+}
+
+static kv_handoff_mode parse_kv_handoff_mode(const char * value) {
+    if (std::strcmp(value, "off") == 0) {
+        return kv_handoff_mode::off;
+    }
+    if (std::strcmp(value, "bulk") == 0) {
+        return kv_handoff_mode::bulk;
+    }
+    if (std::strcmp(value, "stream") == 0) {
+        return kv_handoff_mode::stream;
+    }
+    throw std::runtime_error(std::string("unknown --kv-handoff-mode: ") + value);
+}
+
+static std::vector<int> allocate_layers_evenly(int total_layers, int stage_count) {
+    if (stage_count <= 0) {
+        throw std::runtime_error("kv handoff stage count must be > 0");
+    }
+    if (total_layers < stage_count) {
+        throw std::runtime_error("kv handoff stage count cannot exceed model layer count");
+    }
+    std::vector<int> allocations((size_t) stage_count, total_layers / stage_count);
+    for (int i = 0; i < total_layers % stage_count; ++i) {
+        allocations[(size_t) i] += 1;
+    }
+    return allocations;
+}
+
+static kv_handoff_metrics simulate_kv_handoff(
+        const llama_model * model,
+        int prompt_tokens,
+        double prefill_elapsed_s) {
+    kv_handoff_metrics metrics;
+    metrics.mode = kv_handoff_mode_name(kv_handoff_mode_value);
+    metrics.stage_count = kv_handoff_stage_count;
+    metrics.decode_owner_count = kv_handoff_decode_owner_count;
+    metrics.chunk_tokens = kv_handoff_chunk_tokens;
+    metrics.max_inflight_bytes = kv_handoff_max_inflight_bytes;
+    metrics.receiver_max_queued_bytes = kv_handoff_receiver_max_queued_bytes;
+    metrics.network_latency_ms = kv_handoff_network_latency_ms;
+    metrics.bandwidth_gbps = kv_handoff_bandwidth_gbps;
+    metrics.receiver_assembly_gbps = kv_handoff_receiver_assembly_gbps;
+    metrics.ack_required = kv_handoff_ack_required;
+    metrics.prefill_elapsed_s = prefill_elapsed_s;
+
+    if (kv_handoff_mode_value == kv_handoff_mode::off || prompt_tokens <= 0) {
+        return metrics;
+    }
+
+    const auto & hparams = model->hparams;
+    const int n_layers = (int) hparams.n_layer;
+    const auto layer_allocations = allocate_layers_evenly(n_layers, kv_handoff_stage_count);
+    const size_t k_type_size = ggml_type_size(GGML_TYPE_F16);
+    const size_t v_type_size = ggml_type_size(GGML_TYPE_F16);
+    const double bandwidth_bytes_per_s = kv_handoff_bandwidth_gbps > 0.0
+        ? kv_handoff_bandwidth_gbps * 1.0e9 / 8.0
+        : 0.0;
+    const double receiver_assembly_bytes_per_s = kv_handoff_receiver_assembly_gbps > 0.0
+        ? kv_handoff_receiver_assembly_gbps * 1.0e9 / 8.0
+        : 0.0;
+    const double latency_s = kv_handoff_network_latency_ms / 1e3;
+    const int chunk_tokens = std::max(1, kv_handoff_chunk_tokens);
+    const int chunk_count = (prompt_tokens + chunk_tokens - 1) / chunk_tokens;
+
+    int layer_cursor = 0;
+    for (int stage_id = 0; stage_id < kv_handoff_stage_count; ++stage_id) {
+        const int stage_layers = layer_allocations[(size_t) stage_id];
+        kv_stage_assignment assignment;
+        assignment.stage_id = stage_id;
+        assignment.layer_start = layer_cursor;
+        assignment.layer_end = layer_cursor + stage_layers;
+        uint64_t kv_bytes_per_token = 0;
+        for (int il = assignment.layer_start; il < assignment.layer_end; ++il) {
+            kv_bytes_per_token += (uint64_t) hparams.n_head_kv(il) *
+                ((uint64_t) hparams.n_embd_head_k() * k_type_size +
+                 (uint64_t) hparams.n_embd_head_v() * v_type_size);
+        }
+        assignment.kv_bytes_per_token = kv_bytes_per_token;
+        assignment.total_kv_bytes = kv_bytes_per_token * (uint64_t) prompt_tokens;
+        metrics.total_kv_bytes += assignment.total_kv_bytes;
+        metrics.stage_assignments.push_back(assignment);
+        layer_cursor += stage_layers;
+    }
+
+    struct inflight_entry {
+        double complete_time_s = 0.0;
+        uint64_t bytes = 0;
+    };
+
+    std::vector<std::deque<inflight_entry>> sender_inflight((size_t) kv_handoff_stage_count);
+    std::vector<uint64_t> sender_outstanding_bytes((size_t) kv_handoff_stage_count, 0);
+    std::vector<double> next_send_available_s((size_t) kv_handoff_stage_count, 0.0);
+    std::vector<std::deque<inflight_entry>> receiver_assembly((size_t) kv_handoff_decode_owner_count);
+    std::vector<uint64_t> receiver_queued_bytes((size_t) kv_handoff_decode_owner_count, 0);
+    std::vector<double> next_assembly_available_s((size_t) kv_handoff_decode_owner_count, 0.0);
+    std::vector<std::deque<inflight_entry>> receiver_present((size_t) kv_handoff_decode_owner_count);
+    std::vector<uint64_t> receiver_present_bytes((size_t) kv_handoff_decode_owner_count, 0);
+
+    auto release_sender_acked = [&](int stage_id, double now_s) {
+        auto & queue = sender_inflight[(size_t) stage_id];
+        while (!queue.empty() && queue.front().complete_time_s <= now_s) {
+            sender_outstanding_bytes[(size_t) stage_id] -= queue.front().bytes;
+            queue.pop_front();
+        }
+    };
+
+    auto release_receiver_assembled = [&](int decode_owner_id, double now_s) {
+        auto & queue = receiver_assembly[(size_t) decode_owner_id];
+        while (!queue.empty() && queue.front().complete_time_s <= now_s) {
+            receiver_queued_bytes[(size_t) decode_owner_id] -= queue.front().bytes;
+            queue.pop_front();
+        }
+    };
+
+    auto release_receiver_present = [&](int decode_owner_id, double now_s) {
+        auto & queue = receiver_present[(size_t) decode_owner_id];
+        while (!queue.empty() && queue.front().complete_time_s <= now_s) {
+            receiver_present_bytes[(size_t) decode_owner_id] -= queue.front().bytes;
+            queue.pop_front();
+        }
+    };
+
+    for (const auto & assignment : metrics.stage_assignments) {
+        for (int chunk_index = 0; chunk_index < chunk_count; ++chunk_index) {
+            const int token_start = chunk_index * chunk_tokens;
+            const int token_end = std::min(prompt_tokens, token_start + chunk_tokens);
+            const int chunk_token_count = token_end - token_start;
+            if (chunk_token_count <= 0) {
+                continue;
+            }
+
+            kv_chunk_metrics chunk;
+            chunk.stage_id = assignment.stage_id;
+            chunk.decode_owner_id = kv_handoff_decode_owner_count > 0
+                ? assignment.stage_id % kv_handoff_decode_owner_count
+                : 0;
+            chunk.layer_start = assignment.layer_start;
+            chunk.layer_end = assignment.layer_end;
+            chunk.token_start = token_start;
+            chunk.token_end = token_end;
+            chunk.bytes = assignment.kv_bytes_per_token * (uint64_t) chunk_token_count;
+
+            const double ready_fraction = double(chunk_index + 1 + assignment.stage_id) /
+                double(chunk_count + kv_handoff_stage_count - 1);
+            chunk.ready_time_s = prefill_elapsed_s * ready_fraction;
+            if (kv_handoff_mode_value == kv_handoff_mode::bulk) {
+                chunk.ready_time_s = prefill_elapsed_s;
+            }
+
+            release_sender_acked(assignment.stage_id, chunk.ready_time_s);
+            double send_start_s = std::max(chunk.ready_time_s, next_send_available_s[(size_t) assignment.stage_id]);
+            release_sender_acked(assignment.stage_id, send_start_s);
+
+            while (sender_outstanding_bytes[(size_t) assignment.stage_id] + chunk.bytes > kv_handoff_max_inflight_bytes &&
+                   !sender_inflight[(size_t) assignment.stage_id].empty()) {
+                send_start_s = std::max(send_start_s, sender_inflight[(size_t) assignment.stage_id].front().complete_time_s);
+                release_sender_acked(assignment.stage_id, send_start_s);
+            }
+
+            chunk.send_start_s = send_start_s;
+            const double transmit_s = bandwidth_bytes_per_s > 0.0
+                ? double(chunk.bytes) / bandwidth_bytes_per_s
+                : 0.0;
+            chunk.receive_time_s = send_start_s + latency_s + transmit_s;
+
+            release_receiver_assembled(chunk.decode_owner_id, chunk.receive_time_s);
+            release_receiver_present(chunk.decode_owner_id, chunk.receive_time_s);
+            double assemble_start_s = std::max(
+                chunk.receive_time_s,
+                next_assembly_available_s[(size_t) chunk.decode_owner_id]
+            );
+            release_receiver_assembled(chunk.decode_owner_id, assemble_start_s);
+            release_receiver_present(chunk.decode_owner_id, assemble_start_s);
+
+            while (receiver_queued_bytes[(size_t) chunk.decode_owner_id] + chunk.bytes > kv_handoff_receiver_max_queued_bytes &&
+                   !receiver_assembly[(size_t) chunk.decode_owner_id].empty()) {
+                assemble_start_s = std::max(
+                    assemble_start_s,
+                    receiver_assembly[(size_t) chunk.decode_owner_id].front().complete_time_s
+                );
+                release_receiver_assembled(chunk.decode_owner_id, assemble_start_s);
+                release_receiver_present(chunk.decode_owner_id, assemble_start_s);
+            }
+
+            chunk.assemble_start_s = assemble_start_s;
+            const double assemble_s = receiver_assembly_bytes_per_s > 0.0
+                ? double(chunk.bytes) / receiver_assembly_bytes_per_s
+                : 0.0;
+            chunk.assemble_complete_s = assemble_start_s + assemble_s;
+            chunk.ack_time_s = kv_handoff_ack_required
+                ? chunk.assemble_complete_s + latency_s
+                : chunk.assemble_complete_s;
+
+            receiver_assembly[(size_t) chunk.decode_owner_id].push_back({ chunk.assemble_complete_s, chunk.bytes });
+            receiver_queued_bytes[(size_t) chunk.decode_owner_id] += chunk.bytes;
+            receiver_present[(size_t) chunk.decode_owner_id].push_back({ chunk.ack_time_s, chunk.bytes });
+            receiver_present_bytes[(size_t) chunk.decode_owner_id] += chunk.bytes;
+            sender_inflight[(size_t) assignment.stage_id].push_back({ chunk.ack_time_s, chunk.bytes });
+            sender_outstanding_bytes[(size_t) assignment.stage_id] += chunk.bytes;
+            next_send_available_s[(size_t) assignment.stage_id] = send_start_s + transmit_s;
+            next_assembly_available_s[(size_t) chunk.decode_owner_id] = chunk.assemble_complete_s;
+
+            uint64_t total_inflight = 0;
+            for (uint64_t bytes : sender_outstanding_bytes) {
+                total_inflight += bytes;
+            }
+            uint64_t total_receiver_queued = 0;
+            for (uint64_t bytes : receiver_queued_bytes) {
+                total_receiver_queued += bytes;
+            }
+            uint64_t total_duplicate = 0;
+            for (uint64_t bytes : receiver_present_bytes) {
+                total_duplicate += bytes;
+            }
+            metrics.peak_inflight_bytes = std::max(metrics.peak_inflight_bytes, total_inflight);
+            metrics.peak_receiver_queued_bytes = std::max(
+                metrics.peak_receiver_queued_bytes,
+                total_receiver_queued
+            );
+            metrics.peak_duplicate_bytes = std::max(metrics.peak_duplicate_bytes, total_duplicate);
+            if (chunk.assemble_complete_s <= prefill_elapsed_s) {
+                metrics.durable_bytes_by_prefill_end += chunk.bytes;
+            }
+            metrics.chunks.push_back(chunk);
+        }
+    }
+
+    double latest_assembled_s = prefill_elapsed_s;
+    double latest_ack_s = prefill_elapsed_s;
+    for (const auto & chunk : metrics.chunks) {
+        latest_assembled_s = std::max(latest_assembled_s, chunk.assemble_complete_s);
+        latest_ack_s = std::max(latest_ack_s, chunk.ack_time_s);
+    }
+    metrics.handoff_complete_s = latest_assembled_s;
+    metrics.sender_release_complete_s = latest_ack_s;
+    metrics.handoff_stall_s = std::max(0.0, latest_assembled_s - prefill_elapsed_s);
+    metrics.bytes_remaining_after_prefill =
+        metrics.total_kv_bytes > metrics.durable_bytes_by_prefill_end
+            ? metrics.total_kv_bytes - metrics.durable_bytes_by_prefill_end
+            : 0;
+    return metrics;
+}
+
 static void write_result_json(
         const std::string & path,
         const std::vector<int> & hot_experts,
@@ -1085,6 +1403,76 @@ static void write_result_json(
         out << stats.post_prefill_probe_resident_bytes[i];
     }
     out << "],\n";
+    out << "  \"kv_handoff\": {\n";
+    out << "    \"mode\": ";
+    write_json_string(out, stats.kv_handoff.mode);
+    out << ",\n";
+    out << "    \"stage_count\": " << stats.kv_handoff.stage_count << ",\n";
+    out << "    \"decode_owner_count\": " << stats.kv_handoff.decode_owner_count << ",\n";
+    out << "    \"chunk_tokens\": " << stats.kv_handoff.chunk_tokens << ",\n";
+    out << "    \"max_inflight_bytes\": " << stats.kv_handoff.max_inflight_bytes << ",\n";
+    out << "    \"receiver_max_queued_bytes\": " << stats.kv_handoff.receiver_max_queued_bytes << ",\n";
+    out << "    \"network_latency_ms\": " << stats.kv_handoff.network_latency_ms << ",\n";
+    out << "    \"bandwidth_gbps\": " << stats.kv_handoff.bandwidth_gbps << ",\n";
+    out << "    \"receiver_assembly_gbps\": " << stats.kv_handoff.receiver_assembly_gbps << ",\n";
+    out << "    \"ack_required\": " << (stats.kv_handoff.ack_required ? "true" : "false") << ",\n";
+    out << "    \"total_kv_bytes\": " << stats.kv_handoff.total_kv_bytes << ",\n";
+    out << "    \"durable_bytes_by_prefill_end\": " << stats.kv_handoff.durable_bytes_by_prefill_end << ",\n";
+    out << "    \"bytes_remaining_after_prefill\": " << stats.kv_handoff.bytes_remaining_after_prefill << ",\n";
+    out << "    \"peak_inflight_bytes\": " << stats.kv_handoff.peak_inflight_bytes << ",\n";
+    out << "    \"peak_receiver_queued_bytes\": " << stats.kv_handoff.peak_receiver_queued_bytes << ",\n";
+    out << "    \"peak_duplicate_bytes\": " << stats.kv_handoff.peak_duplicate_bytes << ",\n";
+    out << "    \"prefill_elapsed_s\": " << stats.kv_handoff.prefill_elapsed_s << ",\n";
+    out << "    \"handoff_complete_s\": " << stats.kv_handoff.handoff_complete_s << ",\n";
+    out << "    \"sender_release_complete_s\": " << stats.kv_handoff.sender_release_complete_s << ",\n";
+    out << "    \"handoff_stall_s\": " << stats.kv_handoff.handoff_stall_s << ",\n";
+    out << "    \"stage_assignments\": [";
+    if (!stats.kv_handoff.stage_assignments.empty()) {
+        out << "\n";
+        for (size_t i = 0; i < stats.kv_handoff.stage_assignments.size(); ++i) {
+            const auto & stage = stats.kv_handoff.stage_assignments[i];
+            out << "      {\n";
+            out << "        \"stage_id\": " << stage.stage_id << ",\n";
+            out << "        \"layer_start\": " << stage.layer_start << ",\n";
+            out << "        \"layer_end\": " << stage.layer_end << ",\n";
+            out << "        \"kv_bytes_per_token\": " << stage.kv_bytes_per_token << ",\n";
+            out << "        \"total_kv_bytes\": " << stage.total_kv_bytes << "\n";
+            out << "      }";
+            if (i + 1 < stats.kv_handoff.stage_assignments.size()) out << ",";
+            out << "\n";
+        }
+        out << "    ],\n";
+    } else {
+        out << "],\n";
+    }
+    out << "    \"chunks\": [";
+    if (!stats.kv_handoff.chunks.empty()) {
+        out << "\n";
+        for (size_t i = 0; i < stats.kv_handoff.chunks.size(); ++i) {
+            const auto & chunk = stats.kv_handoff.chunks[i];
+            out << "      {\n";
+            out << "        \"stage_id\": " << chunk.stage_id << ",\n";
+            out << "        \"decode_owner_id\": " << chunk.decode_owner_id << ",\n";
+            out << "        \"layer_start\": " << chunk.layer_start << ",\n";
+            out << "        \"layer_end\": " << chunk.layer_end << ",\n";
+            out << "        \"token_start\": " << chunk.token_start << ",\n";
+            out << "        \"token_end\": " << chunk.token_end << ",\n";
+            out << "        \"bytes\": " << chunk.bytes << ",\n";
+            out << "        \"ready_time_s\": " << chunk.ready_time_s << ",\n";
+            out << "        \"send_start_s\": " << chunk.send_start_s << ",\n";
+            out << "        \"receive_time_s\": " << chunk.receive_time_s << ",\n";
+            out << "        \"assemble_start_s\": " << chunk.assemble_start_s << ",\n";
+            out << "        \"assemble_complete_s\": " << chunk.assemble_complete_s << ",\n";
+            out << "        \"ack_time_s\": " << chunk.ack_time_s << "\n";
+            out << "      }";
+            if (i + 1 < stats.kv_handoff.chunks.size()) out << ",";
+            out << "\n";
+        }
+        out << "    ]\n";
+    } else {
+        out << "]\n";
+    }
+    out << "  },\n";
     out << "  \"minor_faults_delta\": " << stats.minor_faults_delta << ",\n";
     out << "  \"major_faults_delta\": " << stats.major_faults_delta << ",\n";
     out << "  \"output_text\": ";
@@ -1174,6 +1562,32 @@ int main(int argc, char ** argv) {
             hard_evict = true;
         } else if (std::strcmp(argv[i], "--custom-expert-backing") == 0) {
             custom_expert_backing = true;
+        } else if (std::strcmp(argv[i], "--kv-handoff-mode") == 0 && i + 1 < argc) {
+            kv_handoff_mode_value = parse_kv_handoff_mode(argv[++i]);
+        } else if (std::strcmp(argv[i], "--kv-handoff-stage-count") == 0 && i + 1 < argc) {
+            kv_handoff_stage_count = std::atoi(argv[++i]);
+        } else if (std::strcmp(argv[i], "--kv-handoff-decode-owners") == 0 && i + 1 < argc) {
+            kv_handoff_decode_owner_count = std::atoi(argv[++i]);
+        } else if (std::strcmp(argv[i], "--kv-chunk-tokens") == 0 && i + 1 < argc) {
+            kv_handoff_chunk_tokens = std::atoi(argv[++i]);
+        } else if (std::strcmp(argv[i], "--kv-handoff-network-latency-ms") == 0 && i + 1 < argc) {
+            kv_handoff_network_latency_ms = std::strtod(argv[++i], nullptr);
+        } else if (std::strcmp(argv[i], "--kv-handoff-bandwidth-gbps") == 0 && i + 1 < argc) {
+            kv_handoff_bandwidth_gbps = std::strtod(argv[++i], nullptr);
+        } else if (std::strcmp(argv[i], "--kv-handoff-receiver-assembly-gbps") == 0 && i + 1 < argc) {
+            kv_handoff_receiver_assembly_gbps = std::strtod(argv[++i], nullptr);
+        } else if (std::strcmp(argv[i], "--kv-handoff-max-inflight-mib") == 0 && i + 1 < argc) {
+            double mib = std::strtod(argv[++i], nullptr);
+            kv_handoff_max_inflight_bytes = mib > 0.0
+                ? (uint64_t) std::llround(mib * 1024.0 * 1024.0)
+                : 0;
+        } else if (std::strcmp(argv[i], "--kv-handoff-receiver-max-queued-mib") == 0 && i + 1 < argc) {
+            double mib = std::strtod(argv[++i], nullptr);
+            kv_handoff_receiver_max_queued_bytes = mib > 0.0
+                ? (uint64_t) std::llround(mib * 1024.0 * 1024.0)
+                : 0;
+        } else if (std::strcmp(argv[i], "--kv-handoff-no-ack") == 0) {
+            kv_handoff_ack_required = false;
         } else {
             filtered_argv.push_back(argv[i]);
         }
@@ -1197,6 +1611,30 @@ int main(int argc, char ** argv) {
     }
     if (params.prompt.empty()) {
         LOG_ERR("prompt is required (use --prompt or --file)\n");
+        return 1;
+    }
+    if (kv_handoff_stage_count <= 0) {
+        LOG_ERR("--kv-handoff-stage-count must be > 0\n");
+        return 1;
+    }
+    if (kv_handoff_decode_owner_count <= 0) {
+        LOG_ERR("--kv-handoff-decode-owners must be > 0\n");
+        return 1;
+    }
+    if (kv_handoff_chunk_tokens <= 0) {
+        LOG_ERR("--kv-chunk-tokens must be > 0\n");
+        return 1;
+    }
+    if (kv_handoff_network_latency_ms < 0.0) {
+        LOG_ERR("--kv-handoff-network-latency-ms must be >= 0\n");
+        return 1;
+    }
+    if (kv_handoff_bandwidth_gbps < 0.0) {
+        LOG_ERR("--kv-handoff-bandwidth-gbps must be >= 0\n");
+        return 1;
+    }
+    if (kv_handoff_receiver_assembly_gbps < 0.0) {
+        LOG_ERR("--kv-handoff-receiver-assembly-gbps must be >= 0\n");
         return 1;
     }
 
@@ -1389,6 +1827,7 @@ int main(int argc, char ** argv) {
         return 1;
     }
     double t1 = ggml_time_us() / 1e6;
+    stats.kv_handoff = simulate_kv_handoff(model, (int) prompt_tokens.size(), t1 - t0);
     if (!decode_only_measurement) {
         update_step("prefill", -1, t1 - t0);
     } else {
@@ -1486,6 +1925,7 @@ int main(int argc, char ** argv) {
             break;
         }
         double step_t1 = ggml_time_us() / 1e6;
+
         update_step("decode", i, step_t1 - step_t0);
     }
 
@@ -1512,6 +1952,8 @@ int main(int argc, char ** argv) {
 
     LOG_INF("hot experts: %d\n", hot_expert_count);
     LOG_INF("cold cache experts: %d\n", cold_cache_expert_count);
+    LOG_INF("kv handoff mode: %s\n", stats.kv_handoff.mode.c_str());
+    LOG_INF("kv handoff stall: %.6fs\n", stats.kv_handoff.handoff_stall_s);
     LOG_INF("generated tokens: %d\n", stats.generated_tokens);
     LOG_INF("unique cold experts: %d\n", stats.unique_cold_experts);
     LOG_INF("estimated fetch bytes: %llu\n", (unsigned long long) stats.estimated_fetch_bytes);
