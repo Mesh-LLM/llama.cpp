@@ -465,6 +465,16 @@ static double sample_transport_delay_s(
     return latency_ms / 1000.0 + bandwidth_s;
 }
 
+static llama_model_params clamp_stage_model_gpu_layers(
+    llama_model_params params,
+    int32_t stage_layer_count
+) {
+    if (params.n_gpu_layers > 0 && stage_layer_count > 0) {
+        params.n_gpu_layers = std::min(params.n_gpu_layers, stage_layer_count);
+    }
+    return params;
+}
+
 static std::vector<std::pair<int, int>> make_prompt_chunks(int total_tokens, int chunk_tokens) {
     std::vector<std::pair<int, int>> chunks;
     if (total_tokens <= 0) {
@@ -1507,8 +1517,10 @@ int main(int argc, char ** argv) {
                         bool extraction_ok = true;
                         const double output_extract_t0 = ggml_time_us() / 1e6;
                         for (int token_index = 0; token_index < token_count; ++token_index) {
-                            const int embd_index =
-                                message_kind == MULTISTAGE_STAGE_MSG_DECODE_EMBD ? -1 : token_index;
+                            // Use the explicit token row rather than the synthetic "latest" row.
+                            // The decode path is single-token today, but row-indexed retrieval has
+                            // already proven more stable than -1 for staged boundary extraction.
+                            const int embd_index = token_index;
                             float * token_embeddings = llama_get_embeddings_ith(session_ctx, embd_index);
                             if (!token_embeddings) {
                                 extraction_ok = false;
@@ -2078,7 +2090,9 @@ int main(int argc, char ** argv) {
 
             llama_model * stage0_model = model;
             if (!multistage_model_paths.empty()) {
-                stage0_model = llama_model_load_from_file(multistage_model_paths[0].c_str(), model_params);
+                const auto [il_start, il_end] = stage_ranges[0];
+                const auto stage0_model_params = clamp_stage_model_gpu_layers(model_params, il_end - il_start);
+                stage0_model = llama_model_load_from_file(multistage_model_paths[0].c_str(), stage0_model_params);
             }
             if (!stage0_model) {
                 LOG_ERR("failed to load multistage stage0 model\n");
@@ -2334,7 +2348,7 @@ int main(int argc, char ** argv) {
                     LOG_ERR("multistage process stage0 decode failed at step %d\n", step);
                     break;
                 }
-                float * boundary_embd = llama_get_embeddings_ith(stage0_ctx, -1);
+                float * boundary_embd = llama_get_embeddings_ith(stage0_ctx, 0);
                 if (!boundary_embd) {
                     LOG_ERR("multistage process stage0 boundary embeddings unavailable at step %d\n", step);
                     break;
@@ -2431,7 +2445,9 @@ int main(int argc, char ** argv) {
         for (int stage_index = 0; stage_index < metrics.stage_count; ++stage_index) {
             llama_model * stage_model = model;
             if (!multistage_model_paths.empty()) {
-                stage_model = llama_model_load_from_file(multistage_model_paths[(size_t) stage_index].c_str(), model_params);
+                const auto [il_start, il_end] = stage_ranges[(size_t) stage_index];
+                const auto stage_model_params = clamp_stage_model_gpu_layers(model_params, il_end - il_start);
+                stage_model = llama_model_load_from_file(multistage_model_paths[(size_t) stage_index].c_str(), stage_model_params);
                 stage_models[(size_t) stage_index] = stage_model;
             }
             if (!stage_model) {
@@ -3007,7 +3023,7 @@ int main(int argc, char ** argv) {
                 }
 
                 if (stage_index < metrics.stage_count - 1) {
-                    float * stage_boundary = llama_get_embeddings_ith(stage_ctx, -1);
+                    float * stage_boundary = llama_get_embeddings_ith(stage_ctx, 0);
                     if (!stage_boundary) {
                         staged_ok = false;
                         break;
