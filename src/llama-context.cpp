@@ -1038,6 +1038,12 @@ void llama_context::set_abort_callback(bool (*abort_callback)(void * data), void
     }
 }
 
+void llama_context::set_logits(bool value) {
+    LLAMA_LOG_DEBUG("%s: value = %d\n", __func__, value);
+
+    output_logits = value;
+}
+
 void llama_context::set_embeddings(bool value) {
     LLAMA_LOG_DEBUG("%s: value = %d\n", __func__, value);
 
@@ -1930,7 +1936,7 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
     const auto n_vocab    = vocab.n_tokens();
     const auto n_embd_out = hparams.n_embd_out();
 
-    bool has_logits = true;
+    bool has_logits = output_logits;
     bool has_embd   = cparams.embeddings;
 
     // TODO: hacky enc-dec support
@@ -3123,6 +3129,10 @@ void llama_set_abort_callback(llama_context * ctx, bool (*abort_callback)(void *
 
 void llama_set_embeddings(llama_context * ctx, bool embeddings) {
     ctx->set_embeddings(embeddings);
+}
+
+void llama_set_logits(llama_context * ctx, bool logits) {
+    ctx->set_logits(logits);
 }
 
 void llama_set_causal_attn(llama_context * ctx, bool causal_attn) {

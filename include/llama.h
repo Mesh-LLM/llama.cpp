@@ -1007,6 +1007,10 @@ extern "C" {
     // TODO: rename to avoid confusion with llama_get_embeddings()
     LLAMA_API void llama_set_embeddings(struct llama_context * ctx, bool embeddings);
 
+    // Set whether the context extracts logits into the output buffer.
+    // Internal pipeline stages that only forward embeddings can disable this.
+    LLAMA_API void llama_set_logits(struct llama_context * ctx, bool logits);
+
     // Set whether to use causal attention or not
     // If set to true, the model will only attend to the past tokens
     LLAMA_API void llama_set_causal_attn(struct llama_context * ctx, bool causal_attn);

@@ -101,6 +101,7 @@ struct llama_context {
 
     void set_abort_callback(bool (*abort_callback)(void * data), void * abort_callback_data);
 
+    void set_logits(bool value);
     void set_embeddings (bool value);
     void set_causal_attn(bool value);
     void set_warmup(bool value);
@@ -296,6 +297,7 @@ private:
 
     sampling_info sampling;
 
+    bool output_logits = true;
     int32_t compute_il_start = -1;
     int32_t compute_il_end   = -1;
     int32_t compute_skip_stride = 1;
