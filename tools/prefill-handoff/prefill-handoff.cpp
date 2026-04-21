@@ -153,6 +153,12 @@ struct multistage_stage_server_session_summary {
     int session_index = 0;
     int prefill_chunk_count = 0;
     double prefill_compute_elapsed_s = 0.0;
+    double prefill_recv_elapsed_s = 0.0;
+    double prefill_forward_elapsed_s = 0.0;
+    double prefill_reply_elapsed_s = 0.0;
+    uint64_t prefill_input_bytes = 0;
+    uint64_t prefill_forward_bytes = 0;
+    uint64_t prefill_reply_bytes = 0;
     int decode_step_count = 0;
     double decode_compute_elapsed_s = 0.0;
     std::vector<uint64_t> decode_input_hashes;
@@ -915,6 +921,12 @@ static void write_multistage_stage_server_json(
         out << "\"session_index\": " << session.session_index << ", ";
         out << "\"prefill_chunk_count\": " << session.prefill_chunk_count << ", ";
         out << "\"prefill_compute_elapsed_s\": " << session.prefill_compute_elapsed_s << ", ";
+        out << "\"prefill_recv_elapsed_s\": " << session.prefill_recv_elapsed_s << ", ";
+        out << "\"prefill_forward_elapsed_s\": " << session.prefill_forward_elapsed_s << ", ";
+        out << "\"prefill_reply_elapsed_s\": " << session.prefill_reply_elapsed_s << ", ";
+        out << "\"prefill_input_bytes\": " << session.prefill_input_bytes << ", ";
+        out << "\"prefill_forward_bytes\": " << session.prefill_forward_bytes << ", ";
+        out << "\"prefill_reply_bytes\": " << session.prefill_reply_bytes << ", ";
         out << "\"decode_step_count\": " << session.decode_step_count << ", ";
         out << "\"decode_compute_elapsed_s\": " << session.decode_compute_elapsed_s << ", ";
         out << "\"decode_input_hashes\": [";
@@ -1312,9 +1324,17 @@ int main(int argc, char ** argv) {
                 int32_t pos_start = 0;
                 int32_t token_count = 0;
                 std::vector<float> embeddings;
+                const double recv_t0 = ggml_time_us() / 1e6;
                 if (!recv_stage_message(conn_fd, message_kind, pos_start, token_count, embeddings, n_embd_inp)) {
                     set_last_error("recv_stage_message_failed");
                     break;
+                }
+                const double recv_t1 = ggml_time_us() / 1e6;
+                const bool is_prefill_message = message_kind == MULTISTAGE_STAGE_MSG_PREFILL_EMBD;
+                if (is_prefill_message) {
+                    session_summary.prefill_recv_elapsed_s += recv_t1 - recv_t0;
+                    session_summary.prefill_input_bytes +=
+                        (uint64_t) (sizeof(int32_t) * 3 + (sizeof(float) * embeddings.size()));
                 }
                 if (message_kind == MULTISTAGE_STAGE_MSG_STOP) {
                     if (next_fd >= 0) {
@@ -1324,7 +1344,7 @@ int main(int argc, char ** argv) {
                 }
 
                 const double stage_compute_t0 = ggml_time_us() / 1e6;
-                if (message_kind == MULTISTAGE_STAGE_MSG_PREFILL_EMBD) {
+                if (is_prefill_message) {
                     session_summary.prefill_chunk_count += 1;
                 } else if (message_kind == MULTISTAGE_STAGE_MSG_DECODE_EMBD) {
                     session_summary.decode_step_count += token_count;
@@ -1338,7 +1358,7 @@ int main(int argc, char ** argv) {
                     (llama_model_is_recurrent(stage_model) || llama_model_is_hybrid(stage_model));
                 std::vector<float> next_embeddings;
                 bool next_embeddings_ready = false;
-                if (message_kind == MULTISTAGE_STAGE_MSG_PREFILL_EMBD &&
+                if (is_prefill_message &&
                     stage_requires_sequential_embd &&
                     token_count > 1) {
                     bool stage_ok = true;
@@ -1427,10 +1447,17 @@ int main(int argc, char ** argv) {
                             message_kind == MULTISTAGE_STAGE_MSG_DECODE_EMBD
                             ? MULTISTAGE_STAGE_MSG_DECODE_EMBD
                             : MULTISTAGE_STAGE_MSG_PREFILL_EMBD;
+                        const double forward_t0 = ggml_time_us() / 1e6;
                         if (!send_stage_message(next_fd, forward_kind, pos_start, token_count, next_embeddings.data(), next_embeddings.size()) ||
                             !recv_all(next_fd, &predicted, sizeof(predicted))) {
                             set_last_error("forward_send_recv_failed");
                             break;
+                        }
+                        const double forward_t1 = ggml_time_us() / 1e6;
+                        if (is_prefill_message) {
+                            session_summary.prefill_forward_elapsed_s += forward_t1 - forward_t0;
+                            session_summary.prefill_forward_bytes +=
+                                (uint64_t) (sizeof(int32_t) * 4 + (sizeof(float) * next_embeddings.size()));
                         }
                     } else {
                         set_last_error("forward_embeddings_not_ready");
@@ -1446,16 +1473,22 @@ int main(int argc, char ** argv) {
                 }
 
                 const double stage_compute_t1 = ggml_time_us() / 1e6;
-                if (message_kind == MULTISTAGE_STAGE_MSG_PREFILL_EMBD) {
+                if (is_prefill_message) {
                     session_summary.prefill_compute_elapsed_s += stage_compute_t1 - stage_compute_t0;
                 } else if (message_kind == MULTISTAGE_STAGE_MSG_DECODE_EMBD) {
                     session_summary.decode_compute_elapsed_s += stage_compute_t1 - stage_compute_t0;
                     session_summary.decode_predicted_tokens.push_back(predicted);
                 }
 
+                const double reply_t0 = ggml_time_us() / 1e6;
                 if (!send_all(conn_fd, &predicted, sizeof(predicted))) {
                     set_last_error("reply_send_failed");
                     break;
+                }
+                const double reply_t1 = ggml_time_us() / 1e6;
+                if (is_prefill_message) {
+                    session_summary.prefill_reply_elapsed_s += reply_t1 - reply_t0;
+                    session_summary.prefill_reply_bytes += sizeof(predicted);
                 }
             }
 
