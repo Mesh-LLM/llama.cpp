@@ -26,6 +26,33 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+static std::string model_architecture_name(const llama_model * model) {
+    char buf[128] = {0};
+    const int rc = llama_model_meta_val_str(model, "general.architecture", buf, sizeof(buf));
+    if (rc <= 0) {
+        return "";
+    }
+    return std::string(buf);
+}
+
+static bool staged_same_topology_requires_token_sideband(const llama_model * model) {
+    const std::string arch = model_architecture_name(model);
+    return arch == "gemma4";
+}
+
+static void populate_embd_batch_tokens(
+    llama_batch & batch,
+    const llama_token * tokens,
+    int token_count
+) {
+    if (tokens == nullptr || token_count <= 0) {
+        return;
+    }
+    batch.token = (llama_token *) malloc(sizeof(llama_token) * (size_t) token_count);
+    GGML_ASSERT(batch.token != nullptr);
+    std::memcpy(batch.token, tokens, sizeof(llama_token) * (size_t) token_count);
+}
+
 struct prefill_handoff_metrics {
     bool enabled = true;
     std::string state_kind = "full_context";
@@ -90,10 +117,15 @@ struct split_compute_metrics {
     double stage2_import_elapsed_s = 0.0;
     double stage2_first_decode_elapsed_s = 0.0;
     double stage2_total_decode_elapsed_s = 0.0;
+    double prompt_boundary_stage1_prefill_elapsed_s = 0.0;
+    double prompt_boundary_stage2_prefill_elapsed_s = 0.0;
     double split_total_elapsed_s = 0.0;
     double split_delta_vs_baseline_s = 0.0;
     bool stage2_import_succeeded = false;
     bool token_match = false;
+    bool prompt_boundary_seed_match = false;
+    int prompt_boundary_seed_baseline_token = -1;
+    int prompt_boundary_seed_split_token = -1;
     std::string output_text;
 };
 
@@ -111,6 +143,7 @@ struct multistage_compute_metrics {
     double first_mismatch_baseline_margin = 0.0;
     double first_mismatch_staged_margin = 0.0;
     int seed_token = -1;
+    uint64_t baseline_state_bytes = 0;
     double baseline_prefill_elapsed_s = 0.0;
     double baseline_first_decode_elapsed_s = 0.0;
     double baseline_total_decode_elapsed_s = 0.0;
@@ -190,6 +223,7 @@ struct multistage_stage_server_session_summary {
     double prefill_reply_elapsed_s = 0.0;
     double prefill_input_copy_elapsed_s = 0.0;
     double prefill_output_extract_elapsed_s = 0.0;
+    uint64_t prefill_stage_state_bytes = 0;
     uint64_t prefill_input_bytes = 0;
     uint64_t prefill_forward_bytes = 0;
     uint64_t prefill_reply_bytes = 0;
@@ -358,13 +392,22 @@ static bool send_stage_message(
     int32_t kind,
     int32_t pos_start,
     int32_t token_count,
+    const llama_token * tokens,
+    size_t token_payload_count,
     const float * embeddings,
     size_t embedding_count
 ) {
+    const int32_t token_sideband_count = (int32_t) token_payload_count;
     if (!send_all(fd, &kind, sizeof(kind)) ||
         !send_all(fd, &pos_start, sizeof(pos_start)) ||
-        !send_all(fd, &token_count, sizeof(token_count))) {
+        !send_all(fd, &token_count, sizeof(token_count)) ||
+        !send_all(fd, &token_sideband_count, sizeof(token_sideband_count))) {
         return false;
+    }
+    if (token_payload_count > 0 && tokens != nullptr) {
+        if (!send_all(fd, tokens, sizeof(llama_token) * token_payload_count)) {
+            return false;
+        }
     }
     if (embedding_count > 0 && embeddings != nullptr) {
         return send_all(fd, embeddings, sizeof(float) * embedding_count);
@@ -377,20 +420,30 @@ static bool recv_stage_message(
     int32_t & kind,
     int32_t & pos_start,
     int32_t & token_count,
+    std::vector<llama_token> & tokens,
     std::vector<float> & embeddings,
     int32_t n_embd
 ) {
+    int32_t token_sideband_count = 0;
     if (!recv_all(fd, &kind, sizeof(kind)) ||
         !recv_all(fd, &pos_start, sizeof(pos_start)) ||
-        !recv_all(fd, &token_count, sizeof(token_count))) {
+        !recv_all(fd, &token_count, sizeof(token_count)) ||
+        !recv_all(fd, &token_sideband_count, sizeof(token_sideband_count))) {
         return false;
     }
     if (kind == MULTISTAGE_STAGE_MSG_STOP) {
+        tokens.clear();
         embeddings.clear();
         return true;
     }
-    if (token_count < 0) {
+    if (token_count < 0 || token_sideband_count < 0) {
         return false;
+    }
+    tokens.resize((size_t) token_sideband_count);
+    if (!tokens.empty()) {
+        if (!recv_all(fd, tokens.data(), sizeof(llama_token) * tokens.size())) {
+            return false;
+        }
     }
     embeddings.resize((size_t) token_count * (size_t) n_embd);
     if (!embeddings.empty()) {
@@ -789,10 +842,15 @@ static void write_split_compute_json(
     out << "    \"stage2_import_elapsed_s\": " << metrics.stage2_import_elapsed_s << ",\n";
     out << "    \"stage2_first_decode_elapsed_s\": " << metrics.stage2_first_decode_elapsed_s << ",\n";
     out << "    \"stage2_total_decode_elapsed_s\": " << metrics.stage2_total_decode_elapsed_s << ",\n";
+    out << "    \"prompt_boundary_stage1_prefill_elapsed_s\": " << metrics.prompt_boundary_stage1_prefill_elapsed_s << ",\n";
+    out << "    \"prompt_boundary_stage2_prefill_elapsed_s\": " << metrics.prompt_boundary_stage2_prefill_elapsed_s << ",\n";
     out << "    \"split_total_elapsed_s\": " << metrics.split_total_elapsed_s << ",\n";
     out << "    \"split_delta_vs_baseline_s\": " << metrics.split_delta_vs_baseline_s << ",\n";
     out << "    \"stage2_import_succeeded\": " << (metrics.stage2_import_succeeded ? "true" : "false") << ",\n";
-    out << "    \"token_match\": " << (metrics.token_match ? "true" : "false") << "\n";
+    out << "    \"token_match\": " << (metrics.token_match ? "true" : "false") << ",\n";
+    out << "    \"prompt_boundary_seed_match\": " << (metrics.prompt_boundary_seed_match ? "true" : "false") << ",\n";
+    out << "    \"prompt_boundary_seed_baseline_token\": " << metrics.prompt_boundary_seed_baseline_token << ",\n";
+    out << "    \"prompt_boundary_seed_split_token\": " << metrics.prompt_boundary_seed_split_token << "\n";
     out << "  }\n";
     out << "}\n";
 }
@@ -825,6 +883,7 @@ static void write_multistage_compute_json(
     out << "    \"first_mismatch_baseline_margin\": " << metrics.first_mismatch_baseline_margin << ",\n";
     out << "    \"first_mismatch_staged_margin\": " << metrics.first_mismatch_staged_margin << ",\n";
     out << "    \"seed_token\": " << metrics.seed_token << ",\n";
+    out << "    \"baseline_state_bytes\": " << metrics.baseline_state_bytes << ",\n";
     out << "    \"baseline_prefill_elapsed_s\": " << metrics.baseline_prefill_elapsed_s << ",\n";
     out << "    \"baseline_first_decode_elapsed_s\": " << metrics.baseline_first_decode_elapsed_s << ",\n";
     out << "    \"baseline_total_decode_elapsed_s\": " << metrics.baseline_total_decode_elapsed_s << ",\n";
@@ -1002,6 +1061,7 @@ static void write_multistage_stage_server_json(
         out << "\"prefill_reply_elapsed_s\": " << session.prefill_reply_elapsed_s << ", ";
         out << "\"prefill_input_copy_elapsed_s\": " << session.prefill_input_copy_elapsed_s << ", ";
         out << "\"prefill_output_extract_elapsed_s\": " << session.prefill_output_extract_elapsed_s << ", ";
+        out << "\"prefill_stage_state_bytes\": " << session.prefill_stage_state_bytes << ", ";
         out << "\"prefill_input_bytes\": " << session.prefill_input_bytes << ", ";
         out << "\"prefill_forward_bytes\": " << session.prefill_forward_bytes << ", ";
         out << "\"prefill_reply_bytes\": " << session.prefill_reply_bytes << ", ";
@@ -1271,11 +1331,26 @@ int main(int argc, char ** argv) {
     }
     llama_model * shadow_model = nullptr;
 
-    llama_context * ctx = llama_init_from_model(model, ctx_params);
-    if (!ctx) {
-        LOG_ERR("failed to create context\n");
+    if (multistage_live_prefill &&
+        !multistage_stage_server_mode &&
+        !multistage_compute_boundaries_csv.empty() &&
+        staged_same_topology_requires_token_sideband(model)) {
+        LOG_ERR(
+            "same-topology live prefill is unsupported for %s: prompt-boundary handoff diverges even though late-state split remains exact; use split late-state handoff instead\n",
+            model_architecture_name(model).c_str());
         llama_model_free(model);
+        llama_backend_free();
         return 1;
+    }
+
+    llama_context * ctx = nullptr;
+    if (!multistage_stage_server_mode) {
+        ctx = llama_init_from_model(model, ctx_params);
+        if (!ctx) {
+            LOG_ERR("failed to create context\n");
+            llama_model_free(model);
+            return 1;
+        }
     }
 
     const llama_vocab * vocab = llama_model_get_vocab(model);
@@ -1312,8 +1387,6 @@ int main(int argc, char ** argv) {
         llama_context_params server_ctx_params = ctx_params;
         server_ctx_params.cb_eval = nullptr;
         server_ctx_params.cb_eval_user_data = nullptr;
-        llama_free(ctx);
-        ctx = nullptr;
 
         int listen_fd = ::socket(AF_INET, SOCK_STREAM, 0);
         if (listen_fd < 0) {
@@ -1404,9 +1477,10 @@ int main(int argc, char ** argv) {
                 int32_t message_kind = 0;
                 int32_t pos_start = 0;
                 int32_t token_count = 0;
+                std::vector<llama_token> tokens;
                 std::vector<float> embeddings;
                 const double recv_t0 = ggml_time_us() / 1e6;
-                if (!recv_stage_message(conn_fd, message_kind, pos_start, token_count, embeddings, n_embd_inp)) {
+                if (!recv_stage_message(conn_fd, message_kind, pos_start, token_count, tokens, embeddings, n_embd_inp)) {
                     set_last_error("recv_stage_message_failed");
                     break;
                 }
@@ -1415,11 +1489,13 @@ int main(int argc, char ** argv) {
                 if (is_prefill_message) {
                     session_summary.prefill_recv_elapsed_s += recv_t1 - recv_t0;
                     session_summary.prefill_input_bytes +=
-                        (uint64_t) (sizeof(int32_t) * 3 + (sizeof(float) * embeddings.size()));
+                        (uint64_t) (sizeof(int32_t) * 4 +
+                            (sizeof(llama_token) * tokens.size()) +
+                            (sizeof(float) * embeddings.size()));
                 }
                 if (message_kind == MULTISTAGE_STAGE_MSG_STOP) {
                     if (next_fd >= 0) {
-                        (void) send_stage_message(next_fd, message_kind, 0, 0, nullptr, 0);
+                        (void) send_stage_message(next_fd, message_kind, 0, 0, nullptr, 0, nullptr, 0);
                     }
                     break;
                 }
@@ -1437,6 +1513,8 @@ int main(int argc, char ** argv) {
                 const bool stage_requires_sequential_embd =
                     stage_model != nullptr &&
                     (llama_model_is_recurrent(stage_model) || llama_model_is_hybrid(stage_model));
+                const bool stage_requires_token_sideband =
+                    stage_model != nullptr && staged_same_topology_requires_token_sideband(stage_model);
                 std::vector<float> next_embeddings;
                 bool next_embeddings_ready = false;
                 if (is_prefill_message &&
@@ -1457,6 +1535,9 @@ int main(int argc, char ** argv) {
                                 sizeof(float) * (size_t) n_embd_inp);
                             const double input_copy_t1 = ggml_time_us() / 1e6;
                             session_summary.prefill_input_copy_elapsed_s += input_copy_t1 - input_copy_t0;
+                        }
+                        if (stage_requires_token_sideband && (size_t) token_index < tokens.size()) {
+                            populate_embd_batch_tokens(embd_batch, tokens.data() + token_index, 1);
                         }
                         embd_batch.pos[0] = (llama_pos) (pos_start + token_index);
                         embd_batch.n_seq_id[0] = 1;
@@ -1495,6 +1576,9 @@ int main(int argc, char ** argv) {
                         std::memcpy(embd_batch.embd, embeddings.data(), sizeof(float) * embeddings.size());
                         const double input_copy_t1 = ggml_time_us() / 1e6;
                         session_summary.prefill_input_copy_elapsed_s += input_copy_t1 - input_copy_t0;
+                    }
+                    if (stage_requires_token_sideband && !tokens.empty()) {
+                        populate_embd_batch_tokens(embd_batch, tokens.data(), token_count);
                     }
                     for (int token_index = 0; token_index < token_count; ++token_index) {
                         embd_batch.pos[token_index] = (llama_pos) (pos_start + token_index);
@@ -1550,6 +1634,8 @@ int main(int argc, char ** argv) {
                             forward_kind,
                             pos_start,
                             token_count,
+                            tokens.empty() ? nullptr : tokens.data(),
+                            tokens.size(),
                             next_embeddings.data(),
                             next_embeddings.size());
                         const double forward_send_t1 = ggml_time_us() / 1e6;
@@ -1564,7 +1650,9 @@ int main(int argc, char ** argv) {
                             session_summary.prefill_forward_send_elapsed_s += forward_send_t1 - forward_t0;
                             session_summary.prefill_forward_reply_wait_elapsed_s += forward_t1 - forward_send_t1;
                             session_summary.prefill_forward_bytes +=
-                                (uint64_t) (sizeof(int32_t) * 4 + (sizeof(float) * next_embeddings.size()));
+                                (uint64_t) (sizeof(int32_t) * 4 +
+                                    (sizeof(llama_token) * tokens.size()) +
+                                    (sizeof(float) * next_embeddings.size()));
                         }
                     } else {
                         set_last_error("forward_embeddings_not_ready");
@@ -1582,6 +1670,10 @@ int main(int argc, char ** argv) {
                 const double stage_compute_t1 = ggml_time_us() / 1e6;
                 if (is_prefill_message) {
                     session_summary.prefill_compute_elapsed_s += stage_compute_t1 - stage_compute_t0;
+                    session_summary.prefill_stage_state_bytes =
+                        std::max(
+                            session_summary.prefill_stage_state_bytes,
+                            (uint64_t) llama_state_seq_get_size(session_ctx, 0));
                 } else if (message_kind == MULTISTAGE_STAGE_MSG_DECODE_EMBD) {
                     session_summary.decode_compute_elapsed_s += stage_compute_t1 - stage_compute_t0;
                     session_summary.decode_predicted_tokens.push_back(predicted);
@@ -2087,6 +2179,7 @@ int main(int argc, char ** argv) {
             }
             const double base_prefill_t1 = ggml_time_us() / 1e6;
             metrics.baseline_prefill_elapsed_s = base_prefill_t1 - base_prefill_t0;
+            metrics.baseline_state_bytes = llama_state_seq_get_size(ctx, 0);
 
             llama_model * stage0_model = model;
             if (!multistage_model_paths.empty()) {
@@ -2291,6 +2384,8 @@ int main(int argc, char ** argv) {
                     message_kind,
                     chunk_start,
                     chunk_count,
+                    prompt_tokens.data() + chunk_start,
+                    (size_t) chunk_count,
                     chunk_embeddings.data(),
                     chunk_embeddings.size());
                 const double stage0_send_t1 = ggml_time_us() / 1e6;
@@ -2307,6 +2402,8 @@ int main(int argc, char ** argv) {
             }
             const double staged_prefill_t1 = ggml_time_us() / 1e6;
             metrics.staged_prefill_elapsed_s = staged_prefill_t1 - staged_prefill_t0;
+            metrics.stage_state_bytes.assign((size_t) metrics.stage_count, 0);
+            metrics.stage_state_bytes[0] = llama_state_seq_get_size(stage0_ctx, 0);
             metrics.live_prefill_stage_chunk_counts[0] = prefill_chunk_count;
             metrics.live_prefill_stage_compute_elapsed_s[0] = stage0_prefill_compute_elapsed_s;
             metrics.live_prefill_stage_send_elapsed_s[0] = stage0_send_elapsed_s;
@@ -2374,6 +2471,8 @@ int main(int argc, char ** argv) {
                         MULTISTAGE_STAGE_MSG_DECODE_EMBD,
                         (int32_t) prompt_tokens.size() + step,
                         1,
+                        &current_token,
+                        1,
                         boundary_embd,
                         (size_t) n_embd_inp) ||
                     !recv_all(downstream_fd, &predicted_i32, sizeof(predicted_i32))) {
@@ -2403,7 +2502,7 @@ int main(int argc, char ** argv) {
                 }
             }
 
-            (void) send_stage_message(downstream_fd, MULTISTAGE_STAGE_MSG_STOP, 0, 0, nullptr, 0);
+            (void) send_stage_message(downstream_fd, MULTISTAGE_STAGE_MSG_STOP, 0, 0, nullptr, 0, nullptr, 0);
             ::close(downstream_fd);
             metrics.token_match = metrics.token_mismatch_count == 0;
             metrics.staged_delta_vs_baseline_s =
@@ -2486,6 +2585,7 @@ int main(int argc, char ** argv) {
         }
         const double base_prefill_t1 = ggml_time_us() / 1e6;
         metrics.baseline_prefill_elapsed_s = base_prefill_t1 - base_prefill_t0;
+        metrics.baseline_state_bytes = llama_state_seq_get_size(ctx, 0);
 
         for (int stage_index = 0; stage_index < metrics.stage_count; ++stage_index) {
             const auto [il_start, il_end] = stage_ranges[(size_t) stage_index];
@@ -2710,6 +2810,13 @@ int main(int argc, char ** argv) {
                                         embd_batch.embd,
                                         chunk.embeddings.data() + embd_offset,
                                         sizeof(float) * embd_count);
+                                    if (staged_same_topology_requires_token_sideband(stage_model) &&
+                                        chunk.tokens.size() >= (size_t) processed + (size_t) current_tokens) {
+                                        populate_embd_batch_tokens(
+                                            embd_batch,
+                                            chunk.tokens.data() + processed,
+                                            current_tokens);
+                                    }
                                     for (int token_index = 0; token_index < current_tokens; ++token_index) {
                                         embd_batch.pos[token_index] = (llama_pos) (chunk.pos_start + processed + token_index);
                                         embd_batch.n_seq_id[token_index] = 1;
@@ -2778,6 +2885,9 @@ int main(int argc, char ** argv) {
                                         next_chunk.chunk_index = chunk.chunk_index * 100000 + tile_index * 1000 + subchunk_index;
                                         next_chunk.pos_start = chunk.pos_start + processed + emitted;
                                         next_chunk.token_count = subchunk_tokens;
+                                        next_chunk.tokens.assign(
+                                            chunk.tokens.begin() + (ptrdiff_t) processed + emitted,
+                                            chunk.tokens.begin() + (ptrdiff_t) processed + emitted + subchunk_tokens);
                                         const size_t embd_offset = (size_t) emitted * (size_t) n_embd;
                                         next_chunk.embeddings.assign(
                                             tile_embeddings.begin() + (ptrdiff_t) embd_offset,
@@ -2791,6 +2901,9 @@ int main(int argc, char ** argv) {
                                     next_chunk.chunk_index = chunk.chunk_index * 1000 + tile_index;
                                     next_chunk.pos_start = chunk.pos_start + processed;
                                     next_chunk.token_count = current_tokens;
+                                    next_chunk.tokens.assign(
+                                        chunk.tokens.begin() + (ptrdiff_t) processed,
+                                        chunk.tokens.begin() + (ptrdiff_t) processed + current_tokens);
                                     next_chunk.embeddings = std::move(tile_embeddings);
                                     produced_chunks.push_back(std::move(next_chunk));
                                 }
@@ -2910,6 +3023,23 @@ int main(int argc, char ** argv) {
             const double staged_prefill_t1 = ggml_time_us() / 1e6;
             metrics.staged_prefill_elapsed_s = staged_prefill_t1 - staged_prefill_t0;
 
+            // Record the actual per-stage sequence-state footprint after live
+            // prefill completes so benchmark summaries can track KV residency
+            // across all stage owners instead of the earlier placeholder sizes.
+            metrics.stage_state_bytes.clear();
+            metrics.stage_state_bytes.reserve((size_t) metrics.stage_count);
+            for (int stage_index = 0; stage_index < metrics.stage_count; ++stage_index) {
+                const auto [il_start, il_end] = stage_ranges[(size_t) stage_index];
+                const bool stage_uses_shard_model =
+                    !multistage_model_paths.empty() &&
+                    (size_t) stage_index < multistage_model_paths.size() &&
+                    multistage_model_paths[(size_t) stage_index] != params.model.path;
+                const size_t stage_state_size = stage_uses_shard_model
+                    ? llama_state_seq_get_size(stage_ctxs[(size_t) stage_index], 0)
+                    : llama_state_seq_get_size_range(stage_ctxs[(size_t) stage_index], 0, il_start, il_end, 0);
+                metrics.stage_state_bytes.push_back(stage_state_size);
+            }
+
             if (!error_message.empty()) {
                 LOG_ERR("%s\n", error_message.c_str());
                 cleanup_stage_ctxs();
@@ -3010,6 +3140,9 @@ int main(int argc, char ** argv) {
                     llama_batch embd_batch = llama_batch_init(1, n_embd_inp, 1);
                     embd_batch.n_tokens = 1;
                     std::memcpy(embd_batch.embd, boundary_embd.data(), sizeof(float) * (size_t) n_embd_inp);
+                    if (staged_same_topology_requires_token_sideband(llama_get_model(stage_ctx))) {
+                        populate_embd_batch_tokens(embd_batch, &current_token, 1);
+                    }
                     embd_batch.pos[0] = (llama_pos) (prompt_tokens.size() + step);
                     embd_batch.n_seq_id[0] = 1;
                     embd_batch.seq_id[0][0] = 0;
@@ -3381,6 +3514,69 @@ int main(int argc, char ** argv) {
         }
 
         llama_token baseline_current_token = select_greedy_token(baseline_logits, n_vocab);
+        split_metrics.prompt_boundary_seed_baseline_token = baseline_current_token;
+
+        {
+            llama_context * prompt_stage1_ctx = llama_init_from_model(model, proof_ctx_params);
+            llama_context * prompt_stage2_ctx = llama_init_from_model(shadow_model ? shadow_model : model, proof_ctx_params);
+            if (prompt_stage1_ctx && prompt_stage2_ctx) {
+                llama_set_embeddings(prompt_stage1_ctx, true);
+                llama_set_logits(prompt_stage1_ctx, false);
+                llama_set_embeddings(prompt_stage2_ctx, true);
+                llama_set_compute_range(prompt_stage1_ctx, 0, split_compute_layer);
+                llama_set_compute_range(prompt_stage2_ctx, split_compute_layer, n_layer);
+
+                const double prompt_stage1_t0 = ggml_time_us() / 1e6;
+                const int prompt_stage1_rc = llama_decode(prompt_stage1_ctx, llama_batch_get_one(prompt_tokens.data(), prompt_tokens.size()));
+                const double prompt_stage1_t1 = ggml_time_us() / 1e6;
+                split_metrics.prompt_boundary_stage1_prefill_elapsed_s = prompt_stage1_t1 - prompt_stage1_t0;
+
+                if (prompt_stage1_rc == 0) {
+                    llama_batch prompt_embd_batch = llama_batch_init((int32_t) prompt_tokens.size(), n_embd_inp, 1);
+                    prompt_embd_batch.n_tokens = (int32_t) prompt_tokens.size();
+                    bool prompt_boundary_ok = true;
+                    for (size_t token_index = 0; token_index < prompt_tokens.size(); ++token_index) {
+                        float * token_embd = llama_get_embeddings_ith(prompt_stage1_ctx, (int32_t) token_index);
+                        if (!token_embd) {
+                            prompt_boundary_ok = false;
+                            break;
+                        }
+                        std::memcpy(
+                            prompt_embd_batch.embd + token_index * (size_t) n_embd_inp,
+                            token_embd,
+                            sizeof(float) * (size_t) n_embd_inp);
+                        prompt_embd_batch.pos[token_index] = (llama_pos) token_index;
+                        prompt_embd_batch.n_seq_id[token_index] = 1;
+                        prompt_embd_batch.seq_id[token_index][0] = 0;
+                        prompt_embd_batch.logits[token_index] = token_index + 1 == prompt_tokens.size();
+                    }
+                    if (prompt_boundary_ok && staged_same_topology_requires_token_sideband(llama_get_model(prompt_stage2_ctx))) {
+                        populate_embd_batch_tokens(prompt_embd_batch, prompt_tokens.data(), (int) prompt_tokens.size());
+                    }
+                    const double prompt_stage2_t0 = ggml_time_us() / 1e6;
+                    const int prompt_stage2_rc = prompt_boundary_ok ? llama_decode(prompt_stage2_ctx, prompt_embd_batch) : -1;
+                    const double prompt_stage2_t1 = ggml_time_us() / 1e6;
+                    split_metrics.prompt_boundary_stage2_prefill_elapsed_s = prompt_stage2_t1 - prompt_stage2_t0;
+                    if (prompt_stage2_rc == 0) {
+                        const float * prompt_stage2_logits = llama_get_logits_ith(prompt_stage2_ctx, -1);
+                        if (prompt_stage2_logits) {
+                            split_metrics.prompt_boundary_seed_split_token =
+                                select_greedy_token(prompt_stage2_logits, n_vocab);
+                            split_metrics.prompt_boundary_seed_match =
+                                split_metrics.prompt_boundary_seed_split_token == split_metrics.prompt_boundary_seed_baseline_token;
+                        }
+                    }
+                    llama_batch_free(prompt_embd_batch);
+                }
+            }
+            if (prompt_stage1_ctx) {
+                llama_free(prompt_stage1_ctx);
+            }
+            if (prompt_stage2_ctx) {
+                llama_free(prompt_stage2_ctx);
+            }
+        }
+
         llama_token split_current_token = baseline_current_token;
         split_metrics.first_generated_token = baseline_current_token;
         split_metrics.token_match = true;

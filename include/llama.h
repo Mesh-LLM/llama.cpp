@@ -220,8 +220,11 @@ extern "C" {
     // A llama_batch object can contain input about one or many sequences
     // The provided arrays (i.e. token, embd, pos, etc.) must have size of n_tokens
     //
-    // - token  : the token ids of the input (used when embd is NULL)
-    // - embd   : token embeddings (i.e. float vector of size n_embd) (used when token is NULL)
+    // - token  : the token ids of the input
+    // - embd   : token embeddings (i.e. float vector of size n_embd)
+    //            If both token and embd are provided, embd is used as the primary
+    //            embedding input while token remains available as sideband metadata
+    //            for architecture-specific paths.
     // - pos    : the positions of the respective token in the sequence
     //            (if set to NULL, the token position will be tracked automatically by llama_encode/llama_decode)
     // - seq_id : the sequence to which the respective token belongs

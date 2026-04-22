@@ -215,7 +215,11 @@ static bool should_include_tensor(const char * name, int layer_start, int layer_
         return layer_id >= layer_start && layer_id < layer_end;
     }
 
-    if ((is_output_norm_tensor(name) || is_output_tensor(name)) && !include_output) {
+    if (is_output_norm_tensor(name)) {
+        return true;
+    }
+
+    if (is_output_tensor(name) && !include_output) {
         return false;
     }
 

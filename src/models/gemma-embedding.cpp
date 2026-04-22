@@ -10,7 +10,8 @@ llm_build_gemma_embedding::llm_build_gemma_embedding(const llama_model & model, 
     inpL = build_inp_embd(model.tok_embd);
 
     // important: do not normalize weights for raw embeddings input (i.e. encoded image embeddings)
-    inpL = ggml_scale(ctx0, inpL, ubatch.token ? sqrtf(n_embd) : 1.0f);
+    const bool use_raw_token_embeddings = ubatch.token && !ubatch.embd;
+    inpL = ggml_scale(ctx0, inpL, use_raw_token_embeddings ? sqrtf(n_embd) : 1.0f);
     cb(inpL, "inp_scaled", -1);
 
     // inp_pos - contains the positions

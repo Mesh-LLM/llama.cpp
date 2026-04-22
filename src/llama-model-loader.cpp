@@ -896,6 +896,8 @@ const struct ggml_tensor * llama_model_loader::check_tensor_dims(const std::stri
         throw std::runtime_error(format("%s: tensor '%s' not found", __func__, name.c_str()));
     }
 
+    requested_tensors.insert(name);
+
     {
         bool is_ok = true;
         for (size_t i = 0; i < GGML_MAX_DIMS; ++i) {
@@ -1349,7 +1351,28 @@ struct ggml_tensor * llama_model_loader::create_tensor_as_view(struct ggml_conte
 
 void llama_model_loader::done_getting_tensors() const {
     if (n_created != n_tensors) {
-        throw std::runtime_error(format("%s: wrong number of tensors; expected %d, got %d", __func__, n_tensors, n_created));
+        std::string unused_names;
+        int unused_count = 0;
+        for (const auto & it : weights_map) {
+            if (requested_tensors.find(it.first) != requested_tensors.end()) {
+                continue;
+            }
+            if (unused_count < 8) {
+                if (!unused_names.empty()) {
+                    unused_names += ", ";
+                }
+                unused_names += it.first;
+            }
+            unused_count++;
+        }
+        throw std::runtime_error(format(
+            "%s: wrong number of tensors; expected %d, got %d; unconsumed tensors: %d%s%s",
+            __func__,
+            n_tensors,
+            n_created,
+            unused_count,
+            unused_names.empty() ? "" : " [",
+            unused_names.empty() ? "" : (unused_names + "]").c_str()));
     }
     if (n_tensors_moved > 0) {
         LLAMA_LOG_DEBUG("%s: tensor '%s' (%s) (and %zu others) cannot be used with preferred buffer type %s, using %s instead\n",

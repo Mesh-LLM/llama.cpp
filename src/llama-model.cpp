@@ -4613,6 +4613,7 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                 {
                     const uint32_t n_embd_per_layer = hparams.n_embd_per_layer;
                     const int64_t  n_ff_exp         = hparams.n_ff_exp;
+                    const bool     layer_shard_active = ml.has_layer_shard();
 
                     if (n_embd_head_k != n_embd_head_v) {
                         throw std::runtime_error("Gemma 4 requires n_embd_head_k == n_embd_head_v");
@@ -4664,7 +4665,9 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                         if (!hparams.is_swa(i)) {
                             // full_attention layers use rope_freqs for proportional rope
                             layer.rope_freqs = create_tensor(tn(LLM_TENSOR_ROPE_FREQS, "weight", i), {n_embd_head/2}, rope_freqs_flag);
-                            rope_freqs_flag = TENSOR_DUPLICATED;
+                            if (!layer_shard_active || ml.layer_in_shard(i)) {
+                                rope_freqs_flag = TENSOR_DUPLICATED;
+                            }
                         }
 
                         // handle use_double_wide_mlp
