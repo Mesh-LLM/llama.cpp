@@ -37,6 +37,11 @@ static std::string model_architecture_name(const llama_model * model) {
 
 static bool staged_same_topology_requires_token_sideband(const llama_model * model) {
     const std::string arch = model_architecture_name(model);
+    return arch == "gemma4" || arch == "qwen35moe";
+}
+
+static bool staged_same_topology_prompt_boundary_unsupported(const llama_model * model) {
+    const std::string arch = model_architecture_name(model);
     return arch == "gemma4";
 }
 
@@ -91,6 +96,7 @@ struct prefill_handoff_metrics {
     int speculative_rollback_count = 0;
     std::string speculative_draft_mode = "disabled";
     std::string output_text;
+    std::vector<int> generated_token_ids_trace;
 };
 
 struct split_compute_metrics {
@@ -127,6 +133,10 @@ struct split_compute_metrics {
     int prompt_boundary_seed_baseline_token = -1;
     int prompt_boundary_seed_split_token = -1;
     std::string output_text;
+    std::vector<int> decode_input_tokens;
+    std::vector<int> baseline_predicted_tokens;
+    std::vector<int> split_predicted_tokens;
+    std::vector<uint64_t> debug_stage1_boundary_hashes;
 };
 
 struct multistage_compute_metrics {
@@ -145,6 +155,8 @@ struct multistage_compute_metrics {
     int seed_token = -1;
     uint64_t baseline_state_bytes = 0;
     double baseline_prefill_elapsed_s = 0.0;
+    std::vector<double> baseline_prefill_layer_elapsed_s;
+    std::vector<int32_t> baseline_prefill_layer_observation_count;
     double baseline_first_decode_elapsed_s = 0.0;
     double baseline_total_decode_elapsed_s = 0.0;
     double staged_prefill_elapsed_s = 0.0;
@@ -187,7 +199,86 @@ struct multistage_compute_metrics {
     std::vector<double> live_prefill_edge_transport_elapsed_s;
     std::vector<int32_t> live_prefill_edge_max_queue_depth;
     std::vector<std::vector<uint64_t>> debug_decode_stage_boundary_hashes;
+    std::vector<int> decode_input_tokens;
+    std::vector<int> baseline_predicted_tokens;
+    std::vector<int> staged_predicted_tokens;
 };
+
+struct baseline_prefill_layer_timing_probe {
+    bool enabled = false;
+    bool active = false;
+    double prefill_start_s = 0.0;
+    double last_event_s = 0.0;
+    bool has_last_event = false;
+    std::vector<double> layer_elapsed_s;
+    std::vector<int32_t> layer_observation_count;
+
+    void reset(int32_t n_layer) {
+        enabled = true;
+        active = false;
+        prefill_start_s = 0.0;
+        last_event_s = 0.0;
+        has_last_event = false;
+        layer_elapsed_s.assign((size_t) n_layer, 0.0);
+        layer_observation_count.assign((size_t) n_layer, 0);
+    }
+
+    void begin() {
+        active = true;
+        prefill_start_s = ggml_time_us() / 1e6;
+        last_event_s = prefill_start_s;
+        has_last_event = false;
+        std::fill(layer_elapsed_s.begin(), layer_elapsed_s.end(), 0.0);
+        std::fill(layer_observation_count.begin(), layer_observation_count.end(), 0);
+    }
+
+    void end() {
+        active = false;
+    }
+};
+
+static bool parse_l_out_layer_index(const ggml_tensor * t, int32_t & layer_index) {
+    const char * name = ggml_get_name(t);
+    if (name == nullptr) {
+        return false;
+    }
+    static constexpr const char * prefix = "l_out-";
+    static constexpr size_t prefix_len = 6;
+    if (std::strncmp(name, prefix, prefix_len) != 0) {
+        return false;
+    }
+    char * end = nullptr;
+    const long value = std::strtol(name + prefix_len, &end, 10);
+    if (end == name + prefix_len || end == nullptr || *end != '\0' || value < 0) {
+        return false;
+    }
+    layer_index = (int32_t) value;
+    return true;
+}
+
+static bool baseline_prefill_layer_timing_eval_cb(ggml_tensor * t, bool ask, void * user_data) {
+    auto * probe = static_cast<baseline_prefill_layer_timing_probe *>(user_data);
+    if (probe == nullptr || !probe->enabled || !probe->active) {
+        return false;
+    }
+    int32_t layer_index = -1;
+    if (!parse_l_out_layer_index(t, layer_index)) {
+        return false;
+    }
+    if (ask) {
+        return true;
+    }
+    if (layer_index < 0 || (size_t) layer_index >= probe->layer_elapsed_s.size()) {
+        return true;
+    }
+    const double now_s = ggml_time_us() / 1e6;
+    const double delta_s = probe->has_last_event ? (now_s - probe->last_event_s) : (now_s - probe->prefill_start_s);
+    probe->layer_elapsed_s[(size_t) layer_index] += std::max(0.0, delta_s);
+    probe->layer_observation_count[(size_t) layer_index] += 1;
+    probe->last_event_s = now_s;
+    probe->has_last_event = true;
+    return true;
+}
 
 static std::pair<std::string, bool> build_generation_prompt(
     const llama_model * model,
@@ -272,6 +363,9 @@ static int multistage_live_prefill_tile_tokens = 0;
 static int multistage_live_prefill_fill_chunk_tokens = 0;
 static int multistage_live_prefill_fill_chunk_count = 0;
 static int multistage_live_prefill_max_inflight = 0;
+static int multistage_live_prefill_reply_credit_limit = -1;
+static bool multistage_live_decode_replay = false;
+static int multistage_live_decode_replay_window = 1;
 static bool multistage_live_prefill_source_buffer = false;
 static bool multistage_keep_stage_logits = false;
 static double multistage_live_prefill_hop_latency_ms = 0.0;
@@ -279,18 +373,148 @@ static double multistage_live_prefill_hop_jitter_ms = 0.0;
 static double multistage_live_prefill_hop_bandwidth_mbps = 0.0;
 static int multistage_live_prefill_seed = 0;
 static bool multistage_debug_trace = false;
+static bool multistage_live_prefill_import_baseline_state = false;
+static bool multistage_live_decode_import_baseline_state = false;
+static bool multistage_live_decode_auto_pos = false;
+static int multistage_live_decode_light_context_tokens = 0;
+static bool baseline_prefill_layer_timing = false;
 static std::mutex multistage_live_prefill_runtime_mutex;
 static std::string multistage_stage_server_listen_addr;
 static std::string multistage_stage_next_connect_addr;
 static std::string multistage_stage_driver_connect_addr;
 static int multistage_stage_index = -1;
 static int multistage_stage_session_count = 1;
+static int multistage_stage_il_start = -1;
+static int multistage_stage_il_end = -1;
 
 enum multistage_stage_message_kind : int32_t {
     MULTISTAGE_STAGE_MSG_PREFILL_EMBD = 1,
     MULTISTAGE_STAGE_MSG_DECODE_EMBD = 2,
     MULTISTAGE_STAGE_MSG_STOP = 3,
+    MULTISTAGE_STAGE_MSG_PREFILL_FINAL_EMBD = 4,
+    MULTISTAGE_STAGE_MSG_DECODE_REPLAY_EMBD = 5,
+    MULTISTAGE_STAGE_MSG_DECODE_REPLAY_FINAL_EMBD = 6,
+    MULTISTAGE_STAGE_MSG_STATE_IMPORT = 7,
+    MULTISTAGE_STAGE_MSG_DECODE_READOUT = 8,
+    MULTISTAGE_STAGE_MSG_DECODE_LIGHT_CTX = 9,
 };
+
+enum multistage_stage_reply_kind : int32_t {
+    MULTISTAGE_STAGE_REPLY_ACK = 1,
+    MULTISTAGE_STAGE_REPLY_PREDICTED_TOKEN = 2,
+};
+
+enum multistage_stage_phase_kind : int32_t {
+    MULTISTAGE_STAGE_PHASE_PREFILL = 1,
+    MULTISTAGE_STAGE_PHASE_DECODE = 2,
+    MULTISTAGE_STAGE_PHASE_DECODE_REPLAY = 3,
+    MULTISTAGE_STAGE_PHASE_DECODE_LIGHT = 4,
+};
+
+enum multistage_stage_state_flags : int32_t {
+    MULTISTAGE_STAGE_STATE_FLAG_FINAL_CHUNK = 1 << 0,
+    MULTISTAGE_STAGE_STATE_FLAG_LIGHT_CONTEXT = 1 << 1,
+};
+
+static constexpr int32_t MULTISTAGE_STAGE_STATE_VERSION = 1;
+
+struct multistage_stage_state_header {
+    int32_t version = MULTISTAGE_STAGE_STATE_VERSION;
+    int32_t seq_id = 0;
+    int32_t phase = 0;
+    int32_t flags = 0;
+    int32_t checkpoint_generation = 0;
+    int32_t prompt_token_count = 0;
+    int32_t decode_step = -1;
+    int32_t current_token = LLAMA_TOKEN_NULL;
+    int32_t source_stage_index = -1;
+    int32_t reserved = 0;
+};
+
+static bool multistage_stage_msg_is_prefill(int32_t kind) {
+    return kind == MULTISTAGE_STAGE_MSG_PREFILL_EMBD ||
+           kind == MULTISTAGE_STAGE_MSG_PREFILL_FINAL_EMBD;
+}
+
+static bool multistage_stage_msg_requires_predicted_reply(int32_t kind) {
+    return kind == MULTISTAGE_STAGE_MSG_DECODE_EMBD ||
+           kind == MULTISTAGE_STAGE_MSG_DECODE_READOUT ||
+           kind == MULTISTAGE_STAGE_MSG_DECODE_LIGHT_CTX ||
+           kind == MULTISTAGE_STAGE_MSG_PREFILL_FINAL_EMBD ||
+           kind == MULTISTAGE_STAGE_MSG_DECODE_REPLAY_FINAL_EMBD;
+}
+
+static bool multistage_stage_msg_is_decode_replay(int32_t kind) {
+    return kind == MULTISTAGE_STAGE_MSG_DECODE_REPLAY_EMBD ||
+           kind == MULTISTAGE_STAGE_MSG_DECODE_REPLAY_FINAL_EMBD;
+}
+
+static bool multistage_stage_msg_is_decode_light_context(int32_t kind) {
+    return kind == MULTISTAGE_STAGE_MSG_DECODE_LIGHT_CTX;
+}
+
+static bool multistage_stage_state_matches_kind(
+    int32_t kind,
+    const multistage_stage_state_header & stage_state
+) {
+    if (kind == MULTISTAGE_STAGE_MSG_STATE_IMPORT) {
+        return true;
+    }
+    int32_t expected_phase = MULTISTAGE_STAGE_PHASE_DECODE;
+    if (multistage_stage_msg_is_prefill(kind)) {
+        expected_phase = MULTISTAGE_STAGE_PHASE_PREFILL;
+    } else if (multistage_stage_msg_is_decode_replay(kind)) {
+        expected_phase = MULTISTAGE_STAGE_PHASE_DECODE_REPLAY;
+    } else if (multistage_stage_msg_is_decode_light_context(kind)) {
+        expected_phase = MULTISTAGE_STAGE_PHASE_DECODE_LIGHT;
+    }
+    if (stage_state.phase != expected_phase) {
+        return false;
+    }
+    const bool expected_final =
+        kind == MULTISTAGE_STAGE_MSG_PREFILL_FINAL_EMBD ||
+        kind == MULTISTAGE_STAGE_MSG_DECODE_REPLAY_FINAL_EMBD;
+    const bool actual_final =
+        (stage_state.flags & MULTISTAGE_STAGE_STATE_FLAG_FINAL_CHUNK) != 0;
+    if (expected_final != actual_final) {
+        return false;
+    }
+    const bool expected_light_context = multistage_stage_msg_is_decode_light_context(kind);
+    const bool actual_light_context =
+        (stage_state.flags & MULTISTAGE_STAGE_STATE_FLAG_LIGHT_CONTEXT) != 0;
+    return expected_light_context == actual_light_context;
+}
+
+static multistage_stage_state_header make_stage_state_header(
+    int32_t kind,
+    int32_t checkpoint_generation = 0,
+    int32_t prompt_token_count = 0,
+    int32_t decode_step = -1,
+    int32_t current_token = LLAMA_TOKEN_NULL,
+    int32_t source_stage_index = -1
+) {
+    multistage_stage_state_header header;
+    if (kind == MULTISTAGE_STAGE_MSG_STATE_IMPORT || multistage_stage_msg_is_prefill(kind)) {
+        header.phase = MULTISTAGE_STAGE_PHASE_PREFILL;
+    } else if (multistage_stage_msg_is_decode_replay(kind)) {
+        header.phase = MULTISTAGE_STAGE_PHASE_DECODE_REPLAY;
+    } else if (multistage_stage_msg_is_decode_light_context(kind)) {
+        header.phase = MULTISTAGE_STAGE_PHASE_DECODE_LIGHT;
+        header.flags |= MULTISTAGE_STAGE_STATE_FLAG_LIGHT_CONTEXT;
+    } else {
+        header.phase = MULTISTAGE_STAGE_PHASE_DECODE;
+    }
+    if (kind == MULTISTAGE_STAGE_MSG_PREFILL_FINAL_EMBD ||
+        kind == MULTISTAGE_STAGE_MSG_DECODE_REPLAY_FINAL_EMBD) {
+        header.flags |= MULTISTAGE_STAGE_STATE_FLAG_FINAL_CHUNK;
+    }
+    header.checkpoint_generation = checkpoint_generation;
+    header.prompt_token_count = prompt_token_count;
+    header.decode_step = decode_step;
+    header.current_token = current_token;
+    header.source_stage_index = source_stage_index;
+    return header;
+}
 
 static uint64_t fnv1a64_bytes(const void * data, size_t size) {
     const uint8_t * bytes = static_cast<const uint8_t *>(data);
@@ -392,16 +616,18 @@ static bool send_stage_message(
     int32_t kind,
     int32_t pos_start,
     int32_t token_count,
+    const multistage_stage_state_header & stage_state,
     const llama_token * tokens,
     size_t token_payload_count,
     const float * embeddings,
     size_t embedding_count
 ) {
     const int32_t token_sideband_count = (int32_t) token_payload_count;
-    if (!send_all(fd, &kind, sizeof(kind)) ||
-        !send_all(fd, &pos_start, sizeof(pos_start)) ||
-        !send_all(fd, &token_count, sizeof(token_count)) ||
-        !send_all(fd, &token_sideband_count, sizeof(token_sideband_count))) {
+    const int32_t header[4] = {kind, pos_start, token_count, token_sideband_count};
+    if (!send_all(fd, header, sizeof(header))) {
+        return false;
+    }
+    if (!send_all(fd, &stage_state, sizeof(stage_state))) {
         return false;
     }
     if (token_payload_count > 0 && tokens != nullptr) {
@@ -415,29 +641,98 @@ static bool send_stage_message(
     return true;
 }
 
+static bool send_stage_state_import_message(
+    int fd,
+    int32_t target_stage_index,
+    const multistage_stage_state_header & stage_state,
+    const uint8_t * state_bytes,
+    size_t state_byte_count
+) {
+    const int32_t header[4] = {
+        MULTISTAGE_STAGE_MSG_STATE_IMPORT,
+        target_stage_index,
+        (int32_t) state_byte_count,
+        0,
+    };
+    if (!send_all(fd, header, sizeof(header))) {
+        return false;
+    }
+    if (!send_all(fd, &stage_state, sizeof(stage_state))) {
+        return false;
+    }
+    if (state_byte_count > 0 && state_bytes != nullptr) {
+        return send_all(fd, state_bytes, state_byte_count);
+    }
+    return true;
+}
+
+static bool send_stage_reply_ack(int fd) {
+    const int32_t payload[2] = {MULTISTAGE_STAGE_REPLY_ACK, 0};
+    return send_all(fd, payload, sizeof(payload));
+}
+
+static bool send_stage_reply_predicted(int fd, int32_t predicted) {
+    const int32_t payload[2] = {MULTISTAGE_STAGE_REPLY_PREDICTED_TOKEN, predicted};
+    return send_all(fd, payload, sizeof(payload));
+}
+
+static bool recv_stage_reply(
+    int fd,
+    int32_t & reply_kind,
+    int32_t & predicted
+) {
+    int32_t payload[2] = {0, 0};
+    if (!recv_all(fd, payload, sizeof(payload))) {
+        return false;
+    }
+    reply_kind = payload[0];
+    predicted = payload[1];
+    return reply_kind == MULTISTAGE_STAGE_REPLY_ACK ||
+           reply_kind == MULTISTAGE_STAGE_REPLY_PREDICTED_TOKEN;
+}
+
 static bool recv_stage_message(
     int fd,
     int32_t & kind,
     int32_t & pos_start,
     int32_t & token_count,
+    multistage_stage_state_header & stage_state,
     std::vector<llama_token> & tokens,
     std::vector<float> & embeddings,
+    std::vector<uint8_t> & raw_bytes,
     int32_t n_embd
 ) {
-    int32_t token_sideband_count = 0;
-    if (!recv_all(fd, &kind, sizeof(kind)) ||
-        !recv_all(fd, &pos_start, sizeof(pos_start)) ||
-        !recv_all(fd, &token_count, sizeof(token_count)) ||
-        !recv_all(fd, &token_sideband_count, sizeof(token_sideband_count))) {
+    int32_t header[4] = {0, 0, 0, 0};
+    if (!recv_all(fd, header, sizeof(header))) {
+        return false;
+    }
+    kind = header[0];
+    pos_start = header[1];
+    token_count = header[2];
+    const int32_t token_sideband_count = header[3];
+    if (!recv_all(fd, &stage_state, sizeof(stage_state))) {
+        return false;
+    }
+    if (stage_state.version != MULTISTAGE_STAGE_STATE_VERSION) {
         return false;
     }
     if (kind == MULTISTAGE_STAGE_MSG_STOP) {
         tokens.clear();
         embeddings.clear();
+        raw_bytes.clear();
         return true;
     }
     if (token_count < 0 || token_sideband_count < 0) {
         return false;
+    }
+    if (kind == MULTISTAGE_STAGE_MSG_STATE_IMPORT) {
+        tokens.clear();
+        embeddings.clear();
+        raw_bytes.resize((size_t) token_count);
+        if (!raw_bytes.empty()) {
+            return recv_all(fd, raw_bytes.data(), raw_bytes.size());
+        }
+        return true;
     }
     tokens.resize((size_t) token_sideband_count);
     if (!tokens.empty()) {
@@ -446,6 +741,7 @@ static bool recv_stage_message(
         }
     }
     embeddings.resize((size_t) token_count * (size_t) n_embd);
+    raw_bytes.clear();
     if (!embeddings.empty()) {
         return recv_all(fd, embeddings.data(), sizeof(float) * embeddings.size());
     }
@@ -483,6 +779,17 @@ static std::vector<int32_t> parse_int32_csv(const std::string & text) {
         values.push_back((int32_t) std::atoi(item.c_str()));
     }
     return values;
+}
+
+static int32_t multistage_stage_expected_pos_start(
+    int32_t kind,
+    const multistage_stage_state_header & stage_state,
+    int32_t token_count
+) {
+    if (multistage_stage_msg_is_decode_light_context(kind)) {
+        return stage_state.prompt_token_count + stage_state.decode_step + 1 - token_count;
+    }
+    return stage_state.prompt_token_count + stage_state.decode_step;
 }
 
 static std::vector<std::string> parse_string_csv(const std::string & text) {
@@ -796,7 +1103,13 @@ static void write_result_json(
     out << "    \"speculative_rollback_count\": " << metrics.speculative_rollback_count << ",\n";
     out << "    \"speculative_draft_mode\": ";
     write_json_string(out, metrics.speculative_draft_mode);
-    out << "\n";
+    out << ",\n";
+    out << "    \"generated_token_ids\": [";
+    for (size_t i = 0; i < metrics.generated_token_ids_trace.size(); ++i) {
+        if (i > 0) out << ", ";
+        out << metrics.generated_token_ids_trace[i];
+    }
+    out << "]\n";
     out << "  },\n";
     out << "  \"output_text\": ";
     write_json_string(out, metrics.output_text);
@@ -850,7 +1163,31 @@ static void write_split_compute_json(
     out << "    \"token_match\": " << (metrics.token_match ? "true" : "false") << ",\n";
     out << "    \"prompt_boundary_seed_match\": " << (metrics.prompt_boundary_seed_match ? "true" : "false") << ",\n";
     out << "    \"prompt_boundary_seed_baseline_token\": " << metrics.prompt_boundary_seed_baseline_token << ",\n";
-    out << "    \"prompt_boundary_seed_split_token\": " << metrics.prompt_boundary_seed_split_token << "\n";
+    out << "    \"prompt_boundary_seed_split_token\": " << metrics.prompt_boundary_seed_split_token << ",\n";
+    out << "    \"decode_input_tokens\": [";
+    for (size_t i = 0; i < metrics.decode_input_tokens.size(); ++i) {
+        if (i > 0) out << ", ";
+        out << metrics.decode_input_tokens[i];
+    }
+    out << "],\n";
+    out << "    \"baseline_predicted_tokens\": [";
+    for (size_t i = 0; i < metrics.baseline_predicted_tokens.size(); ++i) {
+        if (i > 0) out << ", ";
+        out << metrics.baseline_predicted_tokens[i];
+    }
+    out << "],\n";
+    out << "    \"split_predicted_tokens\": [";
+    for (size_t i = 0; i < metrics.split_predicted_tokens.size(); ++i) {
+        if (i > 0) out << ", ";
+        out << metrics.split_predicted_tokens[i];
+    }
+    out << "],\n";
+    out << "    \"debug_stage1_boundary_hashes\": [";
+    for (size_t i = 0; i < metrics.debug_stage1_boundary_hashes.size(); ++i) {
+        if (i > 0) out << ", ";
+        out << metrics.debug_stage1_boundary_hashes[i];
+    }
+    out << "]\n";
     out << "  }\n";
     out << "}\n";
 }
@@ -885,6 +1222,18 @@ static void write_multistage_compute_json(
     out << "    \"seed_token\": " << metrics.seed_token << ",\n";
     out << "    \"baseline_state_bytes\": " << metrics.baseline_state_bytes << ",\n";
     out << "    \"baseline_prefill_elapsed_s\": " << metrics.baseline_prefill_elapsed_s << ",\n";
+    out << "    \"baseline_prefill_layer_elapsed_s\": [";
+    for (size_t i = 0; i < metrics.baseline_prefill_layer_elapsed_s.size(); ++i) {
+        if (i > 0) out << ", ";
+        out << metrics.baseline_prefill_layer_elapsed_s[i];
+    }
+    out << "],\n";
+    out << "    \"baseline_prefill_layer_observation_count\": [";
+    for (size_t i = 0; i < metrics.baseline_prefill_layer_observation_count.size(); ++i) {
+        if (i > 0) out << ", ";
+        out << metrics.baseline_prefill_layer_observation_count[i];
+    }
+    out << "],\n";
     out << "    \"baseline_first_decode_elapsed_s\": " << metrics.baseline_first_decode_elapsed_s << ",\n";
     out << "    \"baseline_total_decode_elapsed_s\": " << metrics.baseline_total_decode_elapsed_s << ",\n";
     out << "    \"staged_prefill_elapsed_s\": " << metrics.staged_prefill_elapsed_s << ",\n";
@@ -902,6 +1251,7 @@ static void write_multistage_compute_json(
     out << "    \"live_prefill_fill_chunk_tokens\": " << metrics.live_prefill_fill_chunk_tokens << ",\n";
     out << "    \"live_prefill_fill_chunk_count\": " << metrics.live_prefill_fill_chunk_count << ",\n";
     out << "    \"live_prefill_max_inflight\": " << metrics.live_prefill_max_inflight << ",\n";
+    out << "    \"live_prefill_reply_credit_limit\": " << multistage_live_prefill_reply_credit_limit << ",\n";
     out << "    \"live_prefill_source_buffer_enabled\": " << (metrics.live_prefill_source_buffer_enabled ? "true" : "false") << ",\n";
     out << "    \"keep_stage_logits\": " << (metrics.keep_stage_logits ? "true" : "false") << ",\n";
     out << "    \"live_prefill_hop_latency_ms\": " << metrics.live_prefill_hop_latency_ms << ",\n";
@@ -1019,6 +1369,24 @@ static void write_multistage_compute_json(
             out << row[stage];
         }
         out << "]";
+    }
+    out << "],\n";
+    out << "    \"decode_input_tokens\": [";
+    for (size_t i = 0; i < metrics.decode_input_tokens.size(); ++i) {
+        if (i > 0) out << ", ";
+        out << metrics.decode_input_tokens[i];
+    }
+    out << "],\n";
+    out << "    \"baseline_predicted_tokens\": [";
+    for (size_t i = 0; i < metrics.baseline_predicted_tokens.size(); ++i) {
+        if (i > 0) out << ", ";
+        out << metrics.baseline_predicted_tokens[i];
+    }
+    out << "],\n";
+    out << "    \"staged_predicted_tokens\": [";
+    for (size_t i = 0; i < metrics.staged_predicted_tokens.size(); ++i) {
+        if (i > 0) out << ", ";
+        out << metrics.staged_predicted_tokens[i];
     }
     out << "]\n";
     out << "  },\n";
@@ -1181,8 +1549,22 @@ int main(int argc, char ** argv) {
             multistage_live_prefill_fill_chunk_count = std::atoi(argv[++i]);
         } else if (std::strcmp(argv[i], "--multistage-live-prefill-max-inflight") == 0 && i + 1 < argc) {
             multistage_live_prefill_max_inflight = std::atoi(argv[++i]);
+        } else if (std::strcmp(argv[i], "--multistage-live-prefill-reply-credit-limit") == 0 && i + 1 < argc) {
+            multistage_live_prefill_reply_credit_limit = std::atoi(argv[++i]);
+        } else if (std::strcmp(argv[i], "--multistage-live-decode-replay") == 0) {
+            multistage_live_decode_replay = true;
+        } else if (std::strcmp(argv[i], "--multistage-live-decode-replay-window") == 0 && i + 1 < argc) {
+            multistage_live_decode_replay_window = std::max(std::atoi(argv[++i]), 1);
         } else if (std::strcmp(argv[i], "--multistage-live-prefill-source-buffer") == 0) {
             multistage_live_prefill_source_buffer = true;
+        } else if (std::strcmp(argv[i], "--multistage-live-prefill-import-baseline-state") == 0) {
+            multistage_live_prefill_import_baseline_state = true;
+        } else if (std::strcmp(argv[i], "--multistage-live-decode-import-baseline-state") == 0) {
+            multistage_live_decode_import_baseline_state = true;
+        } else if (std::strcmp(argv[i], "--multistage-live-decode-auto-pos") == 0) {
+            multistage_live_decode_auto_pos = true;
+        } else if (std::strcmp(argv[i], "--multistage-live-decode-light-context-tokens") == 0 && i + 1 < argc) {
+            multistage_live_decode_light_context_tokens = std::max(std::atoi(argv[++i]), 0);
         } else if (std::strcmp(argv[i], "--multistage-keep-stage-logits") == 0) {
             multistage_keep_stage_logits = true;
         } else if (std::strcmp(argv[i], "--multistage-live-prefill-hop-latency-ms") == 0 && i + 1 < argc) {
@@ -1195,6 +1577,8 @@ int main(int argc, char ** argv) {
             multistage_live_prefill_seed = std::atoi(argv[++i]);
         } else if (std::strcmp(argv[i], "--multistage-debug-trace") == 0) {
             multistage_debug_trace = true;
+        } else if (std::strcmp(argv[i], "--baseline-prefill-layer-timing") == 0) {
+            baseline_prefill_layer_timing = true;
         } else if (std::strcmp(argv[i], "--multistage-stage-server-listen") == 0 && i + 1 < argc) {
             multistage_stage_server_listen_addr = argv[++i];
         } else if (std::strcmp(argv[i], "--multistage-stage-next-connect") == 0 && i + 1 < argc) {
@@ -1205,6 +1589,10 @@ int main(int argc, char ** argv) {
             multistage_stage_index = std::atoi(argv[++i]);
         } else if (std::strcmp(argv[i], "--multistage-stage-session-count") == 0 && i + 1 < argc) {
             multistage_stage_session_count = std::atoi(argv[++i]);
+        } else if (std::strcmp(argv[i], "--multistage-stage-il-start") == 0 && i + 1 < argc) {
+            multistage_stage_il_start = std::atoi(argv[++i]);
+        } else if (std::strcmp(argv[i], "--multistage-stage-il-end") == 0 && i + 1 < argc) {
+            multistage_stage_il_end = std::atoi(argv[++i]);
         } else {
             filtered_argv.push_back(argv[i]);
         }
@@ -1263,6 +1651,10 @@ int main(int argc, char ** argv) {
         LOG_ERR("--multistage-live-prefill-max-inflight must be >= 0\n");
         return 1;
     }
+    if (multistage_live_prefill && multistage_live_prefill_reply_credit_limit < -1) {
+        LOG_ERR("--multistage-live-prefill-reply-credit-limit must be >= -1\n");
+        return 1;
+    }
     if (!state_in_path.empty() && !state_chunks_dir_path.empty()) {
         LOG_ERR("use either --state-in or --state-chunks-dir, not both\n");
         return 1;
@@ -1303,6 +1695,16 @@ int main(int argc, char ** argv) {
         LOG_ERR("--multistage-stage-session-count must be > 0\n");
         return 1;
     }
+    if ((multistage_stage_il_start >= 0 || multistage_stage_il_end >= 0) && !multistage_stage_server_mode) {
+        LOG_ERR("--multistage-stage-il-start/--multistage-stage-il-end require --multistage-stage-server-listen\n");
+        return 1;
+    }
+    if (multistage_stage_server_mode &&
+        (multistage_stage_il_start >= 0 || multistage_stage_il_end >= 0) &&
+        (multistage_stage_il_start < 0 || multistage_stage_il_end < 0 || multistage_stage_il_start >= multistage_stage_il_end)) {
+        LOG_ERR("--multistage-stage-il-start/--multistage-stage-il-end must define a non-empty range\n");
+        return 1;
+    }
     if (multistage_stage_driver_mode && multistage_compute_boundaries_csv.empty()) {
         LOG_ERR("--multistage-stage-driver-connect requires --multistage-compute-boundaries\n");
         return 1;
@@ -1323,6 +1725,7 @@ int main(int argc, char ** argv) {
 
     llama_model_params model_params = common_model_params_to_llama(params);
     llama_context_params ctx_params = common_context_params_to_llama(params);
+    baseline_prefill_layer_timing_probe baseline_layer_probe;
 
     llama_model * model = llama_model_load_from_file(params.model.path.c_str(), model_params);
     if (!model) {
@@ -1334,13 +1737,19 @@ int main(int argc, char ** argv) {
     if (multistage_live_prefill &&
         !multistage_stage_server_mode &&
         !multistage_compute_boundaries_csv.empty() &&
-        staged_same_topology_requires_token_sideband(model)) {
+        staged_same_topology_prompt_boundary_unsupported(model)) {
         LOG_ERR(
             "same-topology live prefill is unsupported for %s: prompt-boundary handoff diverges even though late-state split remains exact; use split late-state handoff instead\n",
             model_architecture_name(model).c_str());
         llama_model_free(model);
         llama_backend_free();
         return 1;
+    }
+
+    if (baseline_prefill_layer_timing) {
+        baseline_layer_probe.reset(llama_model_n_layer(model));
+        ctx_params.cb_eval = baseline_prefill_layer_timing_eval_cb;
+        ctx_params.cb_eval_user_data = &baseline_layer_probe;
     }
 
     llama_context * ctx = nullptr;
@@ -1462,42 +1871,279 @@ int main(int argc, char ** argv) {
                 llama_backend_free();
                 return 1;
             }
+            if (multistage_stage_il_start >= 0 && multistage_stage_il_end >= 0) {
+                llama_set_compute_range(session_ctx, multistage_stage_il_start, multistage_stage_il_end);
+            }
             llama_set_embeddings(session_ctx, true);
             llama_set_logits(session_ctx, !has_next_stage);
+            llama_context * replay_ctx = nullptr;
+            auto init_replay_ctx = [&]() -> bool {
+                if (replay_ctx) {
+                    return true;
+                }
+                replay_ctx = llama_init_from_model(model, server_ctx_params);
+                if (!replay_ctx) {
+                    return false;
+                }
+                if (multistage_stage_il_start >= 0 && multistage_stage_il_end >= 0) {
+                    llama_set_compute_range(replay_ctx, multistage_stage_il_start, multistage_stage_il_end);
+                }
+                llama_set_embeddings(replay_ctx, true);
+                llama_set_logits(replay_ctx, !has_next_stage);
+                return true;
+            };
+            auto reset_replay_ctx = [&]() -> bool {
+                if (replay_ctx) {
+                    llama_free(replay_ctx);
+                    replay_ctx = nullptr;
+                }
+                return init_replay_ctx();
+            };
 
             multistage_stage_server_session_summary session_summary;
             session_summary.session_index = session_index;
+            std::vector<llama_token> recv_tokens;
+            std::vector<float> recv_embeddings;
+            std::vector<uint8_t> recv_raw_bytes;
+            std::vector<float> next_embeddings;
+            std::deque<std::vector<uint8_t>> decode_replay_checkpoint_history;
+            bool have_decode_replay_checkpoint = false;
+            bool decode_replay_active = false;
+            int decode_replay_start_pos = -1;
+            int decode_replay_latest_committed_pos = -1;
+            int pending_prefill_replies = 0;
+            int expected_prompt_token_count = -1;
+            int last_decode_step = -1;
+            const int max_deferred_prefill_replies =
+                multistage_live_prefill_reply_credit_limit >= 0
+                    ? multistage_live_prefill_reply_credit_limit
+                    : std::max(multistage_live_prefill_max_inflight - 1, 0);
             auto set_last_error = [&](const std::string & value) {
                 if (session_summary.last_error.empty()) {
                     session_summary.last_error = value;
                 }
+            };
+            auto recv_checked_downstream_reply = [&](int32_t expected_reply_kind, int32_t & predicted) {
+                int32_t reply_kind = 0;
+                if (!recv_stage_reply(next_fd, reply_kind, predicted)) {
+                    set_last_error("forward_send_recv_failed");
+                    return false;
+                }
+                if (reply_kind != expected_reply_kind) {
+                    set_last_error(
+                        expected_reply_kind == MULTISTAGE_STAGE_REPLY_ACK
+                        ? "forward_reply_expected_ack"
+                        : "forward_reply_missing_predicted_token");
+                    return false;
+                }
+                return true;
             };
 
             while (true) {
                 int32_t message_kind = 0;
                 int32_t pos_start = 0;
                 int32_t token_count = 0;
-                std::vector<llama_token> tokens;
-                std::vector<float> embeddings;
+                multistage_stage_state_header recv_stage_state;
+                recv_tokens.clear();
+                recv_embeddings.clear();
                 const double recv_t0 = ggml_time_us() / 1e6;
-                if (!recv_stage_message(conn_fd, message_kind, pos_start, token_count, tokens, embeddings, n_embd_inp)) {
+                if (!recv_stage_message(
+                        conn_fd,
+                        message_kind,
+                        pos_start,
+                        token_count,
+                        recv_stage_state,
+                        recv_tokens,
+                        recv_embeddings,
+                        recv_raw_bytes,
+                        n_embd_inp)) {
                     set_last_error("recv_stage_message_failed");
                     break;
                 }
                 const double recv_t1 = ggml_time_us() / 1e6;
-                const bool is_prefill_message = message_kind == MULTISTAGE_STAGE_MSG_PREFILL_EMBD;
+                const bool is_prefill_message = multistage_stage_msg_is_prefill(message_kind);
+                const bool is_decode_replay_message = multistage_stage_msg_is_decode_replay(message_kind);
+                const bool is_decode_light_context_message =
+                    multistage_stage_msg_is_decode_light_context(message_kind);
+                const bool reply_requires_predicted = multistage_stage_msg_requires_predicted_reply(message_kind);
+                const bool is_control_message =
+                    message_kind == MULTISTAGE_STAGE_MSG_STOP ||
+                    message_kind == MULTISTAGE_STAGE_MSG_STATE_IMPORT;
+                if (recv_stage_state.seq_id != 0) {
+                    set_last_error("stage_state_seq_id_mismatch");
+                    break;
+                }
+                if (message_kind != MULTISTAGE_STAGE_MSG_STOP &&
+                    recv_stage_state.source_stage_index >= 0 &&
+                    recv_stage_state.source_stage_index != multistage_stage_index - 1) {
+                    set_last_error("stage_state_source_stage_mismatch");
+                    break;
+                }
+                if (!is_control_message && !is_prefill_message && recv_stage_state.decode_step < 0) {
+                    set_last_error("stage_state_decode_step_missing");
+                    break;
+                }
+                if (!is_control_message && !is_prefill_message && recv_stage_state.prompt_token_count <= 0) {
+                    set_last_error("stage_state_prompt_token_count_missing");
+                    break;
+                }
+                if (!is_control_message &&
+                    !is_prefill_message &&
+                    pos_start != multistage_stage_expected_pos_start(message_kind, recv_stage_state, token_count)) {
+                    set_last_error("stage_state_decode_pos_mismatch");
+                    break;
+                }
+                if ((message_kind == MULTISTAGE_STAGE_MSG_DECODE_EMBD ||
+                     is_decode_light_context_message) &&
+                    !recv_tokens.empty() &&
+                    recv_stage_state.current_token != LLAMA_TOKEN_NULL &&
+                    recv_stage_state.current_token != recv_tokens.back()) {
+                    set_last_error("stage_state_current_token_mismatch");
+                    break;
+                }
+                if (!multistage_stage_state_matches_kind(message_kind, recv_stage_state)) {
+                    set_last_error("stage_state_kind_mismatch");
+                    break;
+                }
+                if (!is_control_message && !is_prefill_message) {
+                    if (expected_prompt_token_count < 0) {
+                        expected_prompt_token_count = recv_stage_state.prompt_token_count;
+                    } else if (recv_stage_state.prompt_token_count != expected_prompt_token_count) {
+                        set_last_error("stage_state_prompt_token_count_changed");
+                        break;
+                    }
+                }
+                if (!is_control_message && !is_prefill_message && !is_decode_replay_message) {
+                    if (last_decode_step >= 0 && recv_stage_state.decode_step != last_decode_step + 1) {
+                        set_last_error("stage_state_decode_step_nonmonotonic");
+                        break;
+                    }
+                    last_decode_step = recv_stage_state.decode_step;
+                }
+                llama_context * active_ctx = session_ctx;
                 if (is_prefill_message) {
                     session_summary.prefill_recv_elapsed_s += recv_t1 - recv_t0;
                     session_summary.prefill_input_bytes +=
                         (uint64_t) (sizeof(int32_t) * 4 +
-                            (sizeof(llama_token) * tokens.size()) +
-                            (sizeof(float) * embeddings.size()));
+                            sizeof(multistage_stage_state_header) +
+                            (sizeof(llama_token) * recv_tokens.size()) +
+                            (sizeof(float) * recv_embeddings.size()));
                 }
                 if (message_kind == MULTISTAGE_STAGE_MSG_STOP) {
+                    if (pending_prefill_replies != 0) {
+                        set_last_error("stop_with_pending_prefill_replies");
+                    }
                     if (next_fd >= 0) {
-                        (void) send_stage_message(next_fd, message_kind, 0, 0, nullptr, 0, nullptr, 0);
+                        (void) send_stage_message(
+                            next_fd,
+                            message_kind,
+                            0,
+                            0,
+                            make_stage_state_header(message_kind),
+                            nullptr,
+                            0,
+                            nullptr,
+                            0);
                     }
                     break;
+                }
+
+                if (message_kind == MULTISTAGE_STAGE_MSG_STATE_IMPORT) {
+                    const bool target_this_stage = pos_start == multistage_stage_index;
+                    if (target_this_stage) {
+                        if (multistage_stage_il_start < 0 || multistage_stage_il_end < 0) {
+                            set_last_error("state_import_range_unavailable");
+                            break;
+                        }
+                        llama_memory_t session_mem = llama_get_memory(session_ctx);
+                        if (!session_mem) {
+                            set_last_error("state_import_memory_unavailable");
+                            break;
+                        }
+                        llama_memory_clear(session_mem, true);
+                        if (!llama_memory_seq_rm(session_mem, 0, -1, -1)) {
+                            set_last_error("state_import_memory_clear_failed");
+                            break;
+                        }
+                        const size_t imported = llama_state_seq_set_data_range(
+                            session_ctx,
+                            recv_raw_bytes.data(),
+                            recv_raw_bytes.size(),
+                            0,
+                            multistage_stage_il_start,
+                            multistage_stage_il_end,
+                            0);
+                        if (imported != recv_raw_bytes.size()) {
+                            set_last_error("state_import_failed");
+                            break;
+                        }
+                    } else if (next_fd >= 0) {
+                        multistage_stage_state_header forward_stage_state = recv_stage_state;
+                        forward_stage_state.source_stage_index = multistage_stage_index;
+                        const bool send_ok = send_stage_state_import_message(
+                            next_fd,
+                            pos_start,
+                            forward_stage_state,
+                            recv_raw_bytes.data(),
+                            recv_raw_bytes.size());
+                        if (!send_ok) {
+                            set_last_error("state_import_forward_failed");
+                            break;
+                        }
+                        int32_t ignored_predicted = -1;
+                        if (!recv_checked_downstream_reply(MULTISTAGE_STAGE_REPLY_ACK, ignored_predicted)) {
+                            break;
+                        }
+                    } else {
+                        set_last_error("state_import_missing_target_stage");
+                        break;
+                    }
+
+                    if (!send_stage_reply_ack(conn_fd)) {
+                        set_last_error("reply_send_failed");
+                        break;
+                    }
+                    continue;
+                }
+
+                if (message_kind == MULTISTAGE_STAGE_MSG_DECODE_READOUT) {
+                    int32_t predicted = -1;
+                    if (next_fd >= 0) {
+                        multistage_stage_state_header forward_stage_state = recv_stage_state;
+                        forward_stage_state.source_stage_index = multistage_stage_index;
+                        const bool send_ok = send_stage_message(
+                            next_fd,
+                            message_kind,
+                            pos_start,
+                            0,
+                            forward_stage_state,
+                            nullptr,
+                            0,
+                            nullptr,
+                            0);
+                        if (!send_ok) {
+                            set_last_error("readout_forward_failed");
+                            break;
+                        }
+                        int32_t ignored_predicted = -1;
+                        if (!recv_checked_downstream_reply(MULTISTAGE_STAGE_REPLY_PREDICTED_TOKEN, ignored_predicted)) {
+                            break;
+                        }
+                        predicted = ignored_predicted;
+                    } else {
+                        const float * stage_logits = llama_get_logits_ith(active_ctx, -1);
+                        if (!stage_logits) {
+                            set_last_error("stage_logits_unavailable");
+                            break;
+                        }
+                        predicted = (int32_t) select_greedy_token(stage_logits, n_vocab);
+                    }
+                    if (!send_stage_reply_predicted(conn_fd, predicted)) {
+                        set_last_error("reply_send_failed");
+                        break;
+                    }
+                    session_summary.decode_predicted_tokens.push_back(predicted);
+                    continue;
                 }
 
                 const double stage_compute_t0 = ggml_time_us() / 1e6;
@@ -1506,19 +2152,133 @@ int main(int argc, char ** argv) {
                 } else if (message_kind == MULTISTAGE_STAGE_MSG_DECODE_EMBD) {
                     session_summary.decode_step_count += token_count;
                     session_summary.decode_input_hashes.push_back(
-                        embeddings.empty() ? 0ULL : fnv1a64_bytes(embeddings.data(), sizeof(float) * embeddings.size()));
+                        recv_embeddings.empty() ? 0ULL : fnv1a64_bytes(recv_embeddings.data(), sizeof(float) * recv_embeddings.size()));
                 }
 
-                const llama_model * stage_model = llama_get_model(session_ctx);
+                const llama_model * stage_model = llama_get_model(active_ctx);
                 const bool stage_requires_sequential_embd =
+                    !is_prefill_message &&
                     stage_model != nullptr &&
                     (llama_model_is_recurrent(stage_model) || llama_model_is_hybrid(stage_model));
                 const bool stage_requires_token_sideband =
                     stage_model != nullptr && staged_same_topology_requires_token_sideband(stage_model);
-                std::vector<float> next_embeddings;
+                next_embeddings.clear();
                 bool next_embeddings_ready = false;
-                if (is_prefill_message &&
-                    stage_requires_sequential_embd &&
+                if (is_decode_replay_message &&
+                    multistage_live_decode_replay &&
+                    token_count > 0 &&
+                    !decode_replay_active) {
+                    if (!init_replay_ctx()) {
+                        set_last_error("decode_replay_context_init_failed");
+                        break;
+                    }
+                    if (!have_decode_replay_checkpoint || decode_replay_checkpoint_history.empty()) {
+                        set_last_error("decode_replay_checkpoint_unavailable");
+                        break;
+                    }
+                    size_t checkpoints_back = 0;
+                    if (decode_replay_start_pos >= 0 &&
+                        decode_replay_latest_committed_pos >= pos_start) {
+                        checkpoints_back = (size_t) (decode_replay_latest_committed_pos - pos_start + 1);
+                    }
+                    if (checkpoints_back >= decode_replay_checkpoint_history.size()) {
+                        set_last_error("decode_replay_checkpoint_history_unavailable");
+                        break;
+                    }
+                    if (checkpoints_back > 0) {
+                        if (!reset_replay_ctx()) {
+                            set_last_error("decode_replay_context_reset_failed");
+                            break;
+                        }
+                    }
+                    const auto & restore_checkpoint =
+                        decode_replay_checkpoint_history[decode_replay_checkpoint_history.size() - 1 - checkpoints_back];
+                    llama_memory_t replay_mem = llama_get_memory(replay_ctx);
+                    if (!replay_mem) {
+                        set_last_error("decode_replay_checkpoint_clear_failed");
+                        break;
+                    }
+                    llama_memory_clear(replay_mem, true);
+                    if (!llama_memory_seq_rm(replay_mem, 0, -1, -1)) {
+                        set_last_error("decode_replay_checkpoint_clear_failed");
+                        break;
+                    }
+                    const size_t restored = llama_state_seq_set_data(
+                        replay_ctx,
+                        restore_checkpoint.data(),
+                        restore_checkpoint.size(),
+                        0);
+                    if (restored != restore_checkpoint.size()) {
+                        set_last_error("decode_replay_checkpoint_restore_failed");
+                        break;
+                    }
+                    decode_replay_active = true;
+                }
+                if (is_decode_light_context_message &&
+                    multistage_live_decode_light_context_tokens > 0 &&
+                    token_count > 0 &&
+                    !decode_replay_active) {
+                    if (!init_replay_ctx()) {
+                        set_last_error("light_context_context_init_failed");
+                        break;
+                    }
+                    if (!have_decode_replay_checkpoint || decode_replay_checkpoint_history.empty()) {
+                        set_last_error("light_context_checkpoint_unavailable");
+                        break;
+                    }
+                    size_t checkpoints_back = 0;
+                    if (decode_replay_start_pos >= 0 &&
+                        decode_replay_latest_committed_pos >= pos_start) {
+                        checkpoints_back = (size_t) (decode_replay_latest_committed_pos - pos_start + 1);
+                    }
+                    if (checkpoints_back >= decode_replay_checkpoint_history.size()) {
+                        set_last_error("light_context_checkpoint_history_unavailable");
+                        break;
+                    }
+                    if (checkpoints_back > 0) {
+                        if (!reset_replay_ctx()) {
+                            set_last_error("light_context_context_reset_failed");
+                            break;
+                        }
+                    }
+                    const auto & restore_checkpoint =
+                        decode_replay_checkpoint_history[decode_replay_checkpoint_history.size() - 1 - checkpoints_back];
+                    llama_memory_t replay_mem = llama_get_memory(replay_ctx);
+                    if (!replay_mem) {
+                        set_last_error("light_context_checkpoint_clear_failed");
+                        break;
+                    }
+                    llama_memory_clear(replay_mem, true);
+                    if (!llama_memory_seq_rm(replay_mem, 0, -1, -1)) {
+                        set_last_error("light_context_checkpoint_clear_failed");
+                        break;
+                    }
+                    const size_t restored = llama_state_seq_set_data(
+                        replay_ctx,
+                        restore_checkpoint.data(),
+                        restore_checkpoint.size(),
+                        0);
+                    if (restored != restore_checkpoint.size()) {
+                        set_last_error("light_context_checkpoint_restore_failed");
+                        break;
+                    }
+                    decode_replay_active = true;
+                }
+                if (is_decode_replay_message && multistage_live_decode_replay) {
+                    if (!replay_ctx) {
+                        set_last_error("decode_replay_context_unavailable");
+                        break;
+                    }
+                    active_ctx = replay_ctx;
+                } else if (is_decode_light_context_message && multistage_live_decode_light_context_tokens > 0) {
+                    if (!replay_ctx) {
+                        set_last_error("light_context_unavailable");
+                        break;
+                    }
+                    active_ctx = replay_ctx;
+                }
+
+                if (stage_requires_sequential_embd &&
                     token_count > 1) {
                     bool stage_ok = true;
                     if (next_fd >= 0) {
@@ -1527,23 +2287,29 @@ int main(int argc, char ** argv) {
                     for (int token_index = 0; token_index < token_count; ++token_index) {
                         llama_batch embd_batch = llama_batch_init(1, n_embd_inp, 1);
                         embd_batch.n_tokens = 1;
-                        if (!embeddings.empty()) {
+                        if (!recv_embeddings.empty()) {
                             const double input_copy_t0 = ggml_time_us() / 1e6;
                             std::memcpy(
                                 embd_batch.embd,
-                                embeddings.data() + ((size_t) token_index * (size_t) n_embd_inp),
+                                recv_embeddings.data() + ((size_t) token_index * (size_t) n_embd_inp),
                                 sizeof(float) * (size_t) n_embd_inp);
                             const double input_copy_t1 = ggml_time_us() / 1e6;
                             session_summary.prefill_input_copy_elapsed_s += input_copy_t1 - input_copy_t0;
                         }
-                        if (stage_requires_token_sideband && (size_t) token_index < tokens.size()) {
-                            populate_embd_batch_tokens(embd_batch, tokens.data() + token_index, 1);
+                        if (stage_requires_token_sideband && (size_t) token_index < recv_tokens.size()) {
+                            populate_embd_batch_tokens(embd_batch, recv_tokens.data() + token_index, 1);
                         }
-                        embd_batch.pos[0] = (llama_pos) (pos_start + token_index);
-                        embd_batch.n_seq_id[0] = 1;
-                        embd_batch.seq_id[0][0] = 0;
+                        if (is_prefill_message || !multistage_live_decode_auto_pos) {
+                            embd_batch.pos[0] = (llama_pos) (pos_start + token_index);
+                            embd_batch.n_seq_id[0] = 1;
+                            embd_batch.seq_id[0][0] = 0;
+                        } else {
+                            embd_batch.pos = nullptr;
+                            embd_batch.n_seq_id = nullptr;
+                            embd_batch.seq_id = nullptr;
+                        }
                         embd_batch.logits[0] = (next_fd >= 0) || token_index == token_count - 1;
-                        if (llama_decode(session_ctx, embd_batch)) {
+                        if (llama_decode(active_ctx, embd_batch)) {
                             stage_ok = false;
                             set_last_error("sequential_stage_decode_failed");
                         }
@@ -1553,7 +2319,7 @@ int main(int argc, char ** argv) {
                         }
                         if (next_fd >= 0) {
                             const double output_extract_t0 = ggml_time_us() / 1e6;
-                            float * token_embeddings = llama_get_embeddings_ith(session_ctx, 0);
+                            float * token_embeddings = llama_get_embeddings_ith(active_ctx, 0);
                             if (!token_embeddings) {
                                 stage_ok = false;
                                 set_last_error("sequential_token_embeddings_unavailable");
@@ -1571,22 +2337,33 @@ int main(int argc, char ** argv) {
                 } else {
                     llama_batch embd_batch = llama_batch_init(token_count, n_embd_inp, 1);
                     embd_batch.n_tokens = token_count;
-                    if (!embeddings.empty()) {
+                    if (!recv_embeddings.empty()) {
                         const double input_copy_t0 = ggml_time_us() / 1e6;
-                        std::memcpy(embd_batch.embd, embeddings.data(), sizeof(float) * embeddings.size());
+                        std::memcpy(embd_batch.embd, recv_embeddings.data(), sizeof(float) * recv_embeddings.size());
                         const double input_copy_t1 = ggml_time_us() / 1e6;
                         session_summary.prefill_input_copy_elapsed_s += input_copy_t1 - input_copy_t0;
                     }
-                    if (stage_requires_token_sideband && !tokens.empty()) {
-                        populate_embd_batch_tokens(embd_batch, tokens.data(), token_count);
+                    if (stage_requires_token_sideband && !recv_tokens.empty()) {
+                        populate_embd_batch_tokens(embd_batch, recv_tokens.data(), token_count);
                     }
                     for (int token_index = 0; token_index < token_count; ++token_index) {
-                        embd_batch.pos[token_index] = (llama_pos) (pos_start + token_index);
-                        embd_batch.n_seq_id[token_index] = 1;
-                        embd_batch.seq_id[token_index][0] = 0;
-                        embd_batch.logits[token_index] = (next_fd >= 0) || token_index == token_count - 1;
+                        if (is_prefill_message || !multistage_live_decode_auto_pos) {
+                            embd_batch.pos[token_index] = (llama_pos) (pos_start + token_index);
+                            embd_batch.n_seq_id[token_index] = 1;
+                            embd_batch.seq_id[token_index][0] = 0;
+                        }
+                        if (is_prefill_message) {
+                            embd_batch.logits[token_index] = (next_fd >= 0) || token_index == token_count - 1;
+                        } else {
+                            embd_batch.logits[token_index] = (next_fd < 0) && token_index == token_count - 1;
+                        }
                     }
-                    if (llama_decode(session_ctx, embd_batch)) {
+                    if (!is_prefill_message && multistage_live_decode_auto_pos) {
+                        embd_batch.pos = nullptr;
+                        embd_batch.n_seq_id = nullptr;
+                        embd_batch.seq_id = nullptr;
+                    }
+                    if (llama_decode(active_ctx, embd_batch)) {
                         llama_batch_free(embd_batch);
                         set_last_error("stage_decode_failed");
                         break;
@@ -1601,11 +2378,12 @@ int main(int argc, char ** argv) {
                         bool extraction_ok = true;
                         const double output_extract_t0 = ggml_time_us() / 1e6;
                         for (int token_index = 0; token_index < token_count; ++token_index) {
-                            // Use the explicit token row rather than the synthetic "latest" row.
-                            // The decode path is single-token today, but row-indexed retrieval has
-                            // already proven more stable than -1 for staged boundary extraction.
-                            const int embd_index = token_index;
-                            float * token_embeddings = llama_get_embeddings_ith(session_ctx, embd_index);
+                            // Prefill needs row-accurate extraction for multi-token batches, but
+                            // single-token decode has historically matched the monolithic path more
+                            // closely when we read the latest row via -1.
+                            const int embd_index =
+                                (!is_prefill_message && token_count == 1) ? -1 : token_index;
+                            float * token_embeddings = llama_get_embeddings_ith(active_ctx, embd_index);
                             if (!token_embeddings) {
                                 extraction_ok = false;
                                 set_last_error("forward_token_embeddings_unavailable");
@@ -1624,26 +2402,60 @@ int main(int argc, char ** argv) {
                             session_summary.decode_output_hashes.push_back(
                                 fnv1a64_bytes(next_embeddings.data(), sizeof(float) * next_embeddings.size()));
                         }
-                        const int32_t forward_kind =
-                            message_kind == MULTISTAGE_STAGE_MSG_DECODE_EMBD
-                            ? MULTISTAGE_STAGE_MSG_DECODE_EMBD
-                            : MULTISTAGE_STAGE_MSG_PREFILL_EMBD;
+                        multistage_stage_state_header forward_stage_state = recv_stage_state;
+                        forward_stage_state.source_stage_index = multistage_stage_index;
                         const double forward_t0 = ggml_time_us() / 1e6;
                         const bool send_ok = send_stage_message(
                             next_fd,
-                            forward_kind,
+                            message_kind,
                             pos_start,
                             token_count,
-                            tokens.empty() ? nullptr : tokens.data(),
-                            tokens.size(),
+                            forward_stage_state,
+                            recv_tokens.empty() ? nullptr : recv_tokens.data(),
+                            recv_tokens.size(),
                             next_embeddings.data(),
                             next_embeddings.size());
                         const double forward_send_t1 = ggml_time_us() / 1e6;
-                        const bool recv_ok = send_ok && recv_all(next_fd, &predicted, sizeof(predicted));
-                        const double forward_t1 = ggml_time_us() / 1e6;
-                        if (!send_ok || !recv_ok) {
+                        if (!send_ok) {
                             set_last_error("forward_send_recv_failed");
                             break;
+                        }
+                        double forward_t1 = forward_send_t1;
+                        if (reply_requires_predicted) {
+                            int32_t ignored_predicted = -1;
+                            while (pending_prefill_replies > 0) {
+                                if (!recv_checked_downstream_reply(MULTISTAGE_STAGE_REPLY_ACK, ignored_predicted)) {
+                                    break;
+                                }
+                                pending_prefill_replies -= 1;
+                            }
+                            if (!session_summary.last_error.empty()) {
+                                break;
+                            }
+                            if (!recv_checked_downstream_reply(MULTISTAGE_STAGE_REPLY_PREDICTED_TOKEN, predicted)) {
+                                break;
+                            }
+                            forward_t1 = ggml_time_us() / 1e6;
+                        } else {
+                            if (max_deferred_prefill_replies <= 0) {
+                                int32_t ignored_predicted = -1;
+                                if (!recv_checked_downstream_reply(MULTISTAGE_STAGE_REPLY_ACK, ignored_predicted)) {
+                                    break;
+                                }
+                                forward_t1 = ggml_time_us() / 1e6;
+                            } else {
+                                while (pending_prefill_replies >= max_deferred_prefill_replies) {
+                                    int32_t ignored_predicted = -1;
+                                    if (!recv_checked_downstream_reply(MULTISTAGE_STAGE_REPLY_ACK, ignored_predicted)) {
+                                        break;
+                                    }
+                                    pending_prefill_replies -= 1;
+                                }
+                                if (!session_summary.last_error.empty()) {
+                                    break;
+                                }
+                                pending_prefill_replies += 1;
+                            }
                         }
                         if (is_prefill_message) {
                             session_summary.prefill_forward_elapsed_s += forward_t1 - forward_t0;
@@ -1651,15 +2463,16 @@ int main(int argc, char ** argv) {
                             session_summary.prefill_forward_reply_wait_elapsed_s += forward_t1 - forward_send_t1;
                             session_summary.prefill_forward_bytes +=
                                 (uint64_t) (sizeof(int32_t) * 4 +
-                                    (sizeof(llama_token) * tokens.size()) +
+                                    sizeof(multistage_stage_state_header) +
+                                    (sizeof(llama_token) * recv_tokens.size()) +
                                     (sizeof(float) * next_embeddings.size()));
                         }
                     } else {
                         set_last_error("forward_embeddings_not_ready");
                         break;
                     }
-                } else {
-                    const float * stage_logits = llama_get_logits_ith(session_ctx, -1);
+                } else if (reply_requires_predicted) {
+                    const float * stage_logits = llama_get_logits_ith(active_ctx, -1);
                     if (!stage_logits) {
                         set_last_error("stage_logits_unavailable");
                         break;
@@ -1674,20 +2487,115 @@ int main(int argc, char ** argv) {
                         std::max(
                             session_summary.prefill_stage_state_bytes,
                             (uint64_t) llama_state_seq_get_size(session_ctx, 0));
-                } else if (message_kind == MULTISTAGE_STAGE_MSG_DECODE_EMBD) {
+                    if (message_kind == MULTISTAGE_STAGE_MSG_PREFILL_FINAL_EMBD &&
+                        (multistage_live_decode_replay ||
+                         multistage_live_decode_light_context_tokens > 0)) {
+                        const size_t checkpoint_size = llama_state_seq_get_size(session_ctx, 0);
+                        if (checkpoint_size == 0) {
+                            set_last_error("decode_replay_checkpoint_empty");
+                            break;
+                        }
+                        std::vector<uint8_t> decode_replay_checkpoint;
+                        decode_replay_checkpoint.resize(checkpoint_size);
+                        const size_t serialized = llama_state_seq_get_data(
+                            session_ctx,
+                            decode_replay_checkpoint.data(),
+                            decode_replay_checkpoint.size(),
+                            0);
+                        if (serialized != checkpoint_size) {
+                            set_last_error("decode_replay_checkpoint_export_failed");
+                            break;
+                        }
+                        decode_replay_checkpoint_history.clear();
+                        decode_replay_checkpoint_history.push_back(std::move(decode_replay_checkpoint));
+                        have_decode_replay_checkpoint = true;
+                        decode_replay_start_pos = pos_start + token_count;
+                        decode_replay_latest_committed_pos = decode_replay_start_pos - 1;
+                        if (recv_stage_state.checkpoint_generation > 0) {
+                            decode_replay_latest_committed_pos = decode_replay_start_pos - 1;
+                        }
+                    }
+                } else if (message_kind == MULTISTAGE_STAGE_MSG_DECODE_EMBD ||
+                           is_decode_light_context_message ||
+                           is_decode_replay_message) {
                     session_summary.decode_compute_elapsed_s += stage_compute_t1 - stage_compute_t0;
                     session_summary.decode_predicted_tokens.push_back(predicted);
+                    if (is_decode_replay_message &&
+                        recv_stage_state.checkpoint_generation <= 0) {
+                        set_last_error("decode_replay_generation_missing");
+                        break;
+                    }
+                    if (message_kind == MULTISTAGE_STAGE_MSG_DECODE_REPLAY_FINAL_EMBD) {
+                        const size_t checkpoint_size = llama_state_seq_get_size(active_ctx, 0);
+                        if (checkpoint_size == 0) {
+                            set_last_error("decode_replay_checkpoint_advance_empty");
+                            break;
+                        }
+                        std::vector<uint8_t> decode_replay_checkpoint;
+                        decode_replay_checkpoint.resize(checkpoint_size);
+                        const size_t serialized = llama_state_seq_get_data(
+                            active_ctx,
+                            decode_replay_checkpoint.data(),
+                            decode_replay_checkpoint.size(),
+                            0);
+                        if (serialized != checkpoint_size) {
+                            set_last_error("decode_replay_checkpoint_advance_failed");
+                            break;
+                        }
+                        decode_replay_checkpoint_history.push_back(std::move(decode_replay_checkpoint));
+                        const size_t max_checkpoint_history =
+                            (size_t) std::max(multistage_live_decode_replay_window, 1) + 1;
+                        while (decode_replay_checkpoint_history.size() > max_checkpoint_history) {
+                            decode_replay_checkpoint_history.pop_front();
+                        }
+                        have_decode_replay_checkpoint = true;
+                        decode_replay_latest_committed_pos = pos_start + token_count - 1;
+                        decode_replay_active = false;
+                    } else if (is_decode_light_context_message) {
+                        if (recv_stage_state.checkpoint_generation <= 0) {
+                            set_last_error("light_context_generation_missing");
+                            break;
+                        }
+                        const size_t checkpoint_size = llama_state_seq_get_size(active_ctx, 0);
+                        if (checkpoint_size == 0) {
+                            set_last_error("light_context_checkpoint_advance_empty");
+                            break;
+                        }
+                        std::vector<uint8_t> decode_replay_checkpoint;
+                        decode_replay_checkpoint.resize(checkpoint_size);
+                        const size_t serialized = llama_state_seq_get_data(
+                            active_ctx,
+                            decode_replay_checkpoint.data(),
+                            decode_replay_checkpoint.size(),
+                            0);
+                        if (serialized != checkpoint_size) {
+                            set_last_error("light_context_checkpoint_advance_failed");
+                            break;
+                        }
+                        decode_replay_checkpoint_history.push_back(std::move(decode_replay_checkpoint));
+                        const size_t max_checkpoint_history =
+                            (size_t) std::max(multistage_live_decode_light_context_tokens, 1) + 1;
+                        while (decode_replay_checkpoint_history.size() > max_checkpoint_history) {
+                            decode_replay_checkpoint_history.pop_front();
+                        }
+                        have_decode_replay_checkpoint = true;
+                        decode_replay_latest_committed_pos = pos_start + token_count - 1;
+                        decode_replay_active = false;
+                    }
                 }
 
                 const double reply_t0 = ggml_time_us() / 1e6;
-                if (!send_all(conn_fd, &predicted, sizeof(predicted))) {
+                const bool reply_ok = reply_requires_predicted
+                    ? send_stage_reply_predicted(conn_fd, predicted)
+                    : send_stage_reply_ack(conn_fd);
+                if (!reply_ok) {
                     set_last_error("reply_send_failed");
                     break;
                 }
                 const double reply_t1 = ggml_time_us() / 1e6;
                 if (is_prefill_message) {
                     session_summary.prefill_reply_elapsed_s += reply_t1 - reply_t0;
-                    session_summary.prefill_reply_bytes += sizeof(predicted);
+                    session_summary.prefill_reply_bytes += sizeof(int32_t) * 2;
                 }
             }
 
@@ -1696,6 +2604,9 @@ int main(int argc, char ** argv) {
             }
             ::close(conn_fd);
             llama_free(session_ctx);
+            if (replay_ctx) {
+                llama_free(replay_ctx);
+            }
             session_summaries.push_back(std::move(session_summary));
         }
 
@@ -1756,6 +2667,7 @@ int main(int argc, char ** argv) {
         }
         llama_set_embeddings(stage1_ctx, true);
         llama_set_logits(stage1_ctx, false);
+        llama_set_compute_range(stage1_ctx, 0, split_compute_layer);
         if (llama_decode(stage1_ctx, llama_batch_get_one(prompt_tokens.data(), prompt_tokens.size()))) {
             LOG_ERR("split stage1 server prompt prefill failed\n");
             llama_free(stage1_ctx);
@@ -1764,7 +2676,6 @@ int main(int argc, char ** argv) {
             llama_backend_free();
             return 1;
         }
-        llama_set_compute_range(stage1_ctx, 0, split_compute_layer);
 
         llama_context * draft_ctx = nullptr;
         if (split_speculative_tokens > 1 && split_speculative_draft_mode == "self-skip") {
@@ -2169,6 +3080,9 @@ int main(int argc, char ** argv) {
             const std::string host = multistage_stage_driver_connect_addr.substr(0, colon);
             const int port = std::atoi(multistage_stage_driver_connect_addr.substr(colon + 1).c_str());
 
+            if (baseline_prefill_layer_timing) {
+                baseline_layer_probe.begin();
+            }
             const double base_prefill_t0 = ggml_time_us() / 1e6;
             if (llama_decode(ctx, llama_batch_get_one(prompt_tokens.data(), prompt_tokens.size()))) {
                 LOG_ERR("baseline prompt prefill failed\n");
@@ -2178,6 +3092,11 @@ int main(int argc, char ** argv) {
                 return 1;
             }
             const double base_prefill_t1 = ggml_time_us() / 1e6;
+            if (baseline_prefill_layer_timing) {
+                baseline_layer_probe.end();
+                metrics.baseline_prefill_layer_elapsed_s = baseline_layer_probe.layer_elapsed_s;
+                metrics.baseline_prefill_layer_observation_count = baseline_layer_probe.layer_observation_count;
+            }
             metrics.baseline_prefill_elapsed_s = base_prefill_t1 - base_prefill_t0;
             metrics.baseline_state_bytes = llama_state_seq_get_size(ctx, 0);
 
@@ -2207,7 +3126,10 @@ int main(int argc, char ** argv) {
             }
             llama_set_embeddings(stage0_ctx, true);
             llama_set_logits(stage0_ctx, false);
-            if (multistage_model_paths.empty()) {
+            const bool stage0_uses_shard_model =
+                !multistage_model_paths.empty() &&
+                multistage_model_paths[0] != params.model.path;
+            if (!stage0_uses_shard_model) {
                 llama_set_compute_range(stage0_ctx, stage_ranges[0].first, stage_ranges[0].second);
             }
 
@@ -2291,10 +3213,9 @@ int main(int argc, char ** argv) {
             for (const auto & prompt_chunk : prompt_chunks) {
                 const int chunk_start = prompt_chunk.first;
                 const int chunk_count = prompt_chunk.second;
-                const llama_model * stage0_model_view = llama_get_model(stage0_ctx);
-                const bool stage0_requires_sequential_prefill =
-                    stage0_model_view != nullptr &&
-                    (llama_model_is_recurrent(stage0_model_view) || llama_model_is_hybrid(stage0_model_view));
+                // Keep prompt prefill on the chunked path so the stage0 recurrent
+                // state and boundary embeddings match monolithic prefill.
+                const bool stage0_requires_sequential_prefill = false;
                 std::vector<float> chunk_embeddings;
                 chunk_embeddings.reserve((size_t) chunk_count * (size_t) n_embd_inp);
                 const double stage0_prefill_t0 = ggml_time_us() / 1e6;
@@ -2376,7 +3297,19 @@ int main(int argc, char ** argv) {
                     std::this_thread::sleep_for(std::chrono::duration<double>(hop_delay_s));
                 }
                 stage0_transport_elapsed_s += hop_delay_s;
-                const int32_t message_kind = MULTISTAGE_STAGE_MSG_PREFILL_EMBD;
+                const bool is_final_prefill_chunk =
+                    (size_t) (prefill_chunk_count + 1) == prompt_chunks.size();
+                const int32_t message_kind = is_final_prefill_chunk
+                    ? MULTISTAGE_STAGE_MSG_PREFILL_FINAL_EMBD
+                    : MULTISTAGE_STAGE_MSG_PREFILL_EMBD;
+                const multistage_stage_state_header stage0_stage_state =
+                    make_stage_state_header(
+                        message_kind,
+                        multistage_live_decode_replay && is_final_prefill_chunk ? 1 : 0,
+                        (int32_t) prompt_tokens.size(),
+                        -1,
+                        LLAMA_TOKEN_NULL,
+                        0);
                 int32_t predicted_i32 = -1;
                 const double stage0_send_t0 = ggml_time_us() / 1e6;
                 const bool stage0_send_ok = send_stage_message(
@@ -2384,20 +3317,31 @@ int main(int argc, char ** argv) {
                     message_kind,
                     chunk_start,
                     chunk_count,
+                    stage0_stage_state,
                     prompt_tokens.data() + chunk_start,
                     (size_t) chunk_count,
                     chunk_embeddings.data(),
                     chunk_embeddings.size());
                 const double stage0_send_t1 = ggml_time_us() / 1e6;
-                const bool stage0_recv_ok = stage0_send_ok && recv_all(downstream_fd, &predicted_i32, sizeof(predicted_i32));
+                int32_t reply_kind = 0;
+                const bool stage0_recv_ok = stage0_send_ok && recv_stage_reply(downstream_fd, reply_kind, predicted_i32);
                 const double stage0_recv_t1 = ggml_time_us() / 1e6;
                 if (!stage0_send_ok || !stage0_recv_ok) {
                     LOG_ERR("multistage process stage0 prefill send/recv failed\n");
                     break;
                 }
+                if (is_final_prefill_chunk) {
+                    if (reply_kind != MULTISTAGE_STAGE_REPLY_PREDICTED_TOKEN) {
+                        LOG_ERR("multistage process stage0 final prefill expected predicted token reply\n");
+                        break;
+                    }
+                    current_token = (llama_token) predicted_i32;
+                } else if (reply_kind != MULTISTAGE_STAGE_REPLY_ACK) {
+                    LOG_ERR("multistage process stage0 non-final prefill expected ack reply\n");
+                    break;
+                }
                 stage0_send_elapsed_s += stage0_send_t1 - stage0_send_t0;
                 stage0_reply_wait_elapsed_s += stage0_recv_t1 - stage0_send_t1;
-                current_token = (llama_token) predicted_i32;
                 prefill_chunk_count += 1;
             }
             const double staged_prefill_t1 = ggml_time_us() / 1e6;
@@ -2414,9 +3358,267 @@ int main(int argc, char ** argv) {
                 metrics.live_prefill_edge_chunk_counts[0] = prefill_chunk_count;
             }
 
+            auto import_baseline_stage_states = [&](
+                const char * phase_label,
+                int decode_step = -1,
+                llama_token import_token = LLAMA_TOKEN_NULL
+            ) -> bool {
+                for (int stage_index = 1; stage_index < metrics.stage_count; ++stage_index) {
+                    const auto [il_start, il_end] = stage_ranges[(size_t) stage_index];
+                    const size_t stage_state_size = llama_state_seq_get_size_range(ctx, 0, il_start, il_end, 0);
+                    std::vector<uint8_t> stage_state(stage_state_size);
+                    const size_t stage_state_bytes = llama_state_seq_get_data_range(
+                        ctx,
+                        stage_state.data(),
+                        stage_state.size(),
+                        0,
+                        il_start,
+                        il_end,
+                        0);
+                    stage_state.resize(stage_state_bytes);
+                    const bool send_ok = send_stage_state_import_message(
+                        downstream_fd,
+                        stage_index,
+                        make_stage_state_header(
+                            MULTISTAGE_STAGE_MSG_STATE_IMPORT,
+                            0,
+                            (int32_t) prompt_tokens.size(),
+                            decode_step,
+                            import_token,
+                            0),
+                        stage_state.data(),
+                        stage_state.size());
+                    int32_t reply_kind = 0;
+                    int32_t ignored_predicted = -1;
+                    const bool recv_ok = send_ok && recv_stage_reply(downstream_fd, reply_kind, ignored_predicted);
+                    if (!send_ok || !recv_ok || reply_kind != MULTISTAGE_STAGE_REPLY_ACK) {
+                        LOG_ERR("multistage process %s state import send/recv failed for stage %d\n", phase_label, stage_index);
+                        return false;
+                    }
+                }
+                return true;
+            };
+            bool baseline_state_import_ok = true;
+            if (multistage_live_prefill_import_baseline_state) {
+                baseline_state_import_ok = import_baseline_stage_states("prefill");
+            }
+            if (!baseline_state_import_ok) {
+                (void) send_stage_message(
+                    downstream_fd,
+                    MULTISTAGE_STAGE_MSG_STOP,
+                    0,
+                    0,
+                    make_stage_state_header(MULTISTAGE_STAGE_MSG_STOP),
+                    nullptr,
+                    0,
+                    nullptr,
+                    0);
+                ::close(downstream_fd);
+                llama_free(stage0_ctx);
+                if (stage0_model != model) {
+                    llama_model_free(stage0_model);
+                }
+                llama_free(ctx);
+                llama_model_free(model);
+                llama_backend_free();
+                return 1;
+            }
+
+            std::vector<llama_token> decode_context_recent_tokens;
+            std::vector<float> decode_context_recent_embeddings;
+            const int decode_context_window = std::max(
+                multistage_live_decode_replay
+                    ? multistage_live_decode_replay_window
+                    : 0,
+                multistage_live_decode_light_context_tokens);
+            decode_context_recent_tokens.reserve((size_t) std::max(decode_context_window, 1));
+            decode_context_recent_embeddings.reserve((size_t) std::max(decode_context_window, 1) * (size_t) n_embd_inp);
+            int32_t decode_context_checkpoint_generation =
+                (multistage_live_decode_replay || multistage_live_decode_light_context_tokens > 0) ? 1 : 0;
+
             for (int step = 0; step < params.n_predict; ++step) {
                 if (current_token == LLAMA_TOKEN_NULL || llama_vocab_is_eog(vocab, current_token)) {
                     break;
+                }
+
+                const double staged_t0 = ggml_time_us() / 1e6;
+                int32_t predicted_i32 = -1;
+                int32_t reply_kind = 0;
+                bool decode_send_ok = true;
+                llama_token expected = LLAMA_TOKEN_NULL;
+                float baseline_margin = 0.0f;
+
+                if (multistage_live_decode_import_baseline_state) {
+                    if (!import_baseline_stage_states("decode", step, current_token)) {
+                        break;
+                    }
+                }
+
+                    llama_batch stage0_decode_batch = llama_batch_init(1, 0, 1);
+                    stage0_decode_batch.n_tokens = 1;
+                    stage0_decode_batch.token[0] = current_token;
+                    if (!multistage_live_decode_auto_pos) {
+                        stage0_decode_batch.pos[0] = (llama_pos) ((int) prompt_tokens.size() + step);
+                        stage0_decode_batch.n_seq_id[0] = 1;
+                        stage0_decode_batch.seq_id[0][0] = 0;
+                    } else {
+                        stage0_decode_batch.pos = nullptr;
+                        stage0_decode_batch.n_seq_id = nullptr;
+                        stage0_decode_batch.seq_id = nullptr;
+                    }
+                    stage0_decode_batch.logits[0] = 0;
+                    if (llama_decode(stage0_ctx, stage0_decode_batch)) {
+                        llama_batch_free(stage0_decode_batch);
+                        LOG_ERR("multistage process stage0 decode failed at step %d\n", step);
+                        break;
+                    }
+                    llama_batch_free(stage0_decode_batch);
+                    float * boundary_embd = llama_get_embeddings_ith(stage0_ctx, -1);
+                    if (!boundary_embd) {
+                        LOG_ERR("multistage process stage0 boundary embeddings unavailable at step %d\n", step);
+                        break;
+                    }
+                    if (multistage_debug_trace) {
+                        std::vector<uint64_t> step_boundary_hashes;
+                        step_boundary_hashes.push_back(
+                            fnv1a64_bytes(boundary_embd, sizeof(float) * (size_t) n_embd_inp));
+                        metrics.debug_decode_stage_boundary_hashes.push_back(std::move(step_boundary_hashes));
+                    }
+                    const double hop_delay_s = sample_transport_delay_s(
+                        hop_rng,
+                        multistage_live_prefill_hop_latency_ms,
+                        multistage_live_prefill_hop_jitter_ms,
+                        sizeof(float) * (size_t) n_embd_inp,
+                        multistage_live_prefill_hop_bandwidth_mbps);
+                    if (hop_delay_s > 0.0) {
+                        std::this_thread::sleep_for(std::chrono::duration<double>(hop_delay_s));
+                    }
+                    if (multistage_live_decode_replay || multistage_live_decode_light_context_tokens > 0) {
+                        decode_context_recent_tokens.push_back(current_token);
+                        decode_context_recent_embeddings.insert(
+                            decode_context_recent_embeddings.end(),
+                            boundary_embd,
+                            boundary_embd + n_embd_inp);
+                        const size_t context_window = (size_t) std::max(decode_context_window, 1);
+                        while (decode_context_recent_tokens.size() > context_window) {
+                            decode_context_recent_tokens.erase(decode_context_recent_tokens.begin());
+                        }
+                        while (decode_context_recent_embeddings.size() >
+                               decode_context_recent_tokens.size() * (size_t) n_embd_inp) {
+                            decode_context_recent_embeddings.erase(
+                                decode_context_recent_embeddings.begin(),
+                                decode_context_recent_embeddings.begin() + n_embd_inp);
+                        }
+                        if (multistage_live_decode_replay) {
+                            const int replay_token_count = (int) decode_context_recent_tokens.size();
+                            const int replay_pos_start =
+                                (int) prompt_tokens.size() + step + 1 - replay_token_count;
+                            for (int replay_index = 0; replay_index < replay_token_count; ++replay_index) {
+                                const bool is_final_replay = replay_index == replay_token_count - 1;
+                                const int32_t replay_kind = is_final_replay
+                                    ? MULTISTAGE_STAGE_MSG_DECODE_REPLAY_FINAL_EMBD
+                                    : MULTISTAGE_STAGE_MSG_DECODE_REPLAY_EMBD;
+                                const llama_token replay_token = decode_context_recent_tokens[(size_t) replay_index];
+                                const float * replay_embd =
+                                    decode_context_recent_embeddings.data() + ((size_t) replay_index * (size_t) n_embd_inp);
+                                const int replay_step =
+                                    replay_pos_start + replay_index - (int) prompt_tokens.size();
+                                const multistage_stage_state_header replay_stage_state =
+                                    make_stage_state_header(
+                                        replay_kind,
+                                        decode_context_checkpoint_generation,
+                                        (int32_t) prompt_tokens.size(),
+                                        replay_step,
+                                        replay_token,
+                                        0);
+                                if (!send_stage_message(
+                                        downstream_fd,
+                                        replay_kind,
+                                        replay_pos_start + replay_index,
+                                        1,
+                                        replay_stage_state,
+                                        &replay_token,
+                                        1,
+                                        replay_embd,
+                                        (size_t) n_embd_inp) ||
+                                    !recv_stage_reply(downstream_fd, reply_kind, predicted_i32)) {
+                                    decode_send_ok = false;
+                                    break;
+                                }
+                                const int32_t expected_reply_kind = is_final_replay
+                                    ? MULTISTAGE_STAGE_REPLY_PREDICTED_TOKEN
+                                    : MULTISTAGE_STAGE_REPLY_ACK;
+                                if (reply_kind != expected_reply_kind) {
+                                    decode_send_ok = false;
+                                    break;
+                                }
+                                if (is_final_replay) {
+                                    decode_context_checkpoint_generation += 1;
+                                }
+                            }
+                        } else {
+                            const int light_token_count = (int) decode_context_recent_tokens.size();
+                            const int light_pos_start =
+                                (int) prompt_tokens.size() + step + 1 - light_token_count;
+                            const multistage_stage_state_header light_stage_state =
+                                make_stage_state_header(
+                                    MULTISTAGE_STAGE_MSG_DECODE_LIGHT_CTX,
+                                    decode_context_checkpoint_generation,
+                                    (int32_t) prompt_tokens.size(),
+                                    step,
+                                    current_token,
+                                    0);
+                            if (!send_stage_message(
+                                    downstream_fd,
+                                    MULTISTAGE_STAGE_MSG_DECODE_LIGHT_CTX,
+                                    light_pos_start,
+                                    light_token_count,
+                                    light_stage_state,
+                                    decode_context_recent_tokens.data(),
+                                    decode_context_recent_tokens.size(),
+                                    decode_context_recent_embeddings.data(),
+                                    decode_context_recent_embeddings.size()) ||
+                                !recv_stage_reply(downstream_fd, reply_kind, predicted_i32)) {
+                                decode_send_ok = false;
+                            } else if (reply_kind != MULTISTAGE_STAGE_REPLY_PREDICTED_TOKEN) {
+                                decode_send_ok = false;
+                            } else {
+                                decode_context_checkpoint_generation += 1;
+                            }
+                        }
+                    } else {
+                        const multistage_stage_state_header decode_stage_state =
+                            make_stage_state_header(
+                                MULTISTAGE_STAGE_MSG_DECODE_EMBD,
+                                0,
+                                (int32_t) prompt_tokens.size(),
+                                step,
+                                current_token,
+                                0);
+                        if (!send_stage_message(
+                                downstream_fd,
+                                MULTISTAGE_STAGE_MSG_DECODE_EMBD,
+                                (int32_t) prompt_tokens.size() + step,
+                                1,
+                                decode_stage_state,
+                                &current_token,
+                                1,
+                                boundary_embd,
+                                (size_t) n_embd_inp) ||
+                            !recv_stage_reply(downstream_fd, reply_kind, predicted_i32)) {
+                            decode_send_ok = false;
+                        } else if (reply_kind != MULTISTAGE_STAGE_REPLY_PREDICTED_TOKEN) {
+                            decode_send_ok = false;
+                        }
+                    }
+                if (!decode_send_ok) {
+                    LOG_ERR("multistage process stage0 decode send/recv failed at step %d\n", step);
+                    break;
+                }
+                const double staged_t1 = ggml_time_us() / 1e6;
+                metrics.staged_total_decode_elapsed_s += staged_t1 - staged_t0;
+                if (step == 0) {
+                    metrics.staged_first_decode_elapsed_s = staged_t1 - staged_t0;
                 }
 
                 const double base_decode_t0 = ggml_time_us() / 1e6;
@@ -2436,55 +3638,10 @@ int main(int argc, char ** argv) {
                     LOG_ERR("baseline multistage logits unavailable at step %d\n", step);
                     break;
                 }
-                const auto [expected, baseline_margin] = select_greedy_token_with_margin(baseline_logits, n_vocab);
+                std::tie(expected, baseline_margin) = select_greedy_token_with_margin(baseline_logits, n_vocab);
                 metrics.baseline_output_text += common_token_to_piece(ctx, expected, false);
 
-                const double staged_t0 = ggml_time_us() / 1e6;
-                llama_token stage0_token = current_token;
-                if (llama_decode(stage0_ctx, llama_batch_get_one(&stage0_token, 1))) {
-                    LOG_ERR("multistage process stage0 decode failed at step %d\n", step);
-                    break;
-                }
-                float * boundary_embd = llama_get_embeddings_ith(stage0_ctx, 0);
-                if (!boundary_embd) {
-                    LOG_ERR("multistage process stage0 boundary embeddings unavailable at step %d\n", step);
-                    break;
-                }
-                if (multistage_debug_trace) {
-                    std::vector<uint64_t> step_boundary_hashes;
-                    step_boundary_hashes.push_back(
-                        fnv1a64_bytes(boundary_embd, sizeof(float) * (size_t) n_embd_inp));
-                    metrics.debug_decode_stage_boundary_hashes.push_back(std::move(step_boundary_hashes));
-                }
-                const double hop_delay_s = sample_transport_delay_s(
-                    hop_rng,
-                    multistage_live_prefill_hop_latency_ms,
-                    multistage_live_prefill_hop_jitter_ms,
-                    sizeof(float) * (size_t) n_embd_inp,
-                    multistage_live_prefill_hop_bandwidth_mbps);
-                if (hop_delay_s > 0.0) {
-                    std::this_thread::sleep_for(std::chrono::duration<double>(hop_delay_s));
-                }
-                int32_t predicted_i32 = -1;
-                if (!send_stage_message(
-                        downstream_fd,
-                        MULTISTAGE_STAGE_MSG_DECODE_EMBD,
-                        (int32_t) prompt_tokens.size() + step,
-                        1,
-                        &current_token,
-                        1,
-                        boundary_embd,
-                        (size_t) n_embd_inp) ||
-                    !recv_all(downstream_fd, &predicted_i32, sizeof(predicted_i32))) {
-                    LOG_ERR("multistage process stage0 decode send/recv failed at step %d\n", step);
-                    break;
-                }
                 current_token = (llama_token) predicted_i32;
-                const double staged_t1 = ggml_time_us() / 1e6;
-                metrics.staged_total_decode_elapsed_s += staged_t1 - staged_t0;
-                if (step == 0) {
-                    metrics.staged_first_decode_elapsed_s = staged_t1 - staged_t0;
-                }
 
                 metrics.generated_tokens++;
                 metrics.output_text += common_token_to_piece(ctx, current_token, false);
@@ -2502,7 +3659,16 @@ int main(int argc, char ** argv) {
                 }
             }
 
-            (void) send_stage_message(downstream_fd, MULTISTAGE_STAGE_MSG_STOP, 0, 0, nullptr, 0, nullptr, 0);
+            (void) send_stage_message(
+                downstream_fd,
+                MULTISTAGE_STAGE_MSG_STOP,
+                0,
+                0,
+                make_stage_state_header(MULTISTAGE_STAGE_MSG_STOP),
+                nullptr,
+                0,
+                nullptr,
+                0);
             ::close(downstream_fd);
             metrics.token_match = metrics.token_mismatch_count == 0;
             metrics.staged_delta_vs_baseline_s =
@@ -2574,6 +3740,9 @@ int main(int argc, char ** argv) {
                 multistage_keep_stage_logits || stage_index == metrics.stage_count - 1);
         }
 
+        if (baseline_prefill_layer_timing) {
+            baseline_layer_probe.begin();
+        }
         const double base_prefill_t0 = ggml_time_us() / 1e6;
         if (llama_decode(ctx, llama_batch_get_one(prompt_tokens.data(), prompt_tokens.size()))) {
             LOG_ERR("baseline prompt prefill failed\n");
@@ -2584,6 +3753,11 @@ int main(int argc, char ** argv) {
             return 1;
         }
         const double base_prefill_t1 = ggml_time_us() / 1e6;
+        if (baseline_prefill_layer_timing) {
+            baseline_layer_probe.end();
+            metrics.baseline_prefill_layer_elapsed_s = baseline_layer_probe.layer_elapsed_s;
+            metrics.baseline_prefill_layer_observation_count = baseline_layer_probe.layer_observation_count;
+        }
         metrics.baseline_prefill_elapsed_s = base_prefill_t1 - base_prefill_t0;
         metrics.baseline_state_bytes = llama_state_seq_get_size(ctx, 0);
 
@@ -2771,9 +3945,11 @@ int main(int argc, char ** argv) {
                         bool stage_ok = true;
                         const double compute_t0 = ggml_time_us() / 1e6;
                         const llama_model * stage_model = llama_get_model(stage_ctx);
-                        const bool stage_requires_sequential_embd =
-                            stage_model != nullptr &&
-                            (llama_model_is_recurrent(stage_model) || llama_model_is_hybrid(stage_model));
+                        // Prompt prefill must use the chunked recurrent kernels to match
+                        // monolithic prefill state. Decode replay/light-context paths are
+                        // handled by the stage-server path above where sequential replay is
+                        // still intentional.
+                        const bool stage_requires_sequential_embd = false;
                         const int tile_tokens = stage_requires_sequential_embd
                             ? 1
                             : (multistage_live_prefill_tile_tokens > 0
@@ -3050,6 +4226,61 @@ int main(int argc, char ** argv) {
             }
         }
 
+        auto import_local_baseline_stage_states = [&](const char * phase_label) -> bool {
+            for (int stage_index = 1; stage_index < metrics.stage_count; ++stage_index) {
+                const auto [il_start, il_end] = stage_ranges[(size_t) stage_index];
+                llama_context * stage_ctx = stage_ctxs[(size_t) stage_index];
+                if (!stage_ctx) {
+                    LOG_ERR("multistage local %s state import missing stage context %d\n", phase_label, stage_index);
+                    return false;
+                }
+                llama_memory_t stage_mem = llama_get_memory(stage_ctx);
+                if (!stage_mem) {
+                    LOG_ERR("multistage local %s state import missing stage memory %d\n", phase_label, stage_index);
+                    return false;
+                }
+                const size_t stage_state_size = llama_state_seq_get_size_range(ctx, 0, il_start, il_end, 0);
+                std::vector<uint8_t> stage_state(stage_state_size);
+                const size_t serialized = llama_state_seq_get_data_range(
+                    ctx,
+                    stage_state.data(),
+                    stage_state.size(),
+                    0,
+                    il_start,
+                    il_end,
+                    0);
+                stage_state.resize(serialized);
+                llama_memory_clear(stage_mem, true);
+                if (!llama_memory_seq_rm(stage_mem, 0, -1, -1)) {
+                    LOG_ERR("multistage local %s state import failed to clear stage memory %d\n", phase_label, stage_index);
+                    return false;
+                }
+                const size_t imported = llama_state_seq_set_data_range(
+                    stage_ctx,
+                    stage_state.data(),
+                    stage_state.size(),
+                    0,
+                    il_start,
+                    il_end,
+                    0);
+                if (imported != stage_state.size()) {
+                    LOG_ERR("multistage local %s state import failed for stage %d\n", phase_label, stage_index);
+                    return false;
+                }
+            }
+            return true;
+        };
+
+        if (multistage_live_prefill_import_baseline_state) {
+            if (!import_local_baseline_stage_states("prefill")) {
+                cleanup_stage_ctxs();
+                llama_free(ctx);
+                llama_model_free(model);
+                llama_backend_free();
+                return 1;
+            }
+        }
+
         const float * initial_logits = llama_get_logits_ith(ctx, -1);
         if (!initial_logits) {
             LOG_ERR("baseline logits unavailable after prefill\n");
@@ -3102,6 +4333,7 @@ int main(int argc, char ** argv) {
                 break;
             }
 
+            metrics.decode_input_tokens.push_back((int) current_token);
             const double base_decode_t0 = ggml_time_us() / 1e6;
             llama_token baseline_token = current_token;
             if (llama_decode(ctx, llama_batch_get_one(&baseline_token, 1))) {
@@ -3128,6 +4360,9 @@ int main(int argc, char ** argv) {
             if (multistage_debug_trace) {
                 step_boundary_hashes.reserve((size_t) std::max(0, metrics.stage_count - 1));
             }
+            if (multistage_live_decode_import_baseline_state) {
+                staged_ok = import_local_baseline_stage_states("decode");
+            }
             for (int stage_index = 0; stage_index < metrics.stage_count; ++stage_index) {
                 llama_context * stage_ctx = stage_ctxs[(size_t) stage_index];
                 if (stage_index == 0) {
@@ -3146,7 +4381,7 @@ int main(int argc, char ** argv) {
                     embd_batch.pos[0] = (llama_pos) (prompt_tokens.size() + step);
                     embd_batch.n_seq_id[0] = 1;
                     embd_batch.seq_id[0][0] = 0;
-                    embd_batch.logits[0] = 1;
+                    embd_batch.logits[0] = stage_index == metrics.stage_count - 1 ? 1 : 0;
                     const int rc = llama_decode(stage_ctx, embd_batch);
                     llama_batch_free(embd_batch);
                     if (rc) {
@@ -3156,7 +4391,7 @@ int main(int argc, char ** argv) {
                 }
 
                 if (stage_index < metrics.stage_count - 1) {
-                    float * stage_boundary = llama_get_embeddings_ith(stage_ctx, 0);
+                    float * stage_boundary = llama_get_embeddings_ith(stage_ctx, -1);
                     if (!stage_boundary) {
                         staged_ok = false;
                         break;
@@ -3186,6 +4421,8 @@ int main(int argc, char ** argv) {
                 break;
             }
             const auto [predicted, staged_margin] = select_greedy_token_with_margin(staged_logits, n_vocab);
+            metrics.baseline_predicted_tokens.push_back((int) expected);
+            metrics.staged_predicted_tokens.push_back((int) predicted);
             metrics.baseline_output_text += common_token_to_piece(ctx, expected, false);
 
             metrics.generated_tokens++;
@@ -3285,7 +4522,10 @@ int main(int argc, char ** argv) {
 
         llama_set_embeddings(stage1_ctx, true);
         llama_set_logits(stage1_ctx, false);
+        llama_set_compute_range(stage1_ctx, 0, split_compute_layer);
         llama_set_embeddings(stage2_ctx, true);
+        const bool split_stage2_requires_token_sideband =
+            staged_same_topology_requires_token_sideband(llama_get_model(stage2_ctx));
 
         const double base_prefill_t0 = ggml_time_us() / 1e6;
         if (llama_decode(ctx, llama_batch_get_one(prompt_tokens.data(), prompt_tokens.size()))) {
@@ -3299,6 +4539,27 @@ int main(int argc, char ** argv) {
         }
         const double base_prefill_t1 = ggml_time_us() / 1e6;
         split_metrics.baseline_prefill_elapsed_s = base_prefill_t1 - base_prefill_t0;
+
+        llama_context * baseline_ctx = llama_init_from_model(model, proof_ctx_params);
+        if (!baseline_ctx) {
+            LOG_ERR("failed to create isolated baseline context\n");
+            llama_free(stage1_ctx);
+            llama_free(stage2_ctx);
+            llama_free(ctx);
+            llama_model_free(model);
+            llama_backend_free();
+            return 1;
+        }
+        if (llama_decode(baseline_ctx, llama_batch_get_one(prompt_tokens.data(), prompt_tokens.size()))) {
+            LOG_ERR("failed to prefill isolated baseline context\n");
+            llama_free(baseline_ctx);
+            llama_free(stage1_ctx);
+            llama_free(stage2_ctx);
+            llama_free(ctx);
+            llama_model_free(model);
+            llama_backend_free();
+            return 1;
+        }
 
         const double stage1_prefill_t0 = ggml_time_us() / 1e6;
         if (llama_decode(stage1_ctx, llama_batch_get_one(prompt_tokens.data(), prompt_tokens.size()))) {
@@ -3319,7 +4580,6 @@ int main(int argc, char ** argv) {
         split_metrics.late_state_bytes = late_state_bytes;
         late_state.resize(late_state_bytes);
 
-        llama_set_compute_range(stage1_ctx, 0, split_compute_layer);
         const double stage2_import_t0 = ggml_time_us() / 1e6;
         size_t imported = llama_state_seq_set_data_range(stage2_ctx, late_state.data(), late_state.size(), 0, split_compute_layer, n_layer, 0);
         const double stage2_import_t1 = ggml_time_us() / 1e6;
@@ -3416,6 +4676,14 @@ int main(int argc, char ** argv) {
                     if (step < 0) {
                         break;
                     }
+                    llama_token recv_token = LLAMA_TOKEN_NULL;
+                    if (split_stage2_requires_token_sideband) {
+                        int32_t recv_token_i32 = LLAMA_TOKEN_NULL;
+                        if (!recv_all(conn_fd, &recv_token_i32, sizeof(recv_token_i32))) {
+                            break;
+                        }
+                        recv_token = (llama_token) recv_token_i32;
+                    }
                     std::vector<float> embd((size_t) n_embd_inp);
                     if (!recv_all(conn_fd, embd.data(), sizeof(float) * embd.size())) {
                         break;
@@ -3427,6 +4695,9 @@ int main(int argc, char ** argv) {
                     embd_batch.n_seq_id[0] = 1;
                     embd_batch.seq_id[0][0] = 0;
                     embd_batch.logits[0] = 1;
+                    if (split_stage2_requires_token_sideband) {
+                        populate_embd_batch_tokens(embd_batch, &recv_token, 1);
+                    }
                     if (llama_decode(stage2_ctx, embd_batch)) {
                         llama_batch_free(embd_batch);
                         break;
@@ -3496,7 +4767,7 @@ int main(int argc, char ** argv) {
             }
         }
 
-        const float * baseline_logits = llama_get_logits_ith(ctx, -1);
+        const float * baseline_logits = llama_get_logits_ith(baseline_ctx, -1);
         if (!baseline_logits) {
             LOG_ERR("baseline logits unavailable after prompt prefill\n");
             if (client_fd >= 0) {
@@ -3505,6 +4776,7 @@ int main(int argc, char ** argv) {
             if (stage2_thread.joinable()) {
                 stage2_thread.join();
             }
+            llama_free(baseline_ctx);
             llama_free(stage1_ctx);
             llama_free(stage2_ctx);
             llama_free(ctx);
@@ -3587,6 +4859,7 @@ int main(int argc, char ** argv) {
             }
 
             llama_token stage1_token = split_current_token;
+            split_metrics.decode_input_tokens.push_back((int) stage1_token);
             const double stage1_decode_t0 = ggml_time_us() / 1e6;
             if (llama_decode(stage1_ctx, llama_batch_get_one(&stage1_token, 1))) {
                 LOG_ERR("stage1 split decode failed at step %d\n", step);
@@ -3626,12 +4899,17 @@ int main(int argc, char ** argv) {
                 llama_backend_free();
                 return 1;
             }
+            split_metrics.debug_stage1_boundary_hashes.push_back(
+                fnv1a64_bytes(boundary_embd, sizeof(float) * (size_t) n_embd_inp));
 
             const double stage2_decode_t0 = ggml_time_us() / 1e6;
             llama_token split_next = -1;
             if (split_live_transport) {
                 const int32_t step_i32 = (int32_t) step;
+                const int32_t stage1_token_i32 = (int32_t) stage1_token;
                 if (!send_all(client_fd, &step_i32, sizeof(step_i32)) ||
+                    (split_stage2_requires_token_sideband &&
+                        !send_all(client_fd, &stage1_token_i32, sizeof(stage1_token_i32))) ||
                     !send_all(client_fd, boundary_embd, sizeof(float) * (size_t) n_embd_inp)) {
                     LOG_ERR("split live transport send failed at step %d\n", step);
                     ::close(client_fd);
@@ -3668,6 +4946,9 @@ int main(int argc, char ** argv) {
                 embd_batch.n_seq_id[0] = 1;
                 embd_batch.seq_id[0][0] = 0;
                 embd_batch.logits[0] = 1;
+                if (split_stage2_requires_token_sideband) {
+                    populate_embd_batch_tokens(embd_batch, &stage1_token, 1);
+                }
                 if (llama_decode(stage2_ctx, embd_batch)) {
                     llama_batch_free(embd_batch);
                     LOG_ERR("stage2 split decode failed at step %d\n", step);
@@ -3712,7 +4993,7 @@ int main(int argc, char ** argv) {
 
             llama_token baseline_token = baseline_current_token;
             const double baseline_decode_t0 = ggml_time_us() / 1e6;
-            if (llama_decode(ctx, llama_batch_get_one(&baseline_token, 1))) {
+            if (llama_decode(baseline_ctx, llama_batch_get_one(&baseline_token, 1))) {
                 LOG_ERR("baseline decode failed at step %d\n", step);
                 if (client_fd >= 0) {
                     ::close(client_fd);
@@ -3720,6 +5001,7 @@ int main(int argc, char ** argv) {
                 if (stage2_thread.joinable()) {
                     stage2_thread.join();
                 }
+                llama_free(baseline_ctx);
                 llama_free(stage1_ctx);
                 llama_free(stage2_ctx);
                 llama_free(ctx);
@@ -3734,7 +5016,7 @@ int main(int argc, char ** argv) {
                 split_metrics.baseline_first_decode_elapsed_s = baseline_elapsed_s;
             }
 
-            const float * baseline_next_logits = llama_get_logits_ith(ctx, -1);
+            const float * baseline_next_logits = llama_get_logits_ith(baseline_ctx, -1);
             if (!baseline_next_logits) {
                 LOG_ERR("missing baseline logits after split-compute decode at step %d\n", step);
                 if (client_fd >= 0) {
@@ -3743,6 +5025,7 @@ int main(int argc, char ** argv) {
                 if (stage2_thread.joinable()) {
                     stage2_thread.join();
                 }
+                llama_free(baseline_ctx);
                 llama_free(stage1_ctx);
                 llama_free(stage2_ctx);
                 llama_free(ctx);
@@ -3752,6 +5035,8 @@ int main(int argc, char ** argv) {
             }
 
             const llama_token baseline_next = select_greedy_token(baseline_next_logits, n_vocab);
+            split_metrics.baseline_predicted_tokens.push_back((int) baseline_next);
+            split_metrics.split_predicted_tokens.push_back((int) split_next);
             if (step == 0) {
                 split_metrics.baseline_next_token = baseline_next;
                 split_metrics.split_next_token = split_next;
@@ -3780,6 +5065,7 @@ int main(int argc, char ** argv) {
         if (stage2_thread.joinable()) {
             stage2_thread.join();
         }
+        llama_free(baseline_ctx);
 
         split_metrics.split_total_elapsed_s =
             split_metrics.stage1_total_decode_elapsed_s +
@@ -3882,6 +5168,7 @@ int main(int argc, char ** argv) {
 
             llama_set_embeddings(stage1_ctx, true);
             llama_set_logits(stage1_ctx, false);
+            llama_set_compute_range(stage1_ctx, 0, split_compute_layer);
             if (llama_decode(stage1_ctx, llama_batch_get_one(prompt_tokens.data(), prompt_tokens.size()))) {
                 LOG_ERR("split stage1 prompt prefill failed\n");
                 llama_free(stage1_ctx);
@@ -3890,7 +5177,6 @@ int main(int argc, char ** argv) {
                 llama_backend_free();
                 return 1;
             }
-            llama_set_compute_range(stage1_ctx, 0, split_compute_layer);
             llama_token first_generated_mut = first_generated;
             if (llama_decode(stage1_ctx, llama_batch_get_one(&first_generated_mut, 1))) {
                 LOG_ERR("split stage1 decode failed\n");
@@ -4039,6 +5325,7 @@ int main(int argc, char ** argv) {
             }
 
             generated_token_ids.push_back(next);
+            metrics.generated_token_ids_trace.push_back((int) next);
             metrics.output_text += common_token_to_piece(ctx, next, false);
             metrics.generated_tokens++;
 
@@ -4122,6 +5409,7 @@ int main(int argc, char ** argv) {
 
             llama_set_embeddings(stage1_ctx, true);
             llama_set_logits(stage1_ctx, false);
+            llama_set_compute_range(stage1_ctx, 0, split_compute_layer);
             if (llama_decode(stage1_ctx, llama_batch_get_one(prompt_tokens.data(), prompt_tokens.size()))) {
                 LOG_ERR("split stage1 prompt prefill failed for stream export\n");
                 llama_free(stage1_ctx);
@@ -4133,8 +5421,6 @@ int main(int argc, char ** argv) {
                 llama_backend_free();
                 return 1;
             }
-
-            llama_set_compute_range(stage1_ctx, 0, split_compute_layer);
             const size_t stream_steps = generated_token_ids.size() - 1;
             std::vector<float> embd_stream(stream_steps * (size_t) n_embd_inp);
             for (size_t step = 0; step < stream_steps; ++step) {
@@ -4403,6 +5689,7 @@ int main(int argc, char ** argv) {
                         metrics.generated_tokens++;
                         metrics.verified_decode_tokens++;
                         metrics.compared_token_steps++;
+                        metrics.generated_token_ids_trace.push_back((int) predicted);
                         metrics.output_text += common_token_to_piece(ctx, predicted, false);
                         if (step == 0 && block_index == 0) {
                             metrics.first_shadow_token = predicted;
@@ -4523,6 +5810,7 @@ int main(int argc, char ** argv) {
                 metrics.readiness_path = "split_stage2_decode";
                 metrics.shadow_decode_succeeded = true;
                 metrics.verified_decode_tokens = 1;
+                metrics.generated_token_ids_trace.push_back((int) predicted);
                 metrics.output_text = common_token_to_piece(ctx, predicted, false);
                 if (split_expected_token >= 0) {
                     metrics.token_mismatch_count = predicted == split_expected_token ? 0 : 1;
@@ -4551,6 +5839,7 @@ int main(int argc, char ** argv) {
         for (int i = 0; i < replay_limit; ++i) {
             llama_token token = replay_tokens[i];
             metrics.output_text += common_token_to_piece(ctx, token, false);
+            metrics.generated_token_ids_trace.push_back((int) token);
             metrics.generated_tokens++;
             const double decode_t0 = ggml_time_us() / 1e6;
             if (llama_decode(ctx, llama_batch_get_one(&token, 1))) {

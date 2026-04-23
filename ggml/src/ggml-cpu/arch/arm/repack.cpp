@@ -14,6 +14,10 @@
 #include <cassert>
 #include <cstdlib> // for qsort
 #include <cstdio>  // for GGML_ASSERT
+#include <string>
+#include <unordered_set>
+#include <unistd.h>
+#include <vector>
 
 #define GGML_CPU_CLANG_WORKAROUND
 #include "../../repack.h"
@@ -23,6 +27,142 @@
 #endif
 
 #define UNUSED GGML_UNUSED
+
+namespace {
+
+using repack_gemm_fn = void (*)(int, float *, size_t, const void *, const void *, int, int);
+
+const std::unordered_set<std::string> & repack_compare_kernels() {
+    static const std::unordered_set<std::string> enabled = []() {
+        std::unordered_set<std::string> values;
+        const char * env = std::getenv("GGML_CPU_REPACK_COMPARE_GEMM");
+        if (!env || env[0] == '\0') {
+            return values;
+        }
+        std::string item;
+        for (const char * ptr = env;; ++ptr) {
+            const char ch = *ptr;
+            if (ch == ',' || ch == '\0') {
+                if (!item.empty()) {
+                    values.insert(item);
+                    item.clear();
+                }
+                if (ch == '\0') {
+                    break;
+                }
+            } else if (!std::isspace((unsigned char) ch)) {
+                item.push_back(ch);
+            }
+        }
+        return values;
+    }();
+    return enabled;
+}
+
+bool should_compare_kernel(const char * name) {
+    const auto & enabled = repack_compare_kernels();
+    return !enabled.empty() && enabled.find(name) != enabled.end();
+}
+
+int compare_max_calls() {
+    static const int value = []() {
+        const char * env = std::getenv("GGML_CPU_REPACK_COMPARE_MAX_CALLS");
+        return env && env[0] ? std::max(1, std::atoi(env)) : 8;
+    }();
+    return value;
+}
+
+bool take_compare_call_slot() {
+    static int calls = 0;
+    if (calls >= compare_max_calls()) {
+        return false;
+    }
+    ++calls;
+    return true;
+}
+
+const char * compare_log_path() {
+    static const char * path = std::getenv("GGML_CPU_REPACK_COMPARE_LOG");
+    return path && path[0] ? path : nullptr;
+}
+
+void maybe_trace_kernel_entry(const char * name, int n, size_t bs, int nr, int nc) {
+    const char * log_path = compare_log_path();
+    if (!log_path) {
+        return;
+    }
+    if (FILE * handle = std::fopen(log_path, "a")) {
+        std::fprintf(
+            handle,
+            "ggml-cpu-repack-entry: pid=%d kernel=%s n=%d nr=%d nc=%d bs=%zu\n",
+            static_cast<int>(getpid()),
+            name,
+            n,
+            nr,
+            nc,
+            bs);
+        std::fclose(handle);
+    }
+}
+
+void maybe_compare_kernel(
+    const char * name,
+    repack_gemm_fn generic_fn,
+    int n,
+    float * s,
+    size_t bs,
+    const void * vx,
+    const void * vy,
+    int nr,
+    int nc
+) {
+    if (!should_compare_kernel(name) || !take_compare_call_slot()) {
+        return;
+    }
+
+    std::vector<float> generic(static_cast<size_t>(nr) * bs, 0.0f);
+    std::vector<float> specialized(static_cast<size_t>(nr) * bs, 0.0f);
+
+    std::memcpy(specialized.data(), s, sizeof(float) * specialized.size());
+    generic_fn(n, generic.data(), bs, vx, vy, nr, nc);
+
+    float max_abs = 0.0f;
+    int bad_row = -1;
+    int bad_col = -1;
+    float got = 0.0f;
+    float want = 0.0f;
+    for (int row = 0; row < nr; ++row) {
+        for (int col = 0; col < nc; ++col) {
+            const size_t idx = static_cast<size_t>(row) * bs + col;
+            const float diff = std::fabs(specialized[idx] - generic[idx]);
+            if (diff > max_abs) {
+                max_abs = diff;
+                bad_row = row;
+                bad_col = col;
+                got = specialized[idx];
+                want = generic[idx];
+            }
+        }
+    }
+
+    const int pid = static_cast<int>(getpid());
+    std::fprintf(
+        stderr,
+        "ggml-cpu-repack-compare: pid=%d kernel=%s n=%d nr=%d nc=%d bs=%zu max_abs=%g bad_row=%d bad_col=%d got=%g want=%g\n",
+        pid, name, n, nr, nc, bs, max_abs, bad_row, bad_col, got, want);
+
+    if (const char * log_path = compare_log_path()) {
+        if (FILE * handle = std::fopen(log_path, "a")) {
+            std::fprintf(
+                handle,
+                "ggml-cpu-repack-compare: pid=%d kernel=%s n=%d nr=%d nc=%d bs=%zu max_abs=%g bad_row=%d bad_col=%d got=%g want=%g\n",
+                pid, name, n, nr, nc, bs, max_abs, bad_row, bad_col, got, want);
+            std::fclose(handle);
+        }
+    }
+}
+
+} // namespace
 
 #if defined(__aarch64__) && defined(__ARM_NEON) && (defined(__ARM_FEATURE_MATMUL_INT8) || defined(__ARM_FEATURE_DOTPROD))
 // Helper for decoding scales and mins of Q4_K and Q5_K block formats
@@ -265,6 +405,7 @@ void ggml_gemv_q4_0_4x4_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const vo
         vst1q_f32(s, acc);
         s += ncols_interleaved;
     }
+    maybe_compare_kernel("q5_K_8x4_q8_K", ggml_gemm_q5_K_8x4_q8_K_generic, n, s, bs, vx, vy, nr, nc);
     return;
 #endif // #if ! ((defined(_MSC_VER)) && ! defined(__clang__)) && defined(__aarch64__) && defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
     ggml_gemv_q4_0_4x4_q8_0_generic(n, s, bs, vx, vy, nr, nc);
@@ -331,6 +472,7 @@ void ggml_gemv_q4_0_4x8_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const vo
         vst1q_f32(s, acc);
         s += ncols_interleaved;
     }
+    maybe_compare_kernel("q6_K_8x4_q8_K", ggml_gemm_q6_K_8x4_q8_K_generic, n, s, bs, vx, vy, nr, nc);
     return;
 #endif // #if ! ((defined(_MSC_VER)) && ! defined(__clang__)) && defined(__aarch64__) && defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
     ggml_gemv_q4_0_4x8_q8_0_generic(n, s, bs, vx, vy, nr, nc);
@@ -493,6 +635,7 @@ void ggml_gemv_iq4_nl_4x4_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const 
 
         vst1q_f32(res_ptr + x * 4, sumf);
     }
+    maybe_compare_kernel("q8_0_4x4_q8_0", ggml_gemm_q8_0_4x4_q8_0_generic, n, s, bs, vx, vy, nr, nc);
     return;
 #endif // #if ! ((defined(_MSC_VER)) && ! defined(__clang__)) && defined(__aarch64__) && defined(__ARM_NEON)
     ggml_gemv_iq4_nl_4x4_q8_0_generic(n, s, bs, vx, vy, nr, nc);
@@ -574,6 +717,7 @@ void ggml_gemv_mxfp4_4x4_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const v
 }
 
 void ggml_gemv_q4_K_8x4_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc) {
+    maybe_trace_kernel_entry("q4_K_8x4_q8_K", n, bs, nr, nc);
     constexpr int qk = QK_K;
     const int     nb = n / qk;
 
@@ -701,6 +845,7 @@ void ggml_gemv_q4_K_8x4_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const vo
         vst1q_f32(s + base, acc_f32[0]);
         vst1q_f32(s + base + 4, acc_f32[1]);
     }  // for x
+    maybe_compare_kernel("q4_K_8x4_q8_K", ggml_gemv_q4_K_8x4_q8_K_generic, n, s, bs, vx, vy, nr, nc);
     return;
 #endif  // #if defined(__aarch64__) && defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
     ggml_gemv_q4_K_8x4_q8_K_generic(n, s, bs, vx, vy, nr, nc);
@@ -867,6 +1012,7 @@ void ggml_gemv_q5_K_8x4_q8_K(int                        n,
                              const void * GGML_RESTRICT vy,
                              int                        nr,
                              int                        nc) {
+    maybe_trace_kernel_entry("q5_K_8x4_q8_K_gemv", n, bs, nr, nc);
     constexpr int qk = QK_K;
     const int     nb = n / qk;
 
@@ -1014,6 +1160,7 @@ void ggml_gemv_q5_K_8x4_q8_K(int                        n,
         vst1q_f32(s + base, acc_f32[0]);
         vst1q_f32(s + base + 4, acc_f32[1]);
     }  // for x
+    maybe_compare_kernel("q5_K_8x4_q8_K", ggml_gemv_q5_K_8x4_q8_K_generic, n, s, bs, vx, vy, nr, nc);
     return;
 #endif  // defined(__aarch64__) && defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
     ggml_gemv_q5_K_8x4_q8_K_generic(n, s, bs, vx, vy, nr, nc);
@@ -1313,6 +1460,7 @@ void ggml_gemv_q6_K_8x4_q8_K(int                        n,
                              const void * GGML_RESTRICT vy,
                              int                        nr,
                              int                        nc) {
+    maybe_trace_kernel_entry("q6_K_8x4_q8_K_gemv", n, bs, nr, nc);
     constexpr int qk = QK_K;
     const int     nb = n / qk;
 
@@ -1490,6 +1638,7 @@ void ggml_gemv_q6_K_8x4_q8_K(int                        n,
         vst1q_f32(s + base, acc_f32[0]);
         vst1q_f32(s + base + 4, acc_f32[1]);
     }  // for x
+    maybe_compare_kernel("q6_K_8x4_q8_K", ggml_gemv_q6_K_8x4_q8_K_generic, n, s, bs, vx, vy, nr, nc);
     return;
 #endif  // defined(__aarch64__) && defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
     ggml_gemv_q6_K_8x4_q8_K_generic(n, s, bs, vx, vy, nr, nc);
@@ -1703,6 +1852,8 @@ void ggml_gemv_q8_0_4x4_q8_0(int                        n,
                              const void * GGML_RESTRICT vy,
                              int                        nr,
                              int                        nc) {
+    maybe_trace_kernel_entry("q8_0_4x4_q8_0_gemv", n, bs, nr, nc);
+    float * const s_out         = s;
     const int qk                = QK8_0;
     const int nb                = n / qk;
     const int ncols_interleaved = 4;
@@ -1748,6 +1899,7 @@ void ggml_gemv_q8_0_4x4_q8_0(int                        n,
         vst1q_f32(s, acc);
         s += ncols_interleaved;
     }
+    maybe_compare_kernel("q8_0_4x4_q8_0", ggml_gemv_q8_0_4x4_q8_0_generic, n, s_out, bs, vx, vy, nr, nc);
     return;
 
 #endif  // defined(__aarch64__) && defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
@@ -3321,6 +3473,7 @@ void ggml_gemm_mxfp4_4x4_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const v
 }
 
 void ggml_gemm_q4_K_8x4_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc) {
+    maybe_trace_kernel_entry("q4_K_8x4_q8_K", n, bs, nr, nc);
     constexpr int qk = QK_K;
     const int     nb = n / qk;
 
@@ -3515,6 +3668,7 @@ void ggml_gemm_q4_K_8x4_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const vo
             }
         }  // for x
     }  // for y
+    maybe_compare_kernel("q4_K_8x4_q8_K", ggml_gemm_q4_K_8x4_q8_K_generic, n, s, bs, vx, vy, nr, nc);
     return;
 #endif  // defined(__aarch64__) && defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
     ggml_gemm_q4_K_8x4_q8_K_generic(n, s, bs, vx, vy, nr, nc);
@@ -3527,6 +3681,7 @@ void ggml_gemm_q5_K_8x4_q8_K(int                        n,
                              const void * GGML_RESTRICT vy,
                              int                        nr,
                              int                        nc) {
+    maybe_trace_kernel_entry("q5_K_8x4_q8_K", n, bs, nr, nc);
     constexpr int qk = QK_K;
     const int     nb = n / qk;
 
@@ -4523,6 +4678,7 @@ void ggml_gemm_q6_K_8x4_q8_K(int                        n,
                              const void * GGML_RESTRICT vy,
                              int                        nr,
                              int                        nc) {
+    maybe_trace_kernel_entry("q6_K_8x4_q8_K", n, bs, nr, nc);
     constexpr int qk = QK_K;
     const int     nb = n / qk;
 
@@ -4942,6 +5098,7 @@ void ggml_gemm_q8_0_4x4_q8_0(int                        n,
                              const void * GGML_RESTRICT vy,
                              int                        nr,
                              int                        nc) {
+    maybe_trace_kernel_entry("q8_0_4x4_q8_0", n, bs, nr, nc);
     const int qk                = QK8_0;
     const int nb                = n / qk;
     const int ncols_interleaved = 4;
