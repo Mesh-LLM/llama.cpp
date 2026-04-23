@@ -14,7 +14,15 @@
 #include <cmath>
 #include <cstring>
 #include <cassert>
+#include <cinttypes>
 #include <cstdio>  // for GGML_ASSERT
+#include <cctype>
+#include <cstdlib>
+#include <algorithm>
+#include <sstream>
+#include <string>
+#include <unordered_set>
+#include <unistd.h>
 
 #include "repack.h"
 
@@ -3860,6 +3868,311 @@ static int repack_mxfp4_to_mxfp4_8_bl(struct ggml_tensor * t, int interleave_blo
 }
 
 namespace ggml::cpu::repack {
+template <typename BLOC_TYPE> static const char * block_type_name();
+
+template <> const char * block_type_name<block_q4_0>() { return "q4_0"; }
+template <> const char * block_type_name<block_q4_K>() { return "q4_K"; }
+template <> const char * block_type_name<block_q5_K>() { return "q5_K"; }
+template <> const char * block_type_name<block_q6_K>() { return "q6_K"; }
+template <> const char * block_type_name<block_q2_K>() { return "q2_K"; }
+template <> const char * block_type_name<block_iq4_nl>() { return "iq4_nl"; }
+template <> const char * block_type_name<block_mxfp4>() { return "mxfp4"; }
+template <> const char * block_type_name<block_q8_0>() { return "q8_0"; }
+
+static bool repack_debug_enabled() {
+    static const bool enabled = []() {
+        const char * value = std::getenv("GGML_CPU_REPACK_DEBUG");
+        return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
+    }();
+    return enabled;
+}
+
+static const std::unordered_set<std::string> & disabled_repack_traits() {
+    static const std::unordered_set<std::string> disabled = []() {
+        std::unordered_set<std::string> values;
+        const char * env = std::getenv("GGML_CPU_REPACK_DISABLE");
+        if (!env || env[0] == '\0') {
+            return values;
+        }
+        std::string item;
+        for (const char * ptr = env;; ++ptr) {
+            const char ch = *ptr;
+            if (ch == ',' || ch == '\0') {
+                if (!item.empty()) {
+                    values.insert(item);
+                    item.clear();
+                }
+                if (ch == '\0') {
+                    break;
+                }
+            } else if (!std::isspace((unsigned char) ch)) {
+                item.push_back(ch);
+            }
+        }
+        return values;
+    }();
+    return disabled;
+}
+
+static const std::unordered_set<std::string> & disabled_repack_tensors() {
+    static const std::unordered_set<std::string> disabled = []() {
+        std::unordered_set<std::string> values;
+        const char * env = std::getenv("GGML_CPU_REPACK_DISABLE_TENSORS");
+        if (!env || env[0] == '\0') {
+            return values;
+        }
+        std::string item;
+        for (const char * ptr = env;; ++ptr) {
+            const char ch = *ptr;
+            if (ch == ',' || ch == '\0') {
+                if (!item.empty()) {
+                    values.insert(item);
+                    item.clear();
+                }
+                if (ch == '\0') {
+                    break;
+                }
+            } else if (!std::isspace((unsigned char) ch)) {
+                item.push_back(ch);
+            }
+        }
+        return values;
+    }();
+    return disabled;
+}
+
+static const char * repack_dump_file_path() {
+    static const char * path = std::getenv("GGML_CPU_REPACK_DUMP_FILE");
+    return (path && path[0] != '\0') ? path : nullptr;
+}
+
+static const std::unordered_set<std::string> & repack_dump_traits() {
+    static const std::unordered_set<std::string> enabled = []() {
+        std::unordered_set<std::string> values;
+        const char * env = std::getenv("GGML_CPU_REPACK_DUMP_TRAITS");
+        if (!env || env[0] == '\0') {
+            return values;
+        }
+        std::string item;
+        for (const char * ptr = env;; ++ptr) {
+            const char ch = *ptr;
+            if (ch == ',' || ch == '\0') {
+                if (!item.empty()) {
+                    values.insert(item);
+                    item.clear();
+                }
+                if (ch == '\0') {
+                    break;
+                }
+            } else if (!std::isspace((unsigned char) ch)) {
+                item.push_back(ch);
+            }
+        }
+        return values;
+    }();
+    return enabled;
+}
+
+static bool repack_trace_work_enabled() {
+    static const bool enabled = []() {
+        const char * env = std::getenv("GGML_CPU_REPACK_TRACE_WORK");
+        return env != nullptr && env[0] != '\0' && env[0] != '0';
+    }();
+    return enabled;
+}
+
+static int repack_trace_work_max_calls() {
+    static const int value = []() {
+        const char * env = std::getenv("GGML_CPU_REPACK_TRACE_WORK_MAX_CALLS");
+        return env && env[0] ? std::max(1, std::atoi(env)) : 64;
+    }();
+    return value;
+}
+
+static bool repack_trace_work_take_slot() {
+    static int calls = 0;
+    if (calls >= repack_trace_work_max_calls()) {
+        return false;
+    }
+    ++calls;
+    return true;
+}
+
+static void repack_trace_work_event(
+    const char * trait_name,
+    const char * event_name,
+    const struct ggml_tensor * src0,
+    const struct ggml_tensor * src1,
+    int64_t src0_start,
+    int64_t src0_end,
+    int64_t src1_start,
+    int64_t src1_end
+) {
+    if (!repack_trace_work_enabled() || !repack_trace_work_take_slot()) {
+        return;
+    }
+    const int pid = static_cast<int>(getpid());
+    std::fprintf(
+        stderr,
+        "ggml-cpu-repack-work: pid=%d trait=%s event=%s src0=%s src1=%s src0_range=[%" PRId64 ",%" PRId64 ") src1_range=[%" PRId64 ",%" PRId64 ") src0_ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] src1_ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "]\n",
+        pid,
+        trait_name ? trait_name : "<none>",
+        event_name ? event_name : "<none>",
+        src0 ? src0->name : "<null>",
+        src1 ? src1->name : "<null>",
+        src0_start,
+        src0_end,
+        src1_start,
+        src1_end,
+        src0 ? src0->ne[0] : -1, src0 ? src0->ne[1] : -1, src0 ? src0->ne[2] : -1, src0 ? src0->ne[3] : -1,
+        src1 ? src1->ne[0] : -1, src1 ? src1->ne[1] : -1, src1 ? src1->ne[2] : -1, src1 ? src1->ne[3] : -1
+    );
+    if (const char * log_path = std::getenv("GGML_CPU_REPACK_COMPARE_LOG")) {
+        if (log_path[0] != '\0') {
+            if (FILE * handle = std::fopen(log_path, "a")) {
+                std::fprintf(
+                    handle,
+                    "ggml-cpu-repack-work: pid=%d trait=%s event=%s src0=%s src1=%s src0_range=[%" PRId64 ",%" PRId64 ") src1_range=[%" PRId64 ",%" PRId64 ") src0_ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] src1_ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "]\n",
+                    pid,
+                    trait_name ? trait_name : "<none>",
+                    event_name ? event_name : "<none>",
+                    src0 ? src0->name : "<null>",
+                    src1 ? src1->name : "<null>",
+                    src0_start,
+                    src0_end,
+                    src1_start,
+                    src1_end,
+                    src0 ? src0->ne[0] : -1, src0 ? src0->ne[1] : -1, src0 ? src0->ne[2] : -1, src0 ? src0->ne[3] : -1,
+                    src1 ? src1->ne[0] : -1, src1 ? src1->ne[1] : -1, src1 ? src1->ne[2] : -1, src1 ? src1->ne[3] : -1
+                );
+                std::fclose(handle);
+            }
+        }
+    }
+}
+
+static bool repack_trace_select_enabled() {
+    static const bool enabled = []() {
+        const char * env = std::getenv("GGML_CPU_REPACK_TRACE_SELECT");
+        return env != nullptr && env[0] != '\0' && env[0] != '0';
+    }();
+    return enabled;
+}
+
+static void repack_trace_select_event(
+    const char * event_name,
+    const struct ggml_tensor * op,
+    const struct ggml_tensor * src0,
+    const char * trait_name,
+    bool decision
+) {
+    if (!repack_trace_select_enabled()) {
+        return;
+    }
+    const int pid = static_cast<int>(getpid());
+    std::fprintf(
+        stderr,
+        "ggml-cpu-repack-select: pid=%d event=%s decision=%d op=%d src0=%s src0_type=%s src0_buf=%s trait=%s src0_ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "]\n",
+        pid,
+        event_name ? event_name : "<none>",
+        decision ? 1 : 0,
+        op ? int(op->op) : -1,
+        src0 ? src0->name : "<null>",
+        src0 ? ggml_type_name(src0->type) : "<null>",
+        (src0 && src0->buffer && src0->buffer->buft) ? src0->buffer->buft->iface.get_name(src0->buffer->buft) : "<none>",
+        trait_name,
+        src0 ? src0->ne[0] : -1, src0 ? src0->ne[1] : -1, src0 ? src0->ne[2] : -1, src0 ? src0->ne[3] : -1
+    );
+    if (const char * log_path = std::getenv("GGML_CPU_REPACK_COMPARE_LOG")) {
+        if (log_path[0] != '\0') {
+            if (FILE * handle = std::fopen(log_path, "a")) {
+                std::fprintf(
+                    handle,
+                    "ggml-cpu-repack-select: pid=%d event=%s decision=%d op=%d src0=%s src0_type=%s src0_buf=%s trait=%s src0_ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "]\n",
+                    pid,
+                    event_name ? event_name : "<none>",
+                    decision ? 1 : 0,
+                    op ? int(op->op) : -1,
+                    src0 ? src0->name : "<null>",
+                    src0 ? ggml_type_name(src0->type) : "<null>",
+                    (src0 && src0->buffer && src0->buffer->buft) ? src0->buffer->buft->iface.get_name(src0->buffer->buft) : "<none>",
+                    trait_name ? trait_name : "<none>",
+                    src0 ? src0->ne[0] : -1, src0 ? src0->ne[1] : -1, src0 ? src0->ne[2] : -1, src0 ? src0->ne[3] : -1
+                );
+                std::fclose(handle);
+            }
+        }
+    }
+}
+
+static bool should_dump_repack_tensor(const char * trait_name) {
+    if (repack_dump_file_path() == nullptr) {
+        return false;
+    }
+    const auto & traits = repack_dump_traits();
+    if (traits.empty()) {
+        return true;
+    }
+    return trait_name != nullptr && traits.find(trait_name) != traits.end();
+}
+
+static std::string hex_prefix(const void * data, size_t size, size_t max_bytes = 64) {
+    if (data == nullptr || size == 0) {
+        return "";
+    }
+    const uint8_t * bytes = static_cast<const uint8_t *>(data);
+    const size_t count = std::min(size, max_bytes);
+    std::ostringstream out;
+    out << std::hex;
+    for (size_t i = 0; i < count; ++i) {
+        if (i != 0) {
+            out << ' ';
+        }
+        out.width(2);
+        out.fill('0');
+        out << static_cast<unsigned int>(bytes[i]);
+    }
+    return out.str();
+}
+
+static void dump_repack_tensor_event(
+    const char * status,
+    const struct ggml_tensor * tensor,
+    const char * trait_name,
+    const void * raw_data,
+    size_t raw_size,
+    const void * out_data,
+    size_t out_size
+) {
+    if (!should_dump_repack_tensor(trait_name)) {
+        return;
+    }
+    const char * path = repack_dump_file_path();
+    if (path == nullptr) {
+        return;
+    }
+    FILE * fp = std::fopen(path, "a");
+    if (fp == nullptr) {
+        return;
+    }
+    const std::string raw_hex = hex_prefix(raw_data, raw_size);
+    const std::string out_hex = hex_prefix(out_data, out_size);
+    std::fprintf(
+        fp,
+        "{\"status\":\"%s\",\"tensor\":\"%s\",\"type\":\"%s\",\"trait\":\"%s\",\"size\":%zu,"
+        "\"ne\":[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "],"
+        "\"raw_prefix_hex\":\"%s\",\"out_prefix_hex\":\"%s\"}\n",
+        status,
+        tensor->name,
+        ggml_type_name(tensor->type),
+        trait_name ? trait_name : "",
+        raw_size,
+        tensor->ne[0], tensor->ne[1], tensor->ne[2], tensor->ne[3],
+        raw_hex.c_str(),
+        out_hex.c_str());
+    std::fclose(fp);
+}
+
 // repack
 template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS>
 int repack(struct ggml_tensor *, const void *, size_t);
@@ -4152,10 +4465,42 @@ template <> void gemm<block_q2_K, 1, 16, GGML_TYPE_Q8_K>(int n, float * s, size_
 
 class tensor_traits_base : public ggml::cpu::tensor_traits {
   public:
+    const char * debug_name() const override {
+        return name();
+    }
+    virtual const char * name() const = 0;
     virtual int repack(struct ggml_tensor * t, const void * data, size_t data_size) = 0;
 };
 
+static bool repack_trait_allowed(const tensor_traits_base * trait) {
+    if (trait == nullptr) {
+        return false;
+    }
+    const auto & disabled = disabled_repack_traits();
+    return disabled.find(trait->name()) == disabled.end();
+}
+
+static bool repack_tensor_allowed(const struct ggml_tensor * tensor) {
+    if (tensor == nullptr) {
+        return false;
+    }
+    const auto & disabled = disabled_repack_tensors();
+    return disabled.find(tensor->name) == disabled.end();
+}
+
 template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PARAM_TYPE> class tensor_traits : public tensor_traits_base {
+    static const std::string & trait_name_string() {
+        static const std::string name =
+            std::string(block_type_name<BLOC_TYPE>()) + "_" +
+            std::to_string(NB_COLS) + "x" + std::to_string(INTER_SIZE) + "_" +
+            ggml_type_name(PARAM_TYPE);
+        return name;
+    }
+
+  public:
+    const char * name() const override {
+        return trait_name_string().c_str();
+    }
 
     bool work_size(int /* n_threads */, const struct ggml_tensor * op, size_t & size) override {
         // not realy a GGML_TYPE_Q8_0 but same size.
@@ -4239,11 +4584,13 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
 
         // If there are more than three rows in src1, use gemm; otherwise, use gemv.
         if (nrows > 3) {
+            repack_trace_work_event(name(), "gemm", src0, src1, src0_start, src0_end, src1_start, src1_end);
             gemm<BLOC_TYPE, INTER_SIZE, NB_COLS, PARAM_TYPE>(ne00, (float *) (dst_ptr) + src0_start, nb1 / nb0,
                                                              src0_ptr + src0_start * nb01, src1_ptr,
                                                              nrows - (nrows % 4), ncols);
         }
         for (int iter = nrows - (nrows % 4); iter < nrows; iter++) {
+            repack_trace_work_event(name(), "gemv", src0, src1, src0_start, src0_end, src1_start + iter, src1_start + iter + 1);
             gemv<BLOC_TYPE, INTER_SIZE, NB_COLS, PARAM_TYPE>(ne00, (float *) (dst_ptr + (iter * nb1)) + src0_start,
                                                              ne01, src0_ptr + src0_start * nb01,
                                                              src1_ptr + (src1_col_stride * iter), 1 /* nrows */, ncols);
@@ -4492,7 +4839,7 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
             }
 
             if (src0_cur_start >= src0_cur_end) {
-                return;
+                continue;
             }
 
             for (int ir1 = 0; ir1 < nr1; ir1++) {
@@ -4723,8 +5070,55 @@ static const ggml::cpu::tensor_traits * ggml_repack_get_optimal_repack_type(cons
     return nullptr;
 }
 
+static const ggml::cpu::repack::tensor_traits_base * ggml_repack_filter_trait(
+    const ggml::cpu::repack::tensor_traits_base * trait,
+    const struct ggml_tensor * tensor
+) {
+    if (!trait) {
+        return nullptr;
+    }
+    if (!ggml::cpu::repack::repack_trait_allowed(trait) || !ggml::cpu::repack::repack_tensor_allowed(tensor)) {
+        if (ggml::cpu::repack::repack_debug_enabled()) {
+            std::fprintf(
+                stderr,
+                "ggml-cpu-repack: disabled repack %s for tensor %s type=%s ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "]\n",
+                trait->name(),
+                tensor->name,
+                ggml_type_name(tensor->type),
+                tensor->ne[0], tensor->ne[1], tensor->ne[2], tensor->ne[3]);
+            GGML_LOG_INFO(
+                "ggml-cpu-repack: disabled repack %s for tensor %s type=%s ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "]\n",
+                trait->name(),
+                tensor->name,
+                ggml_type_name(tensor->type),
+                tensor->ne[0], tensor->ne[1], tensor->ne[2], tensor->ne[3]);
+        }
+        return nullptr;
+    }
+    return trait;
+}
+
 static enum ggml_status ggml_backend_cpu_repack_buffer_init_tensor(ggml_backend_buffer_t buffer, struct ggml_tensor * tensor) {
-    tensor->extra = (void *) const_cast<ggml::cpu::tensor_traits *>(ggml_repack_get_optimal_repack_type(tensor));
+    const auto * raw_trait = static_cast<const ggml::cpu::repack::tensor_traits_base *>(
+        ggml_repack_get_optimal_repack_type(tensor));
+    const auto * trait = ggml_repack_filter_trait(raw_trait, tensor);
+    tensor->extra = (void *) const_cast<ggml::cpu::tensor_traits *>(static_cast<const ggml::cpu::tensor_traits *>(trait));
+
+    if (ggml::cpu::repack::repack_debug_enabled()) {
+        std::fprintf(
+            stderr,
+            "ggml-cpu-repack: tensor %s type=%s ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] trait=%s\n",
+            tensor->name,
+            ggml_type_name(tensor->type),
+            tensor->ne[0], tensor->ne[1], tensor->ne[2], tensor->ne[3],
+            trait ? trait->name() : "<none>");
+        GGML_LOG_INFO(
+            "ggml-cpu-repack: tensor %s type=%s ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] trait=%s\n",
+            tensor->name,
+            ggml_type_name(tensor->type),
+            tensor->ne[0], tensor->ne[1], tensor->ne[2], tensor->ne[3],
+            trait ? trait->name() : "<none>");
+    }
 
     GGML_UNUSED(buffer);
     return GGML_STATUS_SUCCESS;
@@ -4736,9 +5130,38 @@ static void ggml_backend_cpu_repack_buffer_set_tensor(ggml_backend_buffer_t buff
     GGML_ASSERT(size == ggml_nbytes(tensor));
 
     auto tensor_traits = (ggml::cpu::repack::tensor_traits_base *) tensor->extra;
+    if (tensor_traits == nullptr) {
+        if (ggml::cpu::repack::repack_debug_enabled()) {
+            std::fprintf(
+                stderr,
+                "ggml-cpu-repack: raw fallback for tensor %s type=%s size=%zu\n",
+                tensor->name,
+                ggml_type_name(tensor->type),
+                size);
+        }
+        std::memcpy((char *) tensor->data + offset, data, size);
+        ggml::cpu::repack::dump_repack_tensor_event(
+            "raw_fallback",
+            tensor,
+            nullptr,
+            data,
+            size,
+            tensor->data,
+            size);
+        GGML_UNUSED(buffer);
+        return;
+    }
     auto OK            = tensor_traits->repack(tensor, data, size);
 
     GGML_ASSERT(OK == 0);
+    ggml::cpu::repack::dump_repack_tensor_event(
+        "repacked",
+        tensor,
+        tensor_traits->name(),
+        data,
+        size,
+        tensor->data,
+        size);
     GGML_UNUSED(buffer);
 }
 
@@ -4772,16 +5195,23 @@ static size_t ggml_backend_cpu_repack_buffer_type_get_alignment(ggml_backend_buf
 namespace ggml::cpu::repack {
 class extra_buffer_type : ggml::cpu::extra_buffer_type {
     bool supports_op(ggml_backend_dev_t, const struct ggml_tensor * op) override {
+        const auto * repack_trait = static_cast<const ggml::cpu::repack::tensor_traits_base *>(
+            ggml_repack_get_optimal_repack_type(op->src[0]));
+        const char * repack_trait_name = repack_trait ? repack_trait->name() : "<none>";
+        bool supported = false;
         if (    op->op == GGML_OP_MUL_MAT &&
                 op->src[0]->buffer &&
                 (ggml_n_dims(op->src[0]) == 2) &&
                 op->src[0]->buffer->buft == ggml_backend_cpu_repack_buffer_type() &&
-                ggml_repack_get_optimal_repack_type(op->src[0])
+                ggml::cpu::repack::repack_trait_allowed(repack_trait)
                 ) {
             if (op->src[1]->buffer && !ggml_backend_buft_is_host(op->src[1]->buffer->buft)) {
+                repack_trace_select_event("supports_op_mul_mat_non_host_src1", op, op->src[0], repack_trait_name, false);
                 return false;
             }
             if (op->src[1]->type == GGML_TYPE_F32) {
+                supported = true;
+                repack_trace_select_event("supports_op_mul_mat", op, op->src[0], repack_trait_name, true);
                 return true;
             }
             //if (op->src[1]->type == GGML_TYPE_Q8_0) {
@@ -4792,27 +5222,40 @@ class extra_buffer_type : ggml::cpu::extra_buffer_type {
                 && op->src[0]->buffer
                 && (ggml_n_dims(op->src[0]) == 3)
                 && op->src[0]->buffer->buft == ggml_backend_cpu_repack_buffer_type()
-                && ggml_repack_get_optimal_repack_type(op->src[0])
+                && ggml::cpu::repack::repack_trait_allowed(repack_trait)
                 ) {
             if (op->src[1]->buffer && !ggml_backend_buft_is_host(op->src[1]->buffer->buft)) {
+                repack_trace_select_event("supports_op_mul_mat_id_non_host_src1", op, op->src[0], repack_trait_name, false);
                 return false;
             }
             if (op->src[1]->type == GGML_TYPE_F32) {
+                supported = true;
+                repack_trace_select_event("supports_op_mul_mat_id", op, op->src[0], repack_trait_name, true);
                 return true;
             }
             //if (op->src[1]->type == GGML_TYPE_Q8_0) {
             //    return true;
             //}
         }
+        repack_trace_select_event("supports_op_fallthrough", op, op->src[0], repack_trait_name, supported);
         return false;
     }
 
     ggml::cpu::tensor_traits * get_tensor_traits(const struct ggml_tensor * op) override {
         if (op->op == GGML_OP_MUL_MAT || op->op == GGML_OP_MUL_MAT_ID) {
             if (op->src[0]->buffer && op->src[0]->buffer->buft == ggml_backend_cpu_repack_buffer_type()) {
-                return (ggml::cpu::tensor_traits *) op->src[0]->extra;
+                auto * traits = (ggml::cpu::tensor_traits *) op->src[0]->extra;
+                const auto * repack_traits = static_cast<const ggml::cpu::repack::tensor_traits_base *>(traits);
+                repack_trace_select_event(
+                    "get_tensor_traits",
+                    op,
+                    op->src[0],
+                    repack_traits ? repack_traits->name() : "<none>",
+                    traits != nullptr);
+                return traits;
             }
         }
+        repack_trace_select_event("get_tensor_traits_none", op, op ? op->src[0] : nullptr, "<none>", false);
         return nullptr;
     }
 };

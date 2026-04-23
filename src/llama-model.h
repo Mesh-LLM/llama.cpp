@@ -517,6 +517,8 @@ struct llama_model {
     llm_arch arch = LLM_ARCH_UNKNOWN;
 
     std::string name = "n/a";
+    int32_t layer_shard_start = -1;
+    int32_t layer_shard_end   = -1;
 
     llama_hparams hparams = {};
     llama_vocab   vocab;
@@ -615,6 +617,10 @@ struct llama_model {
     ggml_backend_buffer_type_t select_buft(int il) const;
 
     bool has_tensor_overrides() const;
+
+    bool has_layer_shard() const {
+        return layer_shard_start >= 0 && layer_shard_end > layer_shard_start;
+    }
 
     const struct ggml_tensor * get_tensor(const char * name) const;
 

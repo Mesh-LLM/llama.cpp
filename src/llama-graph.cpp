@@ -962,6 +962,9 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     mctx             (params.mctx),
     cross            (params.cross),
     samplers         (params.samplers),
+    il_start         (params.il_start),
+    il_end           (params.il_end),
+    il_skip_stride   (params.il_skip_stride),
     cb_func          (params.cb),
     res              (params.res),
     ctx0             (res->get_ctx()),
@@ -1718,7 +1721,11 @@ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd) const {
     assert(ggml_are_same_shape (inps[0], inps[1]));
     assert(ggml_are_same_stride(inps[0], inps[1]));
 
-    ggml_tensor * cur = ggml_build_forward_select(gf, inps.data(), inps.size(), ubatch.token ? 0 : 1);
+    // Prefer explicit vector embeddings when they are provided, even if token IDs are
+    // also present as auxiliary sideband for architecture-specific inputs such as
+    // Gemma4 per-layer token embeddings.
+    const int inp_index = ubatch.embd ? 1 : 0;
+    ggml_tensor * cur = ggml_build_forward_select(gf, inps.data(), inps.size(), inp_index);
 
     if (n_embd_inp != n_embd) {
         cur = ggml_view_2d(ctx0, cur, n_embd, n_tokens, cur->nb[1], 0);

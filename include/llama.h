@@ -220,8 +220,11 @@ extern "C" {
     // A llama_batch object can contain input about one or many sequences
     // The provided arrays (i.e. token, embd, pos, etc.) must have size of n_tokens
     //
-    // - token  : the token ids of the input (used when embd is NULL)
-    // - embd   : token embeddings (i.e. float vector of size n_embd) (used when token is NULL)
+    // - token  : the token ids of the input
+    // - embd   : token embeddings (i.e. float vector of size n_embd)
+    //            If both token and embd are provided, embd is used as the primary
+    //            embedding input while token remains available as sideband metadata
+    //            for architecture-specific paths.
     // - pos    : the positions of the respective token in the sequence
     //            (if set to NULL, the token position will be tracked automatically by llama_encode/llama_decode)
     // - seq_id : the sequence to which the respective token belongs
@@ -912,6 +915,31 @@ extern "C" {
                     llama_seq_id   dest_seq_id,
            llama_state_seq_flags   flags);
 
+    LLAMA_API size_t llama_state_seq_get_size_range(
+            struct llama_context * ctx,
+                    llama_seq_id   seq_id,
+                         int32_t    il_start,
+                         int32_t    il_end,
+           llama_state_seq_flags   flags);
+
+    LLAMA_API size_t llama_state_seq_get_data_range(
+            struct llama_context * ctx,
+                         uint8_t * dst,
+                          size_t   size,
+                    llama_seq_id   seq_id,
+                         int32_t    il_start,
+                         int32_t    il_end,
+           llama_state_seq_flags   flags);
+
+    LLAMA_API size_t llama_state_seq_set_data_range(
+            struct llama_context * ctx,
+                   const uint8_t * src,
+                          size_t   size,
+                    llama_seq_id   dest_seq_id,
+                         int32_t    il_start,
+                         int32_t    il_end,
+           llama_state_seq_flags   flags);
+
     //
     // Decoding
     //
@@ -982,9 +1010,20 @@ extern "C" {
     // TODO: rename to avoid confusion with llama_get_embeddings()
     LLAMA_API void llama_set_embeddings(struct llama_context * ctx, bool embeddings);
 
+    // Set whether the context extracts logits into the output buffer.
+    // Internal pipeline stages that only forward embeddings can disable this.
+    LLAMA_API void llama_set_logits(struct llama_context * ctx, bool logits);
+
     // Set whether to use causal attention or not
     // If set to true, the model will only attend to the past tokens
     LLAMA_API void llama_set_causal_attn(struct llama_context * ctx, bool causal_attn);
+
+    // Restrict execution to a half-open layer range [il_start, il_end).
+    // Use (-1, -1) to restore full-model execution.
+    LLAMA_API void llama_set_compute_range(struct llama_context * ctx, int32_t il_start, int32_t il_end);
+    // Execute only every Nth layer inside the compute range.
+    // Use <= 1 to execute all layers.
+    LLAMA_API void llama_set_compute_skip_stride(struct llama_context * ctx, int32_t stride);
 
     // Set whether the model is in warmup mode or not
     // If true, all model tensors are activated during llama_decode() to load and cache their weights.

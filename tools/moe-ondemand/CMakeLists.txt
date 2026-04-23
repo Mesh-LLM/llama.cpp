@@ -1,0 +1,6 @@
+set(TARGET llama-moe-ondemand)
+add_executable(${TARGET} moe-ondemand.cpp)
+install(TARGETS ${TARGET} RUNTIME)
+target_link_libraries(${TARGET} PRIVATE common llama ${CMAKE_THREAD_LIBS_INIT})
+target_include_directories(${TARGET} PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_compile_features(${TARGET} PRIVATE cxx_std_17)

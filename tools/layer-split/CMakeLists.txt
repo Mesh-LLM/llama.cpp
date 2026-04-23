@@ -1,0 +1,5 @@
+set(TARGET llama-layer-split)
+add_executable(${TARGET} layer-split.cpp)
+install(TARGETS ${TARGET} RUNTIME)
+target_link_libraries(${TARGET} PRIVATE llama)
+target_compile_features(${TARGET} PRIVATE cxx_std_17)

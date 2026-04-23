@@ -20,6 +20,7 @@ namespace ggml::cpu {
 class tensor_traits {
   public:
     virtual ~tensor_traits();
+    virtual const char * debug_name() const { return "unknown"; }
     virtual bool work_size(int n_threads, const struct ggml_tensor * op, size_t & size)        = 0;
     virtual bool compute_forward(struct ggml_compute_params * params, struct ggml_tensor * op) = 0;
 };

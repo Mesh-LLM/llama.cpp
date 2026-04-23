@@ -165,6 +165,13 @@ llama_context::llama_context(
     cparams.op_offload = params.op_offload;
     cparams.kv_unified = params.kv_unified;
 
+    if (model.has_layer_shard()) {
+        compute_il_start = model.layer_shard_start;
+        compute_il_end   = model.layer_shard_end;
+        LLAMA_LOG_INFO("%s: default compute range from model shard = [%d, %d)\n",
+                __func__, compute_il_start, compute_il_end);
+    }
+
     // initialized later
     cparams.pipeline_parallel = false;
 
@@ -1031,6 +1038,12 @@ void llama_context::set_abort_callback(bool (*abort_callback)(void * data), void
     }
 }
 
+void llama_context::set_logits(bool value) {
+    LLAMA_LOG_DEBUG("%s: value = %d\n", __func__, value);
+
+    output_logits = value;
+}
+
 void llama_context::set_embeddings(bool value) {
     LLAMA_LOG_DEBUG("%s: value = %d\n", __func__, value);
 
@@ -1063,6 +1076,34 @@ void llama_context::set_warmup(bool value) {
 
     // warmups are usually with small batches, so no need to reserve
     //sched_need_reserve = true;
+}
+
+void llama_context::set_compute_range(int32_t il_start, int32_t il_end) {
+    LLAMA_LOG_DEBUG("%s: il_start = %d, il_end = %d\n", __func__, il_start, il_end);
+
+    if (compute_il_start == il_start && compute_il_end == il_end) {
+        return;
+    }
+
+    compute_il_start = il_start;
+    compute_il_end   = il_end;
+
+    sched_need_reserve = true;
+    gf_res_prev->reset();
+}
+
+void llama_context::set_compute_skip_stride(int32_t stride) {
+    stride = stride <= 1 ? 1 : stride;
+    LLAMA_LOG_DEBUG("%s: stride = %d\n", __func__, stride);
+
+    if (compute_skip_stride == stride) {
+        return;
+    }
+
+    compute_skip_stride = stride;
+
+    sched_need_reserve = true;
+    gf_res_prev->reset();
 }
 
 bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
@@ -1531,7 +1572,7 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
 }
 
 int llama_context::decode(const llama_batch & batch_inp) {
-    GGML_ASSERT((!batch_inp.token && batch_inp.embd) || (batch_inp.token && !batch_inp.embd)); // NOLINT
+    GGML_ASSERT(batch_inp.token || batch_inp.embd); // NOLINT
 
     if (!memory) {
         LLAMA_LOG_DEBUG("%s: cannot decode batches with this context (calling encode() instead)\n", __func__);
@@ -1895,7 +1936,7 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
     const auto n_vocab    = vocab.n_tokens();
     const auto n_embd_out = hparams.n_embd_out();
 
-    bool has_logits = true;
+    bool has_logits = output_logits;
     bool has_embd   = cparams.embeddings;
 
     // TODO: hacky enc-dec support
@@ -2163,6 +2204,9 @@ llm_graph_params llama_context::graph_params(
         /*.mctx        =*/ mctx,
         /*.cross       =*/ &cross,
         /*.samplers    =*/ sampling.samplers,
+        /*.il_start    =*/ compute_il_start,
+        /*.il_end      =*/ compute_il_end,
+        /*.il_skip_stride =*/ compute_skip_stride,
         /*.n_outputs   =*/ n_outputs,
         /*.cb          =*/ graph_get_cb(),
         /*.res         =*/ res,
@@ -2393,9 +2437,13 @@ size_t llama_context::state_set_data(const uint8_t * src, size_t size) {
 }
 
 size_t llama_context::state_seq_get_size(llama_seq_id seq_id, llama_state_seq_flags flags) {
+    return state_seq_get_size_range(seq_id, flags, -1, -1);
+}
+
+size_t llama_context::state_seq_get_size_range(llama_seq_id seq_id, llama_state_seq_flags flags, int32_t il_start, int32_t il_end) {
     llama_io_write_dummy io;
     try {
-        return state_seq_write_data(io, seq_id, flags);
+        return state_seq_write_data(io, seq_id, flags, il_start, il_end);
     } catch (const std::exception & err) {
         LLAMA_LOG_ERROR("%s: error getting state size: %s\n", __func__, err.what());
         return 0;
@@ -2403,9 +2451,13 @@ size_t llama_context::state_seq_get_size(llama_seq_id seq_id, llama_state_seq_fl
 }
 
 size_t llama_context::state_seq_get_data(llama_seq_id seq_id, uint8_t * dst, size_t size, llama_state_seq_flags flags) {
+    return state_seq_get_data_range(seq_id, dst, size, flags, -1, -1);
+}
+
+size_t llama_context::state_seq_get_data_range(llama_seq_id seq_id, uint8_t * dst, size_t size, llama_state_seq_flags flags, int32_t il_start, int32_t il_end) {
     llama_io_write_buffer io(dst, size);
     try {
-        return state_seq_write_data(io, seq_id, flags);
+        return state_seq_write_data(io, seq_id, flags, il_start, il_end);
     } catch (const std::exception & err) {
         LLAMA_LOG_ERROR("%s: error saving state: %s\n", __func__, err.what());
         return 0;
@@ -2413,9 +2465,13 @@ size_t llama_context::state_seq_get_data(llama_seq_id seq_id, uint8_t * dst, siz
 }
 
 size_t llama_context::state_seq_set_data(llama_seq_id seq_id, const uint8_t * src, size_t size, llama_state_seq_flags flags) {
+    return state_seq_set_data_range(seq_id, src, size, flags, -1, -1);
+}
+
+size_t llama_context::state_seq_set_data_range(llama_seq_id seq_id, const uint8_t * src, size_t size, llama_state_seq_flags flags, int32_t il_start, int32_t il_end) {
     llama_io_read_buffer io(src, size);
     try {
-        return state_seq_read_data(io, seq_id, flags);
+        return state_seq_read_data(io, seq_id, flags, il_start, il_end);
     } catch (const std::exception & err) {
         LLAMA_LOG_ERROR("%s: error loading state: %s\n", __func__, err.what());
         return 0;
@@ -2591,21 +2647,21 @@ size_t llama_context::state_read_data(llama_io_read_i & io) {
     return io.n_bytes();
 }
 
-size_t llama_context::state_seq_write_data(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
+size_t llama_context::state_seq_write_data(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags, int32_t il_start, int32_t il_end) {
     GGML_UNUSED(seq_id);
 
     if (memory) {
-        memory->state_write(io, seq_id, flags);
+        memory->state_write(io, seq_id, flags, il_start, il_end);
     }
 
     return io.n_bytes();
 }
 
-size_t llama_context::state_seq_read_data(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
+size_t llama_context::state_seq_read_data(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags, int32_t il_start, int32_t il_end) {
     GGML_UNUSED(seq_id);
 
     if (memory) {
-        memory->state_read(io, seq_id, flags);
+        memory->state_read(io, seq_id, flags, il_start, il_end);
     }
 
     return io.n_bytes();
@@ -3075,8 +3131,20 @@ void llama_set_embeddings(llama_context * ctx, bool embeddings) {
     ctx->set_embeddings(embeddings);
 }
 
+void llama_set_logits(llama_context * ctx, bool logits) {
+    ctx->set_logits(logits);
+}
+
 void llama_set_causal_attn(llama_context * ctx, bool causal_attn) {
     ctx->set_causal_attn(causal_attn);
+}
+
+void llama_set_compute_range(llama_context * ctx, int32_t il_start, int32_t il_end) {
+    ctx->set_compute_range(il_start, il_end);
+}
+
+void llama_set_compute_skip_stride(llama_context * ctx, int32_t stride) {
+    ctx->set_compute_skip_stride(stride);
 }
 
 void llama_set_warmup(llama_context * ctx, bool warmup) {
@@ -3411,6 +3479,22 @@ size_t llama_state_seq_set_data_ext(llama_context * ctx, const uint8_t * src, si
     ctx->synchronize();
 
     return ctx->state_seq_set_data(seq_id, src, size, flags);
+}
+
+size_t llama_state_seq_get_size_range(llama_context * ctx, llama_seq_id seq_id, int32_t il_start, int32_t il_end, llama_state_seq_flags flags) {
+    return ctx->state_seq_get_size_range(seq_id, flags, il_start, il_end);
+}
+
+size_t llama_state_seq_get_data_range(llama_context * ctx, uint8_t * dst, size_t size, llama_seq_id seq_id, int32_t il_start, int32_t il_end, llama_state_seq_flags flags) {
+    ctx->synchronize();
+
+    return ctx->state_seq_get_data_range(seq_id, dst, size, flags, il_start, il_end);
+}
+
+size_t llama_state_seq_set_data_range(llama_context * ctx, const uint8_t * src, size_t size, llama_seq_id seq_id, int32_t il_start, int32_t il_end, llama_state_seq_flags flags) {
+    ctx->synchronize();
+
+    return ctx->state_seq_set_data_range(seq_id, src, size, flags, il_start, il_end);
 }
 
 size_t llama_state_seq_save_file(llama_context * ctx, const char * filepath, llama_seq_id seq_id, const llama_token * tokens, size_t n_token_count) {

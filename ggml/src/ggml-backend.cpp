@@ -21,11 +21,48 @@
 #include <string.h>
 #include <algorithm>
 #include <vector>
+#include <unistd.h>
 
 #ifdef __APPLE__
 #include <sys/types.h>
 #include <sys/sysctl.h>
 #endif
+
+static bool ggml_sched_trace_assign_enabled() {
+    const char * path = getenv("GGML_SCHED_ASSIGN_LOG");
+    return path != NULL && path[0] != '\0';
+}
+
+static void ggml_sched_trace_assign_event(const char * phase, const struct ggml_tensor * tensor, const struct ggml_tensor * op,
+        ggml_backend_buffer_t buffer, ggml_backend_t backend, bool supports_buft, bool supports_op) {
+    if (!ggml_sched_trace_assign_enabled()) {
+        return;
+    }
+    if (op == NULL || (op->op != GGML_OP_MUL_MAT && op->op != GGML_OP_MUL_MAT_ID)) {
+        return;
+    }
+
+    const char * path = getenv("GGML_SCHED_ASSIGN_LOG");
+    FILE * fp = fopen(path, "a");
+    if (fp == NULL) {
+        return;
+    }
+    fprintf(fp,
+        "ggml-sched-assign: pid=%d phase=%s op=%s op_name=%s tensor=%s tensor_op=%s buffer=%s usage=%d backend=%s supports_buft=%d supports_op=%d\n",
+        (int) getpid(),
+        phase ? phase : "",
+        ggml_op_name(op->op),
+        op->name,
+        tensor ? tensor->name : "(null)",
+        tensor ? ggml_op_name(tensor->op) : "(null)",
+        buffer ? ggml_backend_buffer_name(buffer) : "(null)",
+        buffer ? (int) buffer->usage : -1,
+        backend ? ggml_backend_name(backend) : "(null)",
+        supports_buft ? 1 : 0,
+        supports_op ? 1 : 0
+    );
+    fclose(fp);
+}
 
 
 // backend buffer type
@@ -850,8 +887,11 @@ static int ggml_backend_sched_backend_from_buffer(ggml_backend_sched_t sched, co
 
     // find highest prio backend that supports the buffer type and the op
     for (int i = 0; i < sched->n_backends; i++) {
-        if (ggml_backend_supports_buft(sched->backends[i], buffer->buft) &&
-            ggml_backend_supports_op(sched->backends[i], op)) {
+        const bool supports_buft = ggml_backend_supports_buft(sched->backends[i], buffer->buft);
+        const bool supports_op = ggml_backend_supports_op(sched->backends[i], op);
+        ggml_sched_trace_assign_event("backend_from_buffer_check", tensor, op, buffer, sched->backends[i], supports_buft, supports_op);
+        if (supports_buft && supports_op) {
+            ggml_sched_trace_assign_event("backend_from_buffer_pick", tensor, op, buffer, sched->backends[i], supports_buft, supports_op);
             return i;
         }
     }

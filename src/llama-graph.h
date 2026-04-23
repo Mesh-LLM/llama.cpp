@@ -558,6 +558,10 @@ struct llm_graph_params {
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 
+    int32_t il_start = -1;
+    int32_t il_end   = -1;
+    int32_t il_skip_stride = 1;
+
     static bool samplers_equal(
           const std::map<llama_seq_id, llama_sampler *> & lhs,
           const std::map<llama_seq_id, llama_sampler *> & rhs) {
@@ -617,6 +621,10 @@ struct llm_graph_params {
         }
 
         if (!samplers_equal(samplers, other.samplers)) {
+            return false;
+        }
+
+        if (il_start != other.il_start || il_end != other.il_end || il_skip_stride != other.il_skip_stride) {
             return false;
         }
 
@@ -765,6 +773,9 @@ struct llm_graph_context {
     const llama_cross            * cross;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
+    const int32_t il_start;
+    const int32_t il_end;
+    const int32_t il_skip_stride;
 
     const llm_graph_cb & cb_func;
 

@@ -699,7 +699,7 @@ size_t llama_memory_recurrent::size_s_bytes() const {
     return size_s_bytes;
 }
 
-void llama_memory_recurrent::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
+void llama_memory_recurrent::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags, int32_t il_start, int32_t il_end) const {
     GGML_UNUSED(flags);
 
     std::vector<std::pair<uint32_t, uint32_t>> cell_ranges; // ranges, from inclusive, to exclusive
@@ -736,10 +736,10 @@ void llama_memory_recurrent::state_write(llama_io_write_i & io, llama_seq_id seq
     io.write(&cell_count, sizeof(cell_count));
 
     state_write_meta(io, cell_ranges, seq_id);
-    state_write_data(io, cell_ranges);
+    state_write_data(io, cell_ranges, il_start, il_end);
 }
 
-void llama_memory_recurrent::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
+void llama_memory_recurrent::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags, int32_t il_start, int32_t il_end) {
     GGML_UNUSED(flags);
 
     uint32_t cell_count;
@@ -748,7 +748,7 @@ void llama_memory_recurrent::state_read(llama_io_read_i & io, llama_seq_id seq_i
     bool res = true;
 
     res = res && state_read_meta(io, cell_count, seq_id);
-    res = res && state_read_data(io, cell_count);
+    res = res && state_read_data(io, cell_count, il_start, il_end);
 
     if (!res) {
         if (seq_id == -1) {
@@ -779,16 +779,19 @@ void llama_memory_recurrent::state_write_meta(llama_io_write_i & io, const std::
     }
 }
 
-void llama_memory_recurrent::state_write_data(llama_io_write_i & io, const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges) const {
+void llama_memory_recurrent::state_write_data(llama_io_write_i & io, const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges, int32_t il_start, int32_t il_end) const {
     const uint32_t s_trans = 0;
-    const uint32_t n_layer = hparams.n_layer;
+    const uint32_t n_layer = il_start < 0 || il_end < 0 ? hparams.n_layer : std::max(0, il_end - il_start);
 
     io.write(&s_trans, sizeof(s_trans));
     io.write(&n_layer,   sizeof(n_layer));
 
     // Iterate and write all the R tensors first, each row is a cell
     // Get whole range at a time
-    for (uint32_t il = 0; il < n_layer; ++il) {
+    const uint32_t il0 = il_start < 0 || il_end < 0 ? 0 : (uint32_t) il_start;
+    const uint32_t il1 = il_start < 0 || il_end < 0 ? n_layer : (uint32_t) il_end;
+
+    for (uint32_t il = il0; il < il1; ++il) {
         // skip null layers (read_data will handle this by checking "r_l" and "s_l" for null)
         if (r_l[il] == nullptr) continue;
 
@@ -809,7 +812,7 @@ void llama_memory_recurrent::state_write_data(llama_io_write_i & io, const std::
     }
 
     if (!s_trans) {
-        for (uint32_t il = 0; il < n_layer; ++il) {
+        for (uint32_t il = il0; il < il1; ++il) {
             // skip null layers (read_data will handle this by checking "r_l" and "s_l" for null)
             if (s_l[il] == nullptr) continue;
 
@@ -831,7 +834,7 @@ void llama_memory_recurrent::state_write_data(llama_io_write_i & io, const std::
     } else {
         // When S tensor is transposed, we also need the element size and get the element ranges from each row
         const uint32_t mem_size = size;
-        for (uint32_t il = 0; il < n_layer; ++il) {
+        for (uint32_t il = il0; il < il1; ++il) {
             // skip null layers (read_data will handle this by checking "r_l" and "s_l" for null)
             if (s_l[il] == nullptr) continue;
 
@@ -958,14 +961,15 @@ bool llama_memory_recurrent::state_read_meta(llama_io_read_i & io, uint32_t cell
     return true;
 }
 
-bool llama_memory_recurrent::state_read_data(llama_io_read_i & io, uint32_t cell_count) {
+bool llama_memory_recurrent::state_read_data(llama_io_read_i & io, uint32_t cell_count, int32_t il_start, int32_t il_end) {
     uint32_t s_trans;
     uint32_t n_layer;
     io.read_to(&s_trans, sizeof(s_trans));
     io.read_to(&n_layer, sizeof(n_layer));
 
-    if (n_layer != hparams.n_layer) {
-        LLAMA_LOG_ERROR("%s: mismatched layer count (%u instead of %u)\n", __func__, n_layer, hparams.n_layer);
+    const uint32_t expected_layers = il_start < 0 || il_end < 0 ? hparams.n_layer : (uint32_t) std::max(0, il_end - il_start);
+    if (n_layer != expected_layers) {
+        LLAMA_LOG_ERROR("%s: mismatched layer count (%u instead of %u)\n", __func__, n_layer, expected_layers);
         return false;
     }
     if (cell_count > size) {
@@ -978,7 +982,10 @@ bool llama_memory_recurrent::state_read_data(llama_io_read_i & io, uint32_t cell
     }
 
     // For each layer, read the keys for each cell, one row is one cell, read as one contiguous block
-    for (uint32_t il = 0; il < n_layer; ++il) {
+    const uint32_t il0 = il_start < 0 || il_end < 0 ? 0 : (uint32_t) il_start;
+    const uint32_t il1 = il_start < 0 || il_end < 0 ? n_layer : (uint32_t) il_end;
+
+    for (uint32_t il = il0; il < il1; ++il) {
         // skip null layers
         if (r_l[il] == nullptr) continue;
 
@@ -1007,7 +1014,7 @@ bool llama_memory_recurrent::state_read_data(llama_io_read_i & io, uint32_t cell
     }
 
     if (!s_trans) {
-        for (uint32_t il = 0; il < n_layer; ++il) {
+        for (uint32_t il = il0; il < il1; ++il) {
             // skip null layers
             if (s_l[il] == nullptr) continue;
 
@@ -1037,7 +1044,7 @@ bool llama_memory_recurrent::state_read_data(llama_io_read_i & io, uint32_t cell
         }
     } else {
         // For each layer, read the values for each cell (transposed)
-        for (uint32_t il = 0; il < n_layer; ++il) {
+        for (uint32_t il = il0; il < il1; ++il) {
             // skip null layers
             if (s_l[il] == nullptr) continue;
 

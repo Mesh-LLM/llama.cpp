@@ -10,6 +10,7 @@
 #include <cinttypes>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <future>
 #include <regex>
 
@@ -98,6 +99,17 @@ static std::vector<std::string> llama_get_list_splits(const std::string & path, 
     }
 
     return paths;
+}
+
+static bool llama_parse_repeating_layer_id(const std::string & name, int32_t * layer_id) {
+    int parsed = -1;
+    if (std::sscanf(name.c_str(), "blk.%d.", &parsed) == 1 && parsed >= 0) {
+        if (layer_id) {
+            *layer_id = parsed;
+        }
+        return true;
+    }
+    return false;
 }
 
 namespace GGUFMeta {
@@ -694,6 +706,21 @@ llama_model_loader::llama_model_loader(
     } else {
         get_key(llm_kv(LLM_KV_GENERAL_ARCHITECTURE), arch_name, false);
         llm_kv = LLM_KV(llm_arch_from_string(arch_name));
+        n_tensors = gguf_get_n_tensors(metadata);
+    }
+
+    {
+        int32_t shard_start = -1;
+        int32_t shard_end = -1;
+        if (get_key("mesh.layer_start", shard_start, false) && get_key("mesh.layer_end", shard_end, false)) {
+            if (shard_start < 0 || shard_end < 0 || shard_start >= shard_end) {
+                throw std::runtime_error(format("invalid mesh layer shard range [%d, %d)", shard_start, shard_end));
+            }
+            layer_shard_active = true;
+            layer_shard_start = shard_start;
+            layer_shard_end = shard_end;
+            LLAMA_LOG_INFO("%s: layer shard active [%d, %d)\n", __func__, layer_shard_start, layer_shard_end);
+        }
     }
 
     n_kv      = gguf_get_n_kv(metadata);
@@ -868,6 +895,8 @@ const struct ggml_tensor * llama_model_loader::check_tensor_dims(const std::stri
         }
         throw std::runtime_error(format("%s: tensor '%s' not found", __func__, name.c_str()));
     }
+
+    requested_tensors.insert(name);
 
     {
         bool is_ok = true;
@@ -1076,6 +1105,10 @@ struct ggml_tensor * llama_model_loader::create_tensor(
     };
 
     auto buft_for_tensor = [&](ggml_tensor * t_meta) -> ggml_backend_buffer_type_t {
+        if (tn.bid >= 0 && !layer_in_shard(tn.bid)) {
+            return nullptr;
+        }
+
         if (!t_meta) {
             if (flags & TENSOR_NOT_REQUIRED) {
                 return nullptr;
@@ -1216,9 +1249,13 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         }
         ggml_type type = GGML_TYPE_F32;
         const int64_t tid = gguf_find_tensor(metadata, tn.str().c_str());
-        if (tid != -1) {
-            type = gguf_get_tensor_type(metadata, tid);
+        if (tid == -1) {
+            if (flags & TENSOR_NOT_REQUIRED) {
+                return nullptr;
+            }
+            throw std::runtime_error(format("missing tensor '%s'", tn.str().c_str()));
         }
+        type = gguf_get_tensor_type(metadata, tid);
 
         // for tensors that are not required some of the dimensions can be invalid:
         if (flags & TENSOR_NOT_REQUIRED) {
@@ -1314,7 +1351,28 @@ struct ggml_tensor * llama_model_loader::create_tensor_as_view(struct ggml_conte
 
 void llama_model_loader::done_getting_tensors() const {
     if (n_created != n_tensors) {
-        throw std::runtime_error(format("%s: wrong number of tensors; expected %d, got %d", __func__, n_tensors, n_created));
+        std::string unused_names;
+        int unused_count = 0;
+        for (const auto & it : weights_map) {
+            if (requested_tensors.find(it.first) != requested_tensors.end()) {
+                continue;
+            }
+            if (unused_count < 8) {
+                if (!unused_names.empty()) {
+                    unused_names += ", ";
+                }
+                unused_names += it.first;
+            }
+            unused_count++;
+        }
+        throw std::runtime_error(format(
+            "%s: wrong number of tensors; expected %d, got %d; unconsumed tensors: %d%s%s",
+            __func__,
+            n_tensors,
+            n_created,
+            unused_count,
+            unused_names.empty() ? "" : " [",
+            unused_names.empty() ? "" : (unused_names + "]").c_str()));
     }
     if (n_tensors_moved > 0) {
         LLAMA_LOG_DEBUG("%s: tensor '%s' (%s) (and %zu others) cannot be used with preferred buffer type %s, using %s instead\n",
