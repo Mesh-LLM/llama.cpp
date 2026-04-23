@@ -1,6 +1,7 @@
 #include "arg.h"
 #include "chat.h"
 #include "common.h"
+#include "ggml.h"
 #include "llama.h"
 #include "log.h"
 
@@ -11,6 +12,7 @@
 #include <cstdlib>
 #include <fstream>
 #include <filesystem>
+#include <iostream>
 #include <iterator>
 #include <mutex>
 #include <deque>
@@ -79,6 +81,7 @@ struct prefill_handoff_metrics {
     double import_elapsed_s = 0.0;
     double shadow_ready_elapsed_s = -1.0;
     double first_baseline_decode_elapsed_s = 0.0;
+    double baseline_total_decode_elapsed_s = 0.0;
     double first_shadow_decode_elapsed_s = 0.0;
     double import_plus_first_replay_elapsed_s = -1.0;
     double first_token_replay_delta_s = 0.0;
@@ -171,6 +174,8 @@ struct multistage_compute_metrics {
     uint64_t boundary_embedding_bytes = 0;
     std::vector<int32_t> boundaries;
     std::vector<uint64_t> stage_state_bytes;
+    std::string activation_wire_dtype = "fp32";
+    uint64_t activation_wire_element_bytes = sizeof(float);
     bool live_prefill_enabled = false;
     int live_prefill_chunk_tokens = 0;
     int live_prefill_downstream_chunk_tokens = 0;
@@ -377,15 +382,79 @@ static bool multistage_live_prefill_import_baseline_state = false;
 static bool multistage_live_decode_import_baseline_state = false;
 static bool multistage_live_decode_auto_pos = false;
 static int multistage_live_decode_light_context_tokens = 0;
+static bool multistage_serving_mode = false;
+static bool multistage_stage_ready_handshake = false;
+static bool completion_only = false;
+static bool stream_output = false;
 static bool baseline_prefill_layer_timing = false;
 static std::mutex multistage_live_prefill_runtime_mutex;
 static std::string multistage_stage_server_listen_addr;
 static std::string multistage_stage_next_connect_addr;
 static std::string multistage_stage_driver_connect_addr;
+static bool prompt_stdin_after_init = false;
 static int multistage_stage_index = -1;
 static int multistage_stage_session_count = 1;
 static int multistage_stage_il_start = -1;
 static int multistage_stage_il_end = -1;
+
+enum class multistage_activation_wire_dtype : int32_t {
+    F32 = 0,
+    F16 = 1,
+};
+
+static multistage_activation_wire_dtype multistage_activation_wire_dtype_value =
+    multistage_activation_wire_dtype::F32;
+
+static const char * multistage_activation_wire_dtype_name(multistage_activation_wire_dtype dtype) {
+    switch (dtype) {
+        case multistage_activation_wire_dtype::F16:
+            return "fp16";
+        case multistage_activation_wire_dtype::F32:
+        default:
+            return "fp32";
+    }
+}
+
+static size_t multistage_activation_wire_element_size(multistage_activation_wire_dtype dtype) {
+    return dtype == multistage_activation_wire_dtype::F16 ? sizeof(ggml_fp16_t) : sizeof(float);
+}
+
+static uint64_t multistage_activation_wire_payload_bytes(
+    size_t embedding_count,
+    multistage_activation_wire_dtype dtype = multistage_activation_wire_dtype_value
+) {
+    return (uint64_t) embedding_count * (uint64_t) multistage_activation_wire_element_size(dtype);
+}
+
+static bool parse_multistage_activation_wire_dtype(
+    const char * value,
+    multistage_activation_wire_dtype & dtype
+) {
+    if (std::strcmp(value, "fp32") == 0 || std::strcmp(value, "f32") == 0) {
+        dtype = multistage_activation_wire_dtype::F32;
+        return true;
+    }
+    if (std::strcmp(value, "fp16") == 0 || std::strcmp(value, "f16") == 0) {
+        dtype = multistage_activation_wire_dtype::F16;
+        return true;
+    }
+    return false;
+}
+
+static bool parse_multistage_activation_wire_dtype_id(
+    int32_t value,
+    multistage_activation_wire_dtype & dtype
+) {
+    if (value == (int32_t) multistage_activation_wire_dtype::F32) {
+        dtype = multistage_activation_wire_dtype::F32;
+        return true;
+    }
+    if (value == (int32_t) multistage_activation_wire_dtype::F16) {
+        dtype = multistage_activation_wire_dtype::F16;
+        return true;
+    }
+    return false;
+}
 
 enum multistage_stage_message_kind : int32_t {
     MULTISTAGE_STAGE_MSG_PREFILL_EMBD = 1,
@@ -513,6 +582,7 @@ static multistage_stage_state_header make_stage_state_header(
     header.decode_step = decode_step;
     header.current_token = current_token;
     header.source_stage_index = source_stage_index;
+    header.reserved = (int32_t) multistage_activation_wire_dtype_value;
     return header;
 }
 
@@ -624,10 +694,12 @@ static bool send_stage_message(
 ) {
     const int32_t token_sideband_count = (int32_t) token_payload_count;
     const int32_t header[4] = {kind, pos_start, token_count, token_sideband_count};
+    multistage_stage_state_header wire_stage_state = stage_state;
+    wire_stage_state.reserved = (int32_t) multistage_activation_wire_dtype_value;
     if (!send_all(fd, header, sizeof(header))) {
         return false;
     }
-    if (!send_all(fd, &stage_state, sizeof(stage_state))) {
+    if (!send_all(fd, &wire_stage_state, sizeof(wire_stage_state))) {
         return false;
     }
     if (token_payload_count > 0 && tokens != nullptr) {
@@ -636,6 +708,11 @@ static bool send_stage_message(
         }
     }
     if (embedding_count > 0 && embeddings != nullptr) {
+        if (multistage_activation_wire_dtype_value == multistage_activation_wire_dtype::F16) {
+            std::vector<ggml_fp16_t> packed(embedding_count);
+            ggml_fp32_to_fp16_row(embeddings, packed.data(), (int64_t) embedding_count);
+            return send_all(fd, packed.data(), sizeof(ggml_fp16_t) * packed.size());
+        }
         return send_all(fd, embeddings, sizeof(float) * embedding_count);
     }
     return true;
@@ -691,6 +768,18 @@ static bool recv_stage_reply(
            reply_kind == MULTISTAGE_STAGE_REPLY_PREDICTED_TOKEN;
 }
 
+static constexpr int32_t MULTISTAGE_STAGE_READY_MAGIC = 0x53524459; // "SRDY"
+
+static bool send_stage_ready(int fd) {
+    const int32_t magic = MULTISTAGE_STAGE_READY_MAGIC;
+    return send_all(fd, &magic, sizeof(magic));
+}
+
+static bool recv_stage_ready(int fd) {
+    int32_t magic = 0;
+    return recv_all(fd, &magic, sizeof(magic)) && magic == MULTISTAGE_STAGE_READY_MAGIC;
+}
+
 static bool recv_stage_message(
     int fd,
     int32_t & kind,
@@ -714,6 +803,10 @@ static bool recv_stage_message(
         return false;
     }
     if (stage_state.version != MULTISTAGE_STAGE_STATE_VERSION) {
+        return false;
+    }
+    multistage_activation_wire_dtype payload_dtype = multistage_activation_wire_dtype::F32;
+    if (!parse_multistage_activation_wire_dtype_id(stage_state.reserved, payload_dtype)) {
         return false;
     }
     if (kind == MULTISTAGE_STAGE_MSG_STOP) {
@@ -743,6 +836,14 @@ static bool recv_stage_message(
     embeddings.resize((size_t) token_count * (size_t) n_embd);
     raw_bytes.clear();
     if (!embeddings.empty()) {
+        if (payload_dtype == multistage_activation_wire_dtype::F16) {
+            std::vector<ggml_fp16_t> packed(embeddings.size());
+            if (!recv_all(fd, packed.data(), sizeof(ggml_fp16_t) * packed.size())) {
+                return false;
+            }
+            ggml_fp16_to_fp32_row(packed.data(), embeddings.data(), (int64_t) embeddings.size());
+            return true;
+        }
         return recv_all(fd, embeddings.data(), sizeof(float) * embeddings.size());
     }
     return true;
@@ -1086,6 +1187,7 @@ static void write_result_json(
     out << "    \"import_elapsed_s\": " << metrics.import_elapsed_s << ",\n";
     out << "    \"shadow_ready_elapsed_s\": " << metrics.shadow_ready_elapsed_s << ",\n";
     out << "    \"first_baseline_decode_elapsed_s\": " << metrics.first_baseline_decode_elapsed_s << ",\n";
+    out << "    \"baseline_total_decode_elapsed_s\": " << metrics.baseline_total_decode_elapsed_s << ",\n";
     out << "    \"first_shadow_decode_elapsed_s\": " << metrics.first_shadow_decode_elapsed_s << ",\n";
     out << "    \"import_plus_first_replay_elapsed_s\": " << metrics.import_plus_first_replay_elapsed_s << ",\n";
     out << "    \"first_token_replay_delta_s\": " << metrics.first_token_replay_delta_s << ",\n";
@@ -1244,6 +1346,10 @@ static void write_multistage_compute_json(
     out << "    \"staged_total_delta_vs_baseline_runtime_s\": " << metrics.staged_total_delta_vs_baseline_runtime_s << ",\n";
     out << "    \"token_match\": " << (metrics.token_match ? "true" : "false") << ",\n";
     out << "    \"boundary_embedding_bytes\": " << metrics.boundary_embedding_bytes << ",\n";
+    out << "    \"activation_wire_dtype\": ";
+    write_json_string(out, metrics.activation_wire_dtype);
+    out << ",\n";
+    out << "    \"activation_wire_element_bytes\": " << metrics.activation_wire_element_bytes << ",\n";
     out << "    \"live_prefill_enabled\": " << (metrics.live_prefill_enabled ? "true" : "false") << ",\n";
     out << "    \"live_prefill_chunk_tokens\": " << metrics.live_prefill_chunk_tokens << ",\n";
     out << "    \"live_prefill_downstream_chunk_tokens\": " << metrics.live_prefill_downstream_chunk_tokens << ",\n";
@@ -1414,6 +1520,11 @@ static void write_multistage_stage_server_json(
     out << "  \"multistage_stage_server\": {\n";
     out << "    \"stage_index\": " << stage_index << ",\n";
     out << "    \"has_next_stage\": " << (has_next_stage ? "true" : "false") << ",\n";
+    out << "    \"activation_wire_dtype\": ";
+    write_json_string(out, multistage_activation_wire_dtype_name(multistage_activation_wire_dtype_value));
+    out << ",\n";
+    out << "    \"activation_wire_element_bytes\": "
+        << multistage_activation_wire_element_size(multistage_activation_wire_dtype_value) << ",\n";
     out << "    \"session_summaries\": [";
     for (size_t session_index = 0; session_index < session_summaries.size(); ++session_index) {
         if (session_index > 0) out << ", ";
@@ -1537,6 +1648,13 @@ int main(int argc, char ** argv) {
             multistage_models_csv = argv[++i];
         } else if (std::strcmp(argv[i], "--multistage-live-prefill") == 0) {
             multistage_live_prefill = true;
+        } else if (std::strcmp(argv[i], "--multistage-activation-dtype") == 0 && i + 1 < argc) {
+            if (!parse_multistage_activation_wire_dtype(
+                    argv[++i],
+                    multistage_activation_wire_dtype_value)) {
+                LOG_ERR("--multistage-activation-dtype must be one of: fp32, fp16\n");
+                return 1;
+            }
         } else if (std::strcmp(argv[i], "--multistage-live-prefill-chunk-tokens") == 0 && i + 1 < argc) {
             multistage_live_prefill_chunk_tokens = std::atoi(argv[++i]);
         } else if (std::strcmp(argv[i], "--multistage-live-prefill-downstream-chunk-tokens") == 0 && i + 1 < argc) {
@@ -1565,6 +1683,14 @@ int main(int argc, char ** argv) {
             multistage_live_decode_auto_pos = true;
         } else if (std::strcmp(argv[i], "--multistage-live-decode-light-context-tokens") == 0 && i + 1 < argc) {
             multistage_live_decode_light_context_tokens = std::max(std::atoi(argv[++i]), 0);
+        } else if (std::strcmp(argv[i], "--multistage-serving-mode") == 0) {
+            multistage_serving_mode = true;
+        } else if (std::strcmp(argv[i], "--multistage-stage-ready-handshake") == 0) {
+            multistage_stage_ready_handshake = true;
+        } else if (std::strcmp(argv[i], "--completion-only") == 0) {
+            completion_only = true;
+        } else if (std::strcmp(argv[i], "--stream-output") == 0) {
+            stream_output = true;
         } else if (std::strcmp(argv[i], "--multistage-keep-stage-logits") == 0) {
             multistage_keep_stage_logits = true;
         } else if (std::strcmp(argv[i], "--multistage-live-prefill-hop-latency-ms") == 0 && i + 1 < argc) {
@@ -1593,6 +1719,8 @@ int main(int argc, char ** argv) {
             multistage_stage_il_start = std::atoi(argv[++i]);
         } else if (std::strcmp(argv[i], "--multistage-stage-il-end") == 0 && i + 1 < argc) {
             multistage_stage_il_end = std::atoi(argv[++i]);
+        } else if (std::strcmp(argv[i], "--prompt-stdin-after-init") == 0) {
+            prompt_stdin_after_init = true;
         } else {
             filtered_argv.push_back(argv[i]);
         }
@@ -1605,7 +1733,11 @@ int main(int argc, char ** argv) {
     }
     const bool multistage_stage_server_mode = !multistage_stage_server_listen_addr.empty();
     const bool multistage_stage_driver_mode = !multistage_stage_driver_connect_addr.empty();
-    if (params.prompt.empty() && state_in_path.empty() && state_chunks_dir_path.empty() && !multistage_stage_server_mode) {
+    if (params.prompt.empty() &&
+        !prompt_stdin_after_init &&
+        state_in_path.empty() &&
+        state_chunks_dir_path.empty() &&
+        !multistage_stage_server_mode) {
         LOG_ERR("prompt is required (use --prompt or --file)\n");
         return 1;
     }
@@ -1766,6 +1898,20 @@ int main(int argc, char ** argv) {
     const bool add_bos = llama_vocab_get_add_bos(vocab);
     const int n_vocab = llama_vocab_n_tokens(vocab);
 
+    if (prompt_stdin_after_init && params.prompt.empty() && !multistage_stage_server_mode && !multistage_stage_driver_mode) {
+        std::cout << "PREFILL_HANDOFF_READY" << std::endl;
+        std::ostringstream prompt_buffer;
+        prompt_buffer << std::cin.rdbuf();
+        params.prompt = prompt_buffer.str();
+        if (params.prompt.empty()) {
+            LOG_ERR("--prompt-stdin-after-init received empty prompt\n");
+            llama_free(ctx);
+            llama_model_free(model);
+            llama_backend_free();
+            return 1;
+        }
+    }
+
     if (multistage_stage_server_mode) {
         const int32_t n_embd_inp = llama_model_n_embd_inp(model);
         const size_t colon = multistage_stage_server_listen_addr.rfind(':');
@@ -1900,6 +2046,31 @@ int main(int argc, char ** argv) {
                 return init_replay_ctx();
             };
 
+            if (multistage_stage_ready_handshake) {
+                if (next_fd >= 0 && !recv_stage_ready(next_fd)) {
+                    ::close(next_fd);
+                    ::close(conn_fd);
+                    llama_free(session_ctx);
+                    ::close(listen_fd);
+                    LOG_ERR("failed to receive downstream multistage stage ready handshake\n");
+                    llama_model_free(model);
+                    llama_backend_free();
+                    return 1;
+                }
+                if (!send_stage_ready(conn_fd)) {
+                    if (next_fd >= 0) {
+                        ::close(next_fd);
+                    }
+                    ::close(conn_fd);
+                    llama_free(session_ctx);
+                    ::close(listen_fd);
+                    LOG_ERR("failed to send multistage stage ready handshake\n");
+                    llama_model_free(model);
+                    llama_backend_free();
+                    return 1;
+                }
+            }
+
             multistage_stage_server_session_summary session_summary;
             session_summary.session_index = session_index;
             std::vector<llama_token> recv_tokens;
@@ -2022,12 +2193,30 @@ int main(int argc, char ** argv) {
                 }
                 llama_context * active_ctx = session_ctx;
                 if (is_prefill_message) {
+                    multistage_activation_wire_dtype recv_activation_dtype = multistage_activation_wire_dtype::F32;
+                    (void) parse_multistage_activation_wire_dtype_id(
+                        recv_stage_state.reserved,
+                        recv_activation_dtype);
                     session_summary.prefill_recv_elapsed_s += recv_t1 - recv_t0;
                     session_summary.prefill_input_bytes +=
                         (uint64_t) (sizeof(int32_t) * 4 +
                             sizeof(multistage_stage_state_header) +
-                            (sizeof(llama_token) * recv_tokens.size()) +
-                            (sizeof(float) * recv_embeddings.size()));
+                            (sizeof(llama_token) * recv_tokens.size())) +
+                        multistage_activation_wire_payload_bytes(
+                            recv_embeddings.size(),
+                            recv_activation_dtype);
+                }
+                const bool early_prefill_ack =
+                    is_prefill_message && !reply_requires_predicted;
+                if (early_prefill_ack) {
+                    const double reply_t0 = ggml_time_us() / 1e6;
+                    if (!send_stage_reply_ack(conn_fd)) {
+                        set_last_error("reply_send_failed");
+                        break;
+                    }
+                    const double reply_t1 = ggml_time_us() / 1e6;
+                    session_summary.prefill_reply_elapsed_s += reply_t1 - reply_t0;
+                    session_summary.prefill_reply_bytes += sizeof(int32_t) * 2;
                 }
                 if (message_kind == MULTISTAGE_STAGE_MSG_STOP) {
                     if (pending_prefill_replies != 0) {
@@ -2464,8 +2653,8 @@ int main(int argc, char ** argv) {
                             session_summary.prefill_forward_bytes +=
                                 (uint64_t) (sizeof(int32_t) * 4 +
                                     sizeof(multistage_stage_state_header) +
-                                    (sizeof(llama_token) * recv_tokens.size()) +
-                                    (sizeof(float) * next_embeddings.size()));
+                                    (sizeof(llama_token) * recv_tokens.size())) +
+                                multistage_activation_wire_payload_bytes(next_embeddings.size());
                         }
                     } else {
                         set_last_error("forward_embeddings_not_ready");
@@ -2584,18 +2773,20 @@ int main(int argc, char ** argv) {
                     }
                 }
 
-                const double reply_t0 = ggml_time_us() / 1e6;
-                const bool reply_ok = reply_requires_predicted
-                    ? send_stage_reply_predicted(conn_fd, predicted)
-                    : send_stage_reply_ack(conn_fd);
-                if (!reply_ok) {
-                    set_last_error("reply_send_failed");
-                    break;
-                }
-                const double reply_t1 = ggml_time_us() / 1e6;
-                if (is_prefill_message) {
-                    session_summary.prefill_reply_elapsed_s += reply_t1 - reply_t0;
-                    session_summary.prefill_reply_bytes += sizeof(int32_t) * 2;
+                if (!early_prefill_ack) {
+                    const double reply_t0 = ggml_time_us() / 1e6;
+                    const bool reply_ok = reply_requires_predicted
+                        ? send_stage_reply_predicted(conn_fd, predicted)
+                        : send_stage_reply_ack(conn_fd);
+                    if (!reply_ok) {
+                        set_last_error("reply_send_failed");
+                        break;
+                    }
+                    const double reply_t1 = ggml_time_us() / 1e6;
+                    if (is_prefill_message) {
+                        session_summary.prefill_reply_elapsed_s += reply_t1 - reply_t0;
+                        session_summary.prefill_reply_bytes += sizeof(int32_t) * 2;
+                    }
                 }
             }
 
@@ -3025,8 +3216,27 @@ int main(int argc, char ** argv) {
             prev_boundary = boundary;
         }
 
-        std::vector<llama_token> prompt_tokens = common_tokenize(ctx, params.prompt, add_bos, true);
-        if (prompt_tokens.empty()) {
+        if (prompt_stdin_after_init && params.prompt.empty() && multistage_stage_driver_mode && !multistage_serving_mode) {
+            std::cout << "PREFILL_HANDOFF_READY" << std::endl;
+            std::ostringstream prompt_buffer;
+            prompt_buffer << std::cin.rdbuf();
+            params.prompt = prompt_buffer.str();
+            if (params.prompt.empty()) {
+                LOG_ERR("--prompt-stdin-after-init received empty prompt\n");
+                llama_free(ctx);
+                llama_model_free(model);
+                llama_backend_free();
+                return 1;
+            }
+        }
+
+        std::vector<llama_token> prompt_tokens;
+        const bool defer_prompt_until_stage0_ready =
+            prompt_stdin_after_init && params.prompt.empty() && multistage_stage_driver_mode && multistage_serving_mode;
+        if (!defer_prompt_until_stage0_ready) {
+            prompt_tokens = common_tokenize(ctx, params.prompt, add_bos, true);
+        }
+        if (prompt_tokens.empty() && !defer_prompt_until_stage0_ready) {
             LOG_ERR("multistage compute proof requires a non-empty prompt\n");
             llama_free(ctx);
             llama_model_free(model);
@@ -3040,7 +3250,11 @@ int main(int argc, char ** argv) {
         metrics.stage_count = (int) boundaries.size() + 1;
         metrics.prompt_tokens = (int) prompt_tokens.size();
         metrics.requested_decode_tokens = params.n_predict;
-        metrics.boundary_embedding_bytes = (uint64_t) n_embd_inp * sizeof(float);
+        metrics.boundary_embedding_bytes = multistage_activation_wire_payload_bytes((size_t) n_embd_inp);
+        metrics.activation_wire_dtype =
+            multistage_activation_wire_dtype_name(multistage_activation_wire_dtype_value);
+        metrics.activation_wire_element_bytes =
+            multistage_activation_wire_element_size(multistage_activation_wire_dtype_value);
 
         std::vector<std::string> multistage_model_paths;
         if (!multistage_models_csv.empty()) {
@@ -3080,25 +3294,27 @@ int main(int argc, char ** argv) {
             const std::string host = multistage_stage_driver_connect_addr.substr(0, colon);
             const int port = std::atoi(multistage_stage_driver_connect_addr.substr(colon + 1).c_str());
 
-            if (baseline_prefill_layer_timing) {
-                baseline_layer_probe.begin();
+            if (!multistage_serving_mode) {
+                if (baseline_prefill_layer_timing) {
+                    baseline_layer_probe.begin();
+                }
+                const double base_prefill_t0 = ggml_time_us() / 1e6;
+                if (llama_decode(ctx, llama_batch_get_one(prompt_tokens.data(), prompt_tokens.size()))) {
+                    LOG_ERR("baseline prompt prefill failed\n");
+                    llama_free(ctx);
+                    llama_model_free(model);
+                    llama_backend_free();
+                    return 1;
+                }
+                const double base_prefill_t1 = ggml_time_us() / 1e6;
+                if (baseline_prefill_layer_timing) {
+                    baseline_layer_probe.end();
+                    metrics.baseline_prefill_layer_elapsed_s = baseline_layer_probe.layer_elapsed_s;
+                    metrics.baseline_prefill_layer_observation_count = baseline_layer_probe.layer_observation_count;
+                }
+                metrics.baseline_prefill_elapsed_s = base_prefill_t1 - base_prefill_t0;
+                metrics.baseline_state_bytes = llama_state_seq_get_size(ctx, 0);
             }
-            const double base_prefill_t0 = ggml_time_us() / 1e6;
-            if (llama_decode(ctx, llama_batch_get_one(prompt_tokens.data(), prompt_tokens.size()))) {
-                LOG_ERR("baseline prompt prefill failed\n");
-                llama_free(ctx);
-                llama_model_free(model);
-                llama_backend_free();
-                return 1;
-            }
-            const double base_prefill_t1 = ggml_time_us() / 1e6;
-            if (baseline_prefill_layer_timing) {
-                baseline_layer_probe.end();
-                metrics.baseline_prefill_layer_elapsed_s = baseline_layer_probe.layer_elapsed_s;
-                metrics.baseline_prefill_layer_observation_count = baseline_layer_probe.layer_observation_count;
-            }
-            metrics.baseline_prefill_elapsed_s = base_prefill_t1 - base_prefill_t0;
-            metrics.baseline_state_bytes = llama_state_seq_get_size(ctx, 0);
 
             llama_model * stage0_model = model;
             if (!multistage_model_paths.empty()) {
@@ -3163,6 +3379,39 @@ int main(int argc, char ** argv) {
                 LOG_ERR("failed to connect multistage downstream socket\n");
                 return 1;
             }
+            if (multistage_stage_ready_handshake && !recv_stage_ready(downstream_fd)) {
+                ::close(downstream_fd);
+                llama_free(stage0_ctx);
+                if (stage0_model != model) {
+                    llama_model_free(stage0_model);
+                }
+                llama_free(ctx);
+                llama_model_free(model);
+                llama_backend_free();
+                LOG_ERR("failed to receive multistage downstream ready handshake\n");
+                return 1;
+            }
+
+            if (defer_prompt_until_stage0_ready) {
+                std::cout << "PREFILL_HANDOFF_READY" << std::endl;
+                std::ostringstream prompt_buffer;
+                prompt_buffer << std::cin.rdbuf();
+                params.prompt = prompt_buffer.str();
+                prompt_tokens = common_tokenize(ctx, params.prompt, add_bos, true);
+                if (prompt_tokens.empty()) {
+                    ::close(downstream_fd);
+                    llama_free(stage0_ctx);
+                    if (stage0_model != model) {
+                        llama_model_free(stage0_model);
+                    }
+                    llama_free(ctx);
+                    llama_model_free(model);
+                    llama_backend_free();
+                    LOG_ERR("--prompt-stdin-after-init received empty prompt\n");
+                    return 1;
+                }
+                metrics.prompt_tokens = (int) prompt_tokens.size();
+            }
 
             metrics.live_prefill_enabled = true;
             metrics.live_prefill_chunk_tokens = multistage_live_prefill_chunk_tokens;
@@ -3210,6 +3459,25 @@ int main(int argc, char ** argv) {
             double stage0_send_elapsed_s = 0.0;
             double stage0_reply_wait_elapsed_s = 0.0;
             double stage0_output_extract_elapsed_s = 0.0;
+            int stage0_pending_prefill_acks = 0;
+            const int stage0_prefill_ack_credit =
+                multistage_live_prefill_max_inflight > 0
+                    ? multistage_live_prefill_max_inflight
+                    : 1;
+            auto recv_stage0_prefill_ack = [&]() -> bool {
+                int32_t reply_kind = 0;
+                int32_t ignored_predicted = -1;
+                if (!recv_stage_reply(downstream_fd, reply_kind, ignored_predicted)) {
+                    LOG_ERR("multistage process stage0 prefill ack recv failed\n");
+                    return false;
+                }
+                if (reply_kind != MULTISTAGE_STAGE_REPLY_ACK) {
+                    LOG_ERR("multistage process stage0 non-final prefill expected ack reply\n");
+                    return false;
+                }
+                stage0_pending_prefill_acks -= 1;
+                return true;
+            };
             for (const auto & prompt_chunk : prompt_chunks) {
                 const int chunk_start = prompt_chunk.first;
                 const int chunk_count = prompt_chunk.second;
@@ -3291,7 +3559,7 @@ int main(int argc, char ** argv) {
                     hop_rng,
                     multistage_live_prefill_hop_latency_ms,
                     multistage_live_prefill_hop_jitter_ms,
-                    sizeof(float) * chunk_embeddings.size(),
+                    multistage_activation_wire_payload_bytes(chunk_embeddings.size()),
                     multistage_live_prefill_hop_bandwidth_mbps);
                 if (hop_delay_s > 0.0) {
                     std::this_thread::sleep_for(std::chrono::duration<double>(hop_delay_s));
@@ -3323,25 +3591,46 @@ int main(int argc, char ** argv) {
                     chunk_embeddings.data(),
                     chunk_embeddings.size());
                 const double stage0_send_t1 = ggml_time_us() / 1e6;
-                int32_t reply_kind = 0;
-                const bool stage0_recv_ok = stage0_send_ok && recv_stage_reply(downstream_fd, reply_kind, predicted_i32);
-                const double stage0_recv_t1 = ggml_time_us() / 1e6;
-                if (!stage0_send_ok || !stage0_recv_ok) {
-                    LOG_ERR("multistage process stage0 prefill send/recv failed\n");
+                if (!stage0_send_ok) {
+                    LOG_ERR("multistage process stage0 prefill send failed\n");
                     break;
                 }
+                const double stage0_reply_wait_t0 = ggml_time_us() / 1e6;
                 if (is_final_prefill_chunk) {
+                    bool stage0_recv_ok = true;
+                    while (stage0_pending_prefill_acks > 0) {
+                        if (!recv_stage0_prefill_ack()) {
+                            stage0_recv_ok = false;
+                            break;
+                        }
+                    }
+                    int32_t reply_kind = 0;
+                    stage0_recv_ok = stage0_recv_ok &&
+                        recv_stage_reply(downstream_fd, reply_kind, predicted_i32);
+                    if (!stage0_recv_ok) {
+                        LOG_ERR("multistage process stage0 final prefill recv failed\n");
+                        break;
+                    }
                     if (reply_kind != MULTISTAGE_STAGE_REPLY_PREDICTED_TOKEN) {
                         LOG_ERR("multistage process stage0 final prefill expected predicted token reply\n");
                         break;
                     }
                     current_token = (llama_token) predicted_i32;
-                } else if (reply_kind != MULTISTAGE_STAGE_REPLY_ACK) {
-                    LOG_ERR("multistage process stage0 non-final prefill expected ack reply\n");
-                    break;
+                } else {
+                    stage0_pending_prefill_acks += 1;
+                    while (stage0_pending_prefill_acks >= stage0_prefill_ack_credit) {
+                        if (!recv_stage0_prefill_ack()) {
+                            stage0_ok = false;
+                            break;
+                        }
+                    }
+                    if (!stage0_ok) {
+                        break;
+                    }
                 }
+                const double stage0_reply_wait_t1 = ggml_time_us() / 1e6;
                 stage0_send_elapsed_s += stage0_send_t1 - stage0_send_t0;
-                stage0_reply_wait_elapsed_s += stage0_recv_t1 - stage0_send_t1;
+                stage0_reply_wait_elapsed_s += stage0_reply_wait_t1 - stage0_reply_wait_t0;
                 prefill_chunk_count += 1;
             }
             const double staged_prefill_t1 = ggml_time_us() / 1e6;
@@ -3621,41 +3910,48 @@ int main(int argc, char ** argv) {
                     metrics.staged_first_decode_elapsed_s = staged_t1 - staged_t0;
                 }
 
-                const double base_decode_t0 = ggml_time_us() / 1e6;
-                llama_token baseline_token = current_token;
-                if (llama_decode(ctx, llama_batch_get_one(&baseline_token, 1))) {
-                    LOG_ERR("baseline multistage decode failed at step %d\n", step);
-                    break;
-                }
-                const double base_decode_t1 = ggml_time_us() / 1e6;
-                metrics.baseline_total_decode_elapsed_s += base_decode_t1 - base_decode_t0;
-                if (step == 0) {
-                    metrics.baseline_first_decode_elapsed_s = base_decode_t1 - base_decode_t0;
-                }
-
-                const float * baseline_logits = llama_get_logits_ith(ctx, -1);
-                if (!baseline_logits) {
-                    LOG_ERR("baseline multistage logits unavailable at step %d\n", step);
-                    break;
-                }
-                std::tie(expected, baseline_margin) = select_greedy_token_with_margin(baseline_logits, n_vocab);
-                metrics.baseline_output_text += common_token_to_piece(ctx, expected, false);
-
+                const llama_token decode_input_token_for_baseline = current_token;
                 current_token = (llama_token) predicted_i32;
 
                 metrics.generated_tokens++;
-                metrics.output_text += common_token_to_piece(ctx, current_token, false);
-                metrics.compared_token_steps++;
-                if (current_token != expected) {
-                    metrics.token_mismatch_count++;
-                    if (metrics.first_mismatch_step < 0) {
-                        metrics.first_mismatch_step = step;
-                        metrics.first_mismatch_baseline_token = expected;
-                        metrics.first_mismatch_staged_token = current_token;
-                        metrics.first_mismatch_baseline_margin = baseline_margin;
-                        metrics.first_mismatch_staged_margin = 0.0;
+                const std::string token_piece = common_token_to_piece(ctx, current_token, false);
+                metrics.output_text += token_piece;
+                if (stream_output) {
+                    std::cout << token_piece << std::flush;
+                }
+                if (!multistage_serving_mode) {
+                    const double base_decode_t0 = ggml_time_us() / 1e6;
+                    llama_token baseline_token = decode_input_token_for_baseline;
+                    if (llama_decode(ctx, llama_batch_get_one(&baseline_token, 1))) {
+                        LOG_ERR("baseline multistage decode failed at step %d\n", step);
+                        break;
                     }
-                    break;
+                    const double base_decode_t1 = ggml_time_us() / 1e6;
+                    metrics.baseline_total_decode_elapsed_s += base_decode_t1 - base_decode_t0;
+                    if (step == 0) {
+                        metrics.baseline_first_decode_elapsed_s = base_decode_t1 - base_decode_t0;
+                    }
+
+                    const float * baseline_logits = llama_get_logits_ith(ctx, -1);
+                    if (!baseline_logits) {
+                        LOG_ERR("baseline multistage logits unavailable at step %d\n", step);
+                        break;
+                    }
+                    std::tie(expected, baseline_margin) = select_greedy_token_with_margin(baseline_logits, n_vocab);
+                    metrics.baseline_output_text += common_token_to_piece(ctx, expected, false);
+
+                    metrics.compared_token_steps++;
+                    if (current_token != expected) {
+                        metrics.token_mismatch_count++;
+                        if (metrics.first_mismatch_step < 0) {
+                            metrics.first_mismatch_step = step;
+                            metrics.first_mismatch_baseline_token = expected;
+                            metrics.first_mismatch_staged_token = current_token;
+                            metrics.first_mismatch_baseline_margin = baseline_margin;
+                            metrics.first_mismatch_staged_margin = 0.0;
+                        }
+                        break;
+                    }
                 }
             }
 
@@ -3897,7 +4193,7 @@ int main(int argc, char ** argv) {
                                 rng,
                                 multistage_live_prefill_hop_latency_ms,
                                 multistage_live_prefill_hop_jitter_ms,
-                                sizeof(float) * chunk.embeddings.size(),
+                                multistage_activation_wire_payload_bytes(chunk.embeddings.size()),
                                 multistage_live_prefill_hop_bandwidth_mbps);
                             if (delay_s > 0.0) {
                                 std::this_thread::sleep_for(std::chrono::duration<double>(delay_s));
@@ -5201,7 +5497,9 @@ int main(int argc, char ** argv) {
         }
 
         size_t state_size = 0;
-        if (state_mode == "full") {
+        if (completion_only) {
+            metrics.state_kind = "completion_only";
+        } else if (state_mode == "full") {
             state_size = llama_state_get_size(ctx);
             metrics.state_kind = "full_context";
         } else if (state_mode == "seq") {
@@ -5336,6 +5634,7 @@ int main(int argc, char ** argv) {
                 break;
             }
             const double base_decode_t1 = ggml_time_us() / 1e6;
+            metrics.baseline_total_decode_elapsed_s += base_decode_t1 - base_decode_t0;
             if (i == 0) {
                 metrics.first_baseline_decode_elapsed_s = base_decode_t1 - base_decode_t0;
                 if (metrics.readiness_path == "import_only" && metrics.shadow_ready_elapsed_s >= 0.0) {
