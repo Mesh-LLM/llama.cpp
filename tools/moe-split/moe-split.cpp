@@ -39,6 +39,8 @@
 #include <string>
 #include <vector>
 
+static constexpr size_t MOE_SPLIT_PATH_MAX = 4096;
+
 struct moe_split_params {
     std::string input;
     std::string output;           // single output (with --group-id or --expert-list)
@@ -271,14 +273,14 @@ static std::vector<input_shard> load_input_shards(const std::string & input_path
         return shards;
     }
 
-    std::vector<char> split_prefix(PATH_MAX, 0);
+    std::vector<char> split_prefix(MOE_SPLIT_PATH_MAX, 0);
     if (!llama_split_prefix(split_prefix.data(), split_prefix.size(), input_path.c_str(), 0, n_split)) {
         fprintf(stderr, "error: unexpected split input file name: %s\n", input_path.c_str());
         exit(1);
     }
 
     for (int i_split = 1; i_split < n_split; i_split++) {
-        std::vector<char> split_path(PATH_MAX, 0);
+        std::vector<char> split_path(MOE_SPLIT_PATH_MAX, 0);
         int ret = llama_split_path(
             split_path.data(),
             split_path.size(),
