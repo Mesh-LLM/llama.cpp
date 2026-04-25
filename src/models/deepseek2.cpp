@@ -31,6 +31,14 @@ llm_build_deepseek2::llm_build_deepseek2(const llama_model & model, const llm_gr
     ggml_tensor * cur;
     ggml_tensor * inpL;
 
+    const int effective_n_layers = hparams.n_layer - hparams.nextn_predict_layers;
+    const int32_t layer_start = il_start < 0 ? 0                : il_start;
+    const int32_t layer_end   = il_end   < 0 ? effective_n_layers : il_end;
+
+    GGML_ASSERT(layer_start >= 0);
+    GGML_ASSERT(layer_start <= layer_end);
+    GGML_ASSERT(layer_end <= effective_n_layers);
+
     // {n_embd, n_tokens}
     inpL = build_inp_embd(model.tok_embd);
 
@@ -48,8 +56,8 @@ llm_build_deepseek2::llm_build_deepseek2(const llama_model & model, const llm_gr
 
     ggml_tensor * inp_out_ids = build_inp_out_ids();
 
-    int effective_n_layers = hparams.n_layer - hparams.nextn_predict_layers;
-    for (int il = 0; il < effective_n_layers; ++il) {
+    (void) effective_n_layers;
+    for (int il = layer_start; il < layer_end; ++il) {
         ggml_tensor * inpSA = inpL;
 
         // norm
@@ -223,7 +231,7 @@ llm_build_deepseek2::llm_build_deepseek2(const llama_model & model, const llm_gr
                             Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
             }
         }
-        if (il == effective_n_layers - 1 && inp_out_ids) {
+        if (il == layer_end - 1 && inp_out_ids) {
             cur   = ggml_get_rows(ctx0, cur, inp_out_ids);
             inpSA = ggml_get_rows(ctx0, inpSA, inp_out_ids);
         }
@@ -280,6 +288,13 @@ llm_build_deepseek2::llm_build_deepseek2(const llama_model & model, const llm_gr
         inpL = cur;
     }
     cur = inpL;
+
+    if (layer_end < (int32_t)(hparams.n_layer - hparams.nextn_predict_layers)) {
+        cb(cur, "result_embd", layer_end - 1);
+        res->t_embd = cur;
+        ggml_build_forward_expand(gf, cur);
+        return;
+    }
 
     cur = build_norm(cur, model.output_norm, NULL, LLM_NORM_RMS, -1);
 
