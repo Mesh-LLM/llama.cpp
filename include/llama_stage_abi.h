@@ -36,6 +36,7 @@ enum llama_stage_feature {
     LLAMA_STAGE_FEATURE_GGUF_SLICE_WRITE       = 1 << 4,
     LLAMA_STAGE_FEATURE_STATE_IMPORT_EXPORT    = 1 << 5,
     LLAMA_STAGE_FEATURE_TOKENIZE_DETOKENIZE    = 1 << 6,
+    LLAMA_STAGE_FEATURE_ACTIVATION_FRAME       = 1 << 7,
 };
 
 enum llama_stage_status {
@@ -63,6 +64,18 @@ enum llama_stage_tensor_role {
     LLAMA_STAGE_TENSOR_ROLE_LAYER              = 4,
     LLAMA_STAGE_TENSOR_ROLE_FINAL_NORM         = 5,
     LLAMA_STAGE_TENSOR_ROLE_OUTPUT             = 6,
+};
+
+enum llama_stage_activation_dtype {
+    LLAMA_STAGE_ACTIVATION_DTYPE_UNKNOWN       = 0,
+    LLAMA_STAGE_ACTIVATION_DTYPE_F32           = 1,
+    LLAMA_STAGE_ACTIVATION_DTYPE_F16           = 2,
+    LLAMA_STAGE_ACTIVATION_DTYPE_BF16          = 3,
+};
+
+enum llama_stage_activation_layout {
+    LLAMA_STAGE_ACTIVATION_LAYOUT_OPAQUE       = 0,
+    LLAMA_STAGE_ACTIVATION_LAYOUT_TOKEN_MAJOR  = 1,
 };
 
 struct llama_stage_model;
@@ -97,6 +110,19 @@ struct llama_stage_tensor_info {
     uint32_t ggml_type;
     uint64_t byte_size;
     uint64_t element_count;
+};
+
+struct llama_stage_activation_desc {
+    uint32_t version;
+    enum llama_stage_activation_dtype dtype;
+    enum llama_stage_activation_layout layout;
+    int32_t producer_stage_index;
+    int32_t layer_start;
+    int32_t layer_end;
+    uint32_t token_count;
+    uint32_t sequence_count;
+    uint64_t payload_bytes;
+    uint64_t flags;
 };
 
 struct llama_stage_abi_version {
@@ -151,6 +177,30 @@ LLAMA_API enum llama_stage_status llama_stage_decode_step(
         void * output_activation,
         size_t output_activation_capacity,
         size_t * out_output_activation_bytes,
+        llama_token * out_predicted_token,
+        struct llama_stage_error ** out_error);
+
+LLAMA_API enum llama_stage_status llama_stage_prefill_chunk_frame(
+        struct llama_stage_session * session,
+        const llama_token * token_ids,
+        size_t token_count,
+        const struct llama_stage_activation_desc * input_desc,
+        const void * input_payload,
+        struct llama_stage_activation_desc * output_desc,
+        void * output_payload,
+        size_t output_payload_capacity,
+        size_t * out_output_payload_bytes,
+        struct llama_stage_error ** out_error);
+
+LLAMA_API enum llama_stage_status llama_stage_decode_step_frame(
+        struct llama_stage_session * session,
+        llama_token token_id,
+        const struct llama_stage_activation_desc * input_desc,
+        const void * input_payload,
+        struct llama_stage_activation_desc * output_desc,
+        void * output_payload,
+        size_t output_payload_capacity,
+        size_t * out_output_payload_bytes,
         llama_token * out_predicted_token,
         struct llama_stage_error ** out_error);
 
