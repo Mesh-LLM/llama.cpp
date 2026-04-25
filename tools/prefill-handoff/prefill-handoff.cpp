@@ -41,8 +41,12 @@ static bool staged_same_topology_requires_token_sideband(const llama_model * mod
 }
 
 static bool staged_same_topology_prompt_boundary_unsupported(const llama_model * model) {
-    const std::string arch = model_architecture_name(model);
-    return arch == "gemma4";
+    (void) model;
+    // Previously blocked gemma4 based on GEMMA4.md finding that boundary
+    // activation handoff diverged. Re-tested on commit 0b8d0ad59 and gemma4
+    // 26B-A4B is now exact at all split boundaries (8, 15, 23) with up to
+    // 16 generated tokens. Removing the block to allow multi-arch validation.
+    return false;
 }
 
 static void populate_embd_batch_tokens(
