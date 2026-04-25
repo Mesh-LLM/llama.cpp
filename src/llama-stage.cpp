@@ -1,6 +1,7 @@
 #include "llama_stage_abi.h"
 
 #include "gguf.h"
+#include "llama-model-loader.h"
 
 #include <algorithm>
 #include <cerrno>
@@ -15,6 +16,7 @@
 struct llama_stage_model {
     llama_model * model = nullptr;
     llama_stage_runtime_config config = {};
+    bool executable = true;
 };
 
 struct llama_stage_session {
@@ -113,6 +115,29 @@ static bool llama_stage_is_full_model_config(const struct llama_stage_runtime_co
 
     return !config->filter_tensors_on_load && config->layer_start == 0;
 }
+
+struct llama_stage_filter_scope {
+    explicit llama_stage_filter_scope(const llama_stage_runtime_config * config) {
+        if (config != nullptr && config->filter_tensors_on_load) {
+            llama_model_loader_stage_filter filter;
+            filter.enabled = true;
+            filter.layer_start = config->layer_start;
+            filter.layer_end = config->layer_end;
+            filter.include_embeddings = config->include_embeddings;
+            filter.include_output = config->include_output;
+            llama_model_loader_set_stage_filter(filter);
+            enabled = true;
+        }
+    }
+
+    ~llama_stage_filter_scope() {
+        if (enabled) {
+            llama_model_loader_clear_stage_filter();
+        }
+    }
+
+    bool enabled = false;
+};
 
 static enum llama_stage_status llama_stage_decode_tokens(
         llama_stage_session * session,
@@ -213,7 +238,12 @@ enum llama_stage_status llama_stage_model_open(
 
     *out_model = nullptr;
 
-    if (!llama_stage_is_full_model_config(config)) {
+    if (config != nullptr && config->filter_tensors_on_load && config->layer_start >= config->layer_end) {
+        llama_stage_set_error(out_error, LLAMA_STAGE_STATUS_INVALID_ARGUMENT, "layer_start must be less than layer_end");
+        return LLAMA_STAGE_STATUS_INVALID_ARGUMENT;
+    }
+
+    if (!llama_stage_is_full_model_config(config) && (config == nullptr || !config->filter_tensors_on_load)) {
         llama_stage_set_error(
                 out_error,
                 LLAMA_STAGE_STATUS_UNSUPPORTED,
@@ -224,9 +254,13 @@ enum llama_stage_status llama_stage_model_open(
     llama_model_params params = llama_model_default_params();
     if (config != nullptr) {
         params.n_gpu_layers = config->n_gpu_layers;
+        if (config->disable_repack || config->filter_tensors_on_load) {
+            params.use_extra_bufts = false;
+        }
     }
 
     llama_backend_init();
+    llama_stage_filter_scope filter_scope(config);
     llama_model * model = llama_model_load_from_file(path, params);
     if (model == nullptr) {
         llama_stage_set_error(out_error, LLAMA_STAGE_STATUS_MODEL_ERROR, "failed to load llama model");
@@ -237,6 +271,7 @@ enum llama_stage_status llama_stage_model_open(
     stage_model->model = model;
     if (config != nullptr) {
         stage_model->config = *config;
+        stage_model->executable = !config->filter_tensors_on_load;
     }
 
     *out_model = stage_model;
@@ -260,6 +295,10 @@ enum llama_stage_status llama_stage_session_create(
     if (model == nullptr || model->model == nullptr || out_session == nullptr) {
         llama_stage_set_error(out_error, LLAMA_STAGE_STATUS_INVALID_ARGUMENT, "model and out_session are required");
         return LLAMA_STAGE_STATUS_INVALID_ARGUMENT;
+    }
+    if (!model->executable) {
+        llama_stage_set_error(out_error, LLAMA_STAGE_STATUS_UNSUPPORTED, "filtered runtime-slice handles are not executable yet");
+        return LLAMA_STAGE_STATUS_UNSUPPORTED;
     }
 
     *out_session = nullptr;
