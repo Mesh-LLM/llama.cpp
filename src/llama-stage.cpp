@@ -1,6 +1,8 @@
 #include "llama_stage_abi.h"
 
 #include "gguf.h"
+#include "llama-graph.h"
+#include "llama-model.h"
 #include "llama-model-loader.h"
 
 #include <algorithm>
@@ -139,6 +141,168 @@ struct llama_stage_filter_scope {
     bool enabled = false;
 };
 
+struct llama_stage_graph_filter_scope {
+    explicit llama_stage_graph_filter_scope(const llama_stage_runtime_config * config) {
+        if (config != nullptr && config->filter_tensors_on_load) {
+            llama_stage_graph_filter filter;
+            filter.enabled = true;
+            filter.layer_start = config->layer_start;
+            filter.layer_end = config->layer_end;
+            filter.include_embeddings = config->include_embeddings;
+            filter.include_output = config->include_output;
+            llama_stage_graph_set_filter(filter);
+            enabled = true;
+        }
+    }
+
+    ~llama_stage_graph_filter_scope() {
+        if (enabled) {
+            llama_stage_graph_clear_filter();
+        }
+    }
+
+    bool enabled = false;
+};
+
+static bool llama_stage_is_filtered(const llama_stage_session * session) {
+    return session != nullptr &&
+           session->stage_model != nullptr &&
+           session->stage_model->config.filter_tensors_on_load;
+}
+
+static bool llama_stage_emits_activation_frame(const llama_stage_session * session) {
+    return llama_stage_is_filtered(session) && !session->stage_model->config.include_output;
+}
+
+static size_t llama_stage_activation_payload_bytes(const llama_stage_session * session, size_t token_count) {
+    if (session == nullptr || session->stage_model == nullptr || session->stage_model->model == nullptr) {
+        return 0;
+    }
+
+    return token_count *
+           static_cast<size_t>(llama_model_n_embd(session->stage_model->model)) *
+           sizeof(float);
+}
+
+static bool llama_stage_has_activation_payload(const llama_stage_activation_desc * desc, const void * payload) {
+    return desc != nullptr && desc->payload_bytes > 0 && payload != nullptr;
+}
+
+static enum llama_stage_status llama_stage_validate_frame_input(
+        llama_stage_session * session,
+        const llama_stage_activation_desc * input_desc,
+        const void * input_payload,
+        size_t expected_token_count,
+        struct llama_stage_error ** out_error) {
+    if (session == nullptr || session->stage_model == nullptr) {
+        llama_stage_set_error(out_error, LLAMA_STAGE_STATUS_INVALID_ARGUMENT, "session is required");
+        return LLAMA_STAGE_STATUS_INVALID_ARGUMENT;
+    }
+
+    const llama_stage_runtime_config & config = session->stage_model->config;
+    if (!config.filter_tensors_on_load || config.layer_start == 0) {
+        if (llama_stage_has_activation_payload(input_desc, input_payload)) {
+            llama_stage_set_error(out_error, LLAMA_STAGE_STATUS_INVALID_ARGUMENT, "this stage expects token input, not activation input");
+            return LLAMA_STAGE_STATUS_INVALID_ARGUMENT;
+        }
+        return LLAMA_STAGE_STATUS_OK;
+    }
+
+    if (input_desc == nullptr || input_payload == nullptr || input_desc->payload_bytes == 0) {
+        llama_stage_set_error(out_error, LLAMA_STAGE_STATUS_INVALID_ARGUMENT, "non-first runtime slices require an activation frame input");
+        return LLAMA_STAGE_STATUS_INVALID_ARGUMENT;
+    }
+    if (input_desc->version != 1 ||
+        input_desc->dtype != LLAMA_STAGE_ACTIVATION_DTYPE_F32 ||
+        input_desc->layout != LLAMA_STAGE_ACTIVATION_LAYOUT_TOKEN_MAJOR) {
+        llama_stage_set_error(out_error, LLAMA_STAGE_STATUS_INVALID_ARGUMENT, "activation frame must be version 1 F32 token-major");
+        return LLAMA_STAGE_STATUS_INVALID_ARGUMENT;
+    }
+    if (input_desc->sequence_count != 1 || input_desc->token_count != expected_token_count) {
+        llama_stage_set_error(out_error, LLAMA_STAGE_STATUS_INVALID_ARGUMENT, "activation frame token or sequence count does not match request");
+        return LLAMA_STAGE_STATUS_INVALID_ARGUMENT;
+    }
+    if (input_desc->layer_end != config.layer_start) {
+        llama_stage_set_error(out_error, LLAMA_STAGE_STATUS_INVALID_ARGUMENT, "activation frame layer_end must match this stage layer_start");
+        return LLAMA_STAGE_STATUS_INVALID_ARGUMENT;
+    }
+
+    const size_t expected_bytes = llama_stage_activation_payload_bytes(session, expected_token_count);
+    if (input_desc->payload_bytes != expected_bytes) {
+        llama_stage_set_error(out_error, LLAMA_STAGE_STATUS_INVALID_ARGUMENT, "activation frame payload size does not match model hidden size");
+        return LLAMA_STAGE_STATUS_INVALID_ARGUMENT;
+    }
+
+    return LLAMA_STAGE_STATUS_OK;
+}
+
+static enum llama_stage_status llama_stage_prepare_output_activation_frame(
+        llama_stage_session * session,
+        size_t token_count,
+        void * output_payload,
+        size_t output_payload_capacity,
+        size_t * out_output_payload_bytes,
+        llama_stage_activation_desc * output_desc,
+        struct llama_stage_error ** out_error) {
+    const size_t payload_bytes = llama_stage_emits_activation_frame(session) ?
+            llama_stage_activation_payload_bytes(session, token_count) : 0;
+
+    if (out_output_payload_bytes != nullptr) {
+        *out_output_payload_bytes = payload_bytes;
+    }
+
+    if (payload_bytes > 0) {
+        if (output_payload == nullptr) {
+            llama_stage_set_error(out_error, LLAMA_STAGE_STATUS_INVALID_ARGUMENT, "output_payload is required for runtime-slice activation output");
+            return LLAMA_STAGE_STATUS_INVALID_ARGUMENT;
+        }
+        if (output_payload_capacity < payload_bytes) {
+            llama_stage_set_error(out_error, LLAMA_STAGE_STATUS_BUFFER_TOO_SMALL, "output activation buffer is too small");
+            return LLAMA_STAGE_STATUS_BUFFER_TOO_SMALL;
+        }
+    } else if (output_payload_capacity > 0 && output_payload == nullptr) {
+        llama_stage_set_error(out_error, LLAMA_STAGE_STATUS_INVALID_ARGUMENT, "output_payload is required when output capacity is non-zero");
+        return LLAMA_STAGE_STATUS_INVALID_ARGUMENT;
+    }
+
+    if (output_desc != nullptr) {
+        *output_desc = {};
+        output_desc->version = 1;
+        output_desc->dtype = payload_bytes > 0 ? LLAMA_STAGE_ACTIVATION_DTYPE_F32 : LLAMA_STAGE_ACTIVATION_DTYPE_UNKNOWN;
+        output_desc->layout = payload_bytes > 0 ? LLAMA_STAGE_ACTIVATION_LAYOUT_TOKEN_MAJOR : LLAMA_STAGE_ACTIVATION_LAYOUT_OPAQUE;
+        output_desc->producer_stage_index = session != nullptr ? session->stage_model->config.stage_index : -1;
+        output_desc->layer_start = session != nullptr ? session->stage_model->config.layer_start : 0;
+        output_desc->layer_end = session != nullptr ? session->stage_model->config.layer_end : 0;
+        output_desc->token_count = static_cast<uint32_t>(std::min<size_t>(token_count, std::numeric_limits<uint32_t>::max()));
+        output_desc->sequence_count = token_count > 0 ? 1 : 0;
+        output_desc->payload_bytes = payload_bytes;
+        output_desc->flags = 0;
+    }
+
+    return LLAMA_STAGE_STATUS_OK;
+}
+
+static enum llama_stage_status llama_stage_decode_batch(
+        llama_stage_session * session,
+        llama_batch batch,
+        size_t token_count,
+        struct llama_stage_error ** out_error) {
+    if (session == nullptr || session->ctx == nullptr || token_count == 0) {
+        llama_stage_set_error(out_error, LLAMA_STAGE_STATUS_INVALID_ARGUMENT, "session and at least one token are required");
+        return LLAMA_STAGE_STATUS_INVALID_ARGUMENT;
+    }
+
+    llama_stage_graph_filter_scope graph_filter_scope(&session->stage_model->config);
+    const int32_t rc = llama_decode(session->ctx, batch);
+    if (rc != 0) {
+        llama_stage_set_error(out_error, LLAMA_STAGE_STATUS_RUNTIME_ERROR, "llama_decode failed");
+        return LLAMA_STAGE_STATUS_RUNTIME_ERROR;
+    }
+
+    session->n_past += static_cast<int32_t>(token_count);
+    return llama_stage_success(out_error);
+}
+
 static enum llama_stage_status llama_stage_decode_tokens(
         llama_stage_session * session,
         const llama_token * token_ids,
@@ -151,6 +315,10 @@ static enum llama_stage_status llama_stage_decode_tokens(
         llama_stage_set_error(out_error, LLAMA_STAGE_STATUS_INVALID_ARGUMENT, "session and at least one token are required");
         return LLAMA_STAGE_STATUS_INVALID_ARGUMENT;
     }
+    if (llama_stage_is_filtered(session) && session->stage_model->config.layer_start > 0) {
+        llama_stage_set_error(out_error, LLAMA_STAGE_STATUS_INVALID_ARGUMENT, "non-first runtime slices require activation input");
+        return LLAMA_STAGE_STATUS_INVALID_ARGUMENT;
+    }
     if (token_count > static_cast<size_t>(std::numeric_limits<int32_t>::max())) {
         llama_stage_set_error(out_error, LLAMA_STAGE_STATUS_INVALID_ARGUMENT, "token_count exceeds int32_t range");
         return LLAMA_STAGE_STATUS_INVALID_ARGUMENT;
@@ -160,14 +328,7 @@ static enum llama_stage_status llama_stage_decode_tokens(
             const_cast<llama_token *>(token_ids),
             static_cast<int32_t>(token_count));
 
-    const int32_t rc = llama_decode(session->ctx, batch);
-    if (rc != 0) {
-        llama_stage_set_error(out_error, LLAMA_STAGE_STATUS_RUNTIME_ERROR, "llama_decode failed");
-        return LLAMA_STAGE_STATUS_RUNTIME_ERROR;
-    }
-
-    session->n_past += static_cast<int32_t>(token_count);
-    return llama_stage_success(out_error);
+    return llama_stage_decode_batch(session, batch, token_count, out_error);
 }
 
 static llama_token llama_stage_greedy_sample(llama_stage_session * session) {
@@ -185,10 +346,6 @@ static llama_token llama_stage_greedy_sample(llama_stage_session * session) {
     }
 
     return best;
-}
-
-static bool llama_stage_has_activation_payload(const llama_stage_activation_desc * desc, const void * payload) {
-    return desc != nullptr && desc->payload_bytes > 0 && payload != nullptr;
 }
 
 static enum llama_stage_status llama_stage_prepare_empty_activation_frame(
@@ -225,6 +382,60 @@ static enum llama_stage_status llama_stage_prepare_empty_activation_frame(
     return LLAMA_STAGE_STATUS_OK;
 }
 
+static enum llama_stage_status llama_stage_copy_output_activation_frame(
+        llama_stage_session * session,
+        size_t token_count,
+        void * output_payload,
+        struct llama_stage_error ** out_error) {
+    if (!llama_stage_emits_activation_frame(session)) {
+        return llama_stage_success(out_error);
+    }
+
+    float * embeddings = llama_get_embeddings(session->ctx);
+    if (embeddings == nullptr) {
+        llama_stage_set_error(out_error, LLAMA_STAGE_STATUS_RUNTIME_ERROR, "llama embeddings output was not available");
+        return LLAMA_STAGE_STATUS_RUNTIME_ERROR;
+    }
+
+    const size_t payload_bytes = llama_stage_activation_payload_bytes(session, token_count);
+    std::memcpy(output_payload, embeddings, payload_bytes);
+    return llama_stage_success(out_error);
+}
+
+static enum llama_stage_status llama_stage_decode_activation_frame(
+        llama_stage_session * session,
+        const llama_stage_activation_desc * input_desc,
+        const void * input_payload,
+        size_t token_count,
+        bool request_logits,
+        struct llama_stage_error ** out_error) {
+    if (session == nullptr || session->ctx == nullptr || input_desc == nullptr || input_payload == nullptr || token_count == 0) {
+        llama_stage_set_error(out_error, LLAMA_STAGE_STATUS_INVALID_ARGUMENT, "session and activation frame input are required");
+        return LLAMA_STAGE_STATUS_INVALID_ARGUMENT;
+    }
+    if (token_count > static_cast<size_t>(std::numeric_limits<int32_t>::max())) {
+        llama_stage_set_error(out_error, LLAMA_STAGE_STATUS_INVALID_ARGUMENT, "token_count exceeds int32_t range");
+        return LLAMA_STAGE_STATUS_INVALID_ARGUMENT;
+    }
+
+    const int32_t n_tokens = static_cast<int32_t>(token_count);
+    const int32_t n_embd = llama_model_n_embd(session->stage_model->model);
+    llama_batch batch = llama_batch_init(n_tokens, n_embd, 1);
+    batch.n_tokens = n_tokens;
+    std::memcpy(batch.embd, input_payload, static_cast<size_t>(input_desc->payload_bytes));
+
+    for (int32_t i = 0; i < n_tokens; ++i) {
+        batch.pos[i] = session->n_past + i;
+        batch.n_seq_id[i] = 1;
+        batch.seq_id[i][0] = 0;
+        batch.logits[i] = request_logits && i == n_tokens - 1 ? 1 : 0;
+    }
+
+    enum llama_stage_status status = llama_stage_decode_batch(session, batch, token_count, out_error);
+    llama_batch_free(batch);
+    return status;
+}
+
 extern "C" {
 
 struct llama_stage_abi_version llama_stage_abi_version(void) {
@@ -236,7 +447,8 @@ struct llama_stage_abi_version llama_stage_abi_version(void) {
 }
 
 uint64_t llama_stage_abi_features(void) {
-    return LLAMA_STAGE_FEATURE_MODEL_INTROSPECTION |
+    return LLAMA_STAGE_FEATURE_RUNTIME_SLICE |
+           LLAMA_STAGE_FEATURE_MODEL_INTROSPECTION |
            LLAMA_STAGE_FEATURE_TOKENIZE_DETOKENIZE |
            LLAMA_STAGE_FEATURE_ACTIVATION_FRAME;
 }
@@ -277,8 +489,8 @@ enum llama_stage_status llama_stage_model_open(
 
     *out_model = nullptr;
 
-    if (config != nullptr && config->filter_tensors_on_load && config->layer_start >= config->layer_end) {
-        llama_stage_set_error(out_error, LLAMA_STAGE_STATUS_INVALID_ARGUMENT, "layer_start must be less than layer_end");
+    if (config != nullptr && config->filter_tensors_on_load && (config->layer_start < 0 || config->layer_start >= config->layer_end)) {
+        llama_stage_set_error(out_error, LLAMA_STAGE_STATUS_INVALID_ARGUMENT, "layer_start must be non-negative and less than layer_end");
         return LLAMA_STAGE_STATUS_INVALID_ARGUMENT;
     }
 
@@ -306,11 +518,40 @@ enum llama_stage_status llama_stage_model_open(
         return LLAMA_STAGE_STATUS_MODEL_ERROR;
     }
 
+    if (config != nullptr && config->filter_tensors_on_load) {
+        const int32_t n_layer = llama_model_n_layer(model);
+        if (model->arch != LLM_ARCH_LLAMA) {
+            llama_model_free(model);
+            llama_stage_set_error(out_error, LLAMA_STAGE_STATUS_UNSUPPORTED, "runtime-slice execution is currently supported for LLaMA-family graphs only");
+            return LLAMA_STAGE_STATUS_UNSUPPORTED;
+        }
+        if (config->layer_end > n_layer) {
+            llama_model_free(model);
+            llama_stage_set_error(out_error, LLAMA_STAGE_STATUS_INVALID_ARGUMENT, "layer_end exceeds model layer count");
+            return LLAMA_STAGE_STATUS_INVALID_ARGUMENT;
+        }
+        if (config->include_embeddings && config->layer_start != 0) {
+            llama_model_free(model);
+            llama_stage_set_error(out_error, LLAMA_STAGE_STATUS_INVALID_ARGUMENT, "only the first runtime slice may include token embeddings");
+            return LLAMA_STAGE_STATUS_INVALID_ARGUMENT;
+        }
+        if (config->layer_start == 0 && !config->include_embeddings) {
+            llama_model_free(model);
+            llama_stage_set_error(out_error, LLAMA_STAGE_STATUS_INVALID_ARGUMENT, "the first runtime slice must include token embeddings");
+            return LLAMA_STAGE_STATUS_INVALID_ARGUMENT;
+        }
+        if (config->include_output && config->layer_end != n_layer) {
+            llama_model_free(model);
+            llama_stage_set_error(out_error, LLAMA_STAGE_STATUS_INVALID_ARGUMENT, "only the final runtime slice may include output tensors");
+            return LLAMA_STAGE_STATUS_INVALID_ARGUMENT;
+        }
+    }
+
     llama_stage_model * stage_model = new llama_stage_model{};
     stage_model->model = model;
     if (config != nullptr) {
         stage_model->config = *config;
-        stage_model->executable = !config->filter_tensors_on_load;
+        stage_model->executable = true;
     }
 
     *out_model = stage_model;
@@ -335,17 +576,14 @@ enum llama_stage_status llama_stage_session_create(
         llama_stage_set_error(out_error, LLAMA_STAGE_STATUS_INVALID_ARGUMENT, "model and out_session are required");
         return LLAMA_STAGE_STATUS_INVALID_ARGUMENT;
     }
-    if (!model->executable) {
-        llama_stage_set_error(out_error, LLAMA_STAGE_STATUS_UNSUPPORTED, "filtered runtime-slice handles are not executable yet");
-        return LLAMA_STAGE_STATUS_UNSUPPORTED;
-    }
-
     *out_session = nullptr;
 
     llama_context_params params = llama_context_default_params();
     params.n_ctx = model->config.ctx_size > 0 ? static_cast<uint32_t>(model->config.ctx_size) : 512;
     params.n_batch = params.n_ctx;
+    params.embeddings = model->config.filter_tensors_on_load && !model->config.include_output;
 
+    llama_stage_graph_filter_scope graph_filter_scope(&model->config);
     llama_context * ctx = llama_init_from_model(model->model, params);
     if (ctx == nullptr) {
         llama_stage_set_error(out_error, LLAMA_STAGE_STATUS_RUNTIME_ERROR, "failed to create llama context");
@@ -434,12 +672,26 @@ enum llama_stage_status llama_stage_prefill_chunk_frame(
         size_t output_payload_capacity,
         size_t * out_output_payload_bytes,
         struct llama_stage_error ** out_error) {
-    if (llama_stage_has_activation_payload(input_desc, input_payload)) {
-        llama_stage_set_error(out_error, LLAMA_STAGE_STATUS_UNSUPPORTED, "activation frame input is not executable yet");
-        return LLAMA_STAGE_STATUS_UNSUPPORTED;
+    if (token_count == 0) {
+        llama_stage_set_error(out_error, LLAMA_STAGE_STATUS_INVALID_ARGUMENT, "token_count must be greater than zero");
+        return LLAMA_STAGE_STATUS_INVALID_ARGUMENT;
+    }
+    if (token_count > static_cast<size_t>(std::numeric_limits<uint32_t>::max())) {
+        llama_stage_set_error(out_error, LLAMA_STAGE_STATUS_INVALID_ARGUMENT, "token_count exceeds activation descriptor range");
+        return LLAMA_STAGE_STATUS_INVALID_ARGUMENT;
     }
 
-    enum llama_stage_status status = llama_stage_prepare_empty_activation_frame(
+    enum llama_stage_status status = llama_stage_validate_frame_input(
+            session,
+            input_desc,
+            input_payload,
+            token_count,
+            out_error);
+    if (status != LLAMA_STAGE_STATUS_OK) {
+        return status;
+    }
+
+    status = llama_stage_prepare_output_activation_frame(
             session,
             token_count,
             output_payload,
@@ -451,7 +703,16 @@ enum llama_stage_status llama_stage_prefill_chunk_frame(
         return status;
     }
 
-    return llama_stage_decode_tokens(session, token_ids, token_count, false, out_error);
+    if (llama_stage_is_filtered(session) && session->stage_model->config.layer_start > 0) {
+        status = llama_stage_decode_activation_frame(session, input_desc, input_payload, token_count, false, out_error);
+    } else {
+        status = llama_stage_decode_tokens(session, token_ids, token_count, false, out_error);
+    }
+    if (status != LLAMA_STAGE_STATUS_OK) {
+        return status;
+    }
+
+    return llama_stage_copy_output_activation_frame(session, token_count, output_payload, out_error);
 }
 
 enum llama_stage_status llama_stage_decode_step_frame(
@@ -465,12 +726,17 @@ enum llama_stage_status llama_stage_decode_step_frame(
         size_t * out_output_payload_bytes,
         llama_token * out_predicted_token,
         struct llama_stage_error ** out_error) {
-    if (llama_stage_has_activation_payload(input_desc, input_payload)) {
-        llama_stage_set_error(out_error, LLAMA_STAGE_STATUS_UNSUPPORTED, "activation frame input is not executable yet");
-        return LLAMA_STAGE_STATUS_UNSUPPORTED;
+    enum llama_stage_status status = llama_stage_validate_frame_input(
+            session,
+            input_desc,
+            input_payload,
+            1,
+            out_error);
+    if (status != LLAMA_STAGE_STATUS_OK) {
+        return status;
     }
 
-    enum llama_stage_status status = llama_stage_prepare_empty_activation_frame(
+    status = llama_stage_prepare_output_activation_frame(
             session,
             1,
             output_payload,
@@ -482,16 +748,20 @@ enum llama_stage_status llama_stage_decode_step_frame(
         return status;
     }
 
-    status = llama_stage_decode_tokens(session, &token_id, 1, true, out_error);
+    if (llama_stage_is_filtered(session) && session->stage_model->config.layer_start > 0) {
+        status = llama_stage_decode_activation_frame(session, input_desc, input_payload, 1, true, out_error);
+    } else {
+        status = llama_stage_decode_tokens(session, &token_id, 1, true, out_error);
+    }
     if (status != LLAMA_STAGE_STATUS_OK) {
         return status;
     }
 
     if (out_predicted_token != nullptr) {
-        *out_predicted_token = llama_stage_greedy_sample(session);
+        *out_predicted_token = session->stage_model->config.include_output ? llama_stage_greedy_sample(session) : -1;
     }
 
-    return llama_stage_success(out_error);
+    return llama_stage_copy_output_activation_frame(session, 1, output_payload, out_error);
 }
 
 enum llama_stage_status llama_stage_export_state(

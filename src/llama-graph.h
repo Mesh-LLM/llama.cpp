@@ -27,6 +27,18 @@ class llama_memory_recurrent_context;
 class llama_memory_hybrid_context;
 class llama_memory_hybrid_iswa_context;
 
+struct llama_stage_graph_filter {
+    bool enabled = false;
+    int32_t layer_start = 0;
+    int32_t layer_end = 0;
+    bool include_embeddings = false;
+    bool include_output = false;
+};
+
+void llama_stage_graph_set_filter(const llama_stage_graph_filter & filter);
+void llama_stage_graph_clear_filter();
+const llama_stage_graph_filter & llama_stage_graph_get_filter();
+
 // certain models (typically multi-modal) can produce different types of graphs
 enum llm_graph_type {
     LLM_GRAPH_TYPE_DEFAULT,
