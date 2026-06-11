@@ -565,11 +565,23 @@ class LlamaHfVocab(Vocab):
 
         # Allow the tokenizer to default to slow or fast versions.
         # Explicitly set tokenizer to use local paths.
-        self.tokenizer = AutoTokenizer.from_pretrained(
-            base_path,
-            cache_dir=base_path,
-            local_files_only=True,
-        )
+        tokenizer_kwargs = {
+            "cache_dir": base_path,
+            "local_files_only": True,
+        }
+        try:
+            self.tokenizer = AutoTokenizer.from_pretrained(
+                base_path,
+                fix_mistral_regex=True,
+                **tokenizer_kwargs,
+            )
+        except TypeError as e:
+            if "fix_mistral_regex" not in str(e):
+                raise
+            self.tokenizer = AutoTokenizer.from_pretrained(
+                base_path,
+                **tokenizer_kwargs,
+            )
         assert self.tokenizer.is_fast  # assume tokenizer.json is used  # ty: ignore[unresolved-attribute]
 
         # Initialize lists and dictionaries for added tokens
