@@ -202,11 +202,6 @@ def main() -> None:
         "auto": gguf.LlamaFileType.GUESSED,
     }
 
-    is_split = args.split_max_tensors > 0 or args.split_max_size != "0"
-    if args.use_temp_file and is_split:
-        logger.error("Error: Cannot use temp file when splitting")
-        sys.exit(1)
-
     if args.outfile is not None:
         fname_out = args.outfile
     elif hf_repo_id:

@@ -66,6 +66,7 @@ class GGUFWriter:
     fout: list[BufferedWriter] | None
     path: Path | None
     temp_file: tempfile.SpooledTemporaryFile[bytes] | None
+    temp_files: list[tempfile.SpooledTemporaryFile[bytes] | None]
     tensors: list[dict[str, TensorInfo]]
     kv_data: list[dict[str, GGUFValue]]
     state: WriterState
@@ -94,6 +95,7 @@ class GGUFWriter:
         self.data_alignment = GGUF_DEFAULT_ALIGNMENT
         self.use_temp_file = use_temp_file
         self.temp_file = None
+        self.temp_files = []
         self.tensors = [{}]
         self.kv_data = [{}]
         self.split_max_tensors = split_max_tensors
@@ -109,6 +111,20 @@ class GGUFWriter:
             self.tensors.append({})
 
         self.add_architecture()
+
+    def _get_temp_file(self, shard_idx: int) -> tempfile.SpooledTemporaryFile[bytes]:
+        while len(self.temp_files) <= shard_idx:
+            self.temp_files.append(None)
+
+        fp = self.temp_files[shard_idx]
+        if fp is None:
+            fp = tempfile.SpooledTemporaryFile(mode="w+b", max_size=256 * 1024 * 1024)
+            fp.seek(0)
+            self.temp_files[shard_idx] = fp
+            if self.temp_file is None:
+                self.temp_file = fp
+
+        return fp
 
     def get_total_parameter_count(self) -> tuple[int, int, int, int]:
         total_params = 0
@@ -383,20 +399,17 @@ class GGUFWriter:
         if tensor_endianess != self.endianess:
             # Don't byteswap inplace since lazy copies cannot handle it
             tensor = tensor.byteswap(inplace=False)
-        if self.use_temp_file and self.temp_file is None:
-            fp = tempfile.SpooledTemporaryFile(mode="w+b", max_size=256 * 1024 * 1024)
-            fp.seek(0)
-            self.temp_file = fp
-
         shape: Sequence[int] = raw_shape if raw_shape is not None else tensor.shape
         self.add_tensor_info(name, shape, tensor.dtype, tensor.nbytes, raw_dtype=raw_dtype)
+        shard_idx = len(self.tensors) - 1
 
-        if self.temp_file is None:
+        if not self.use_temp_file:
             self.tensors[-1][name].tensor = tensor
             return
 
-        tensor.tofile(self.temp_file)
-        self.write_padding(self.temp_file, tensor.nbytes)
+        temp_file = self._get_temp_file(shard_idx)
+        tensor.tofile(temp_file)
+        self.write_padding(temp_file, tensor.nbytes)
 
     def write_padding(self, fp: IO[bytes], n: int, align: int | None = None) -> None:
         pad = GGUFWriter.ggml_pad(n, align if align is not None else self.data_alignment) - n
@@ -443,7 +456,7 @@ class GGUFWriter:
         for fout in self.fout:
             self.write_padding(fout, fout.tell())
 
-        if self.temp_file is None:
+        if not self.use_temp_file:
             shard_bar = None
             bar = None
 
@@ -474,11 +487,16 @@ class GGUFWriter:
                     self.write_padding(fout, ti.nbytes)
                     ti.tensor = None
         else:
-            self.temp_file.seek(0)
+            for temp_file, fout in zip(self.temp_files, self.fout):
+                if temp_file is None:
+                    continue
 
-            shutil.copyfileobj(self.temp_file, self.fout[0 if not self.small_first_shard else 1])
+                temp_file.seek(0)
+                shutil.copyfileobj(temp_file, fout)
+                temp_file.close()
+            self.temp_files = []
+            self.temp_file = None
             self.flush()
-            self.temp_file.close()
 
         self.state = WriterState.WEIGHTS
 
