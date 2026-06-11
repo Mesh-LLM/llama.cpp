@@ -1421,6 +1421,9 @@ class TextModel(ModelBase):
         if chkhsh == "cdf5f35325780597efd76153d4d1c16778f766173908894c04afc20108536267":
             # ref: https://huggingface.co/zai-org/GLM-4.7-Flash
             res = "glm4"
+        if chkhsh == "bd30abdd4d2e79a3b76199e7380500230a211249db4abad44a34ab28117fd4c6":
+            # ref: https://huggingface.co/zai-org/GLM-4.7-Flash with fix_mistral_regex=True
+            res = "glm4"
         if chkhsh == "1431a23e583c97432bc230bff598d103ddb5a1f89960c8f1d1051aaa944d0b35":
             # ref: https://huggingface.co/sapienzanlp/Minerva-7B-base-v1.0
             res = "minerva-7b"
