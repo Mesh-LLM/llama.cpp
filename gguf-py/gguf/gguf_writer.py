@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import os
+import resource
 import shutil
 import struct
 import sys
@@ -33,6 +34,71 @@ from .constants import (
 from .quants import quant_shape_from_byte_shape
 
 logger = logging.getLogger(__name__)
+
+
+def _env_bool(name: str) -> bool:
+    return os.environ.get(name, "").lower() in {"1", "true", "yes", "on"}
+
+
+def _read_int(path: Path) -> int | None:
+    try:
+        raw = path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    if raw == "max":
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        return None
+
+
+def _proc_status_kib(name: str) -> int | None:
+    try:
+        for line in Path("/proc/self/status").read_text(encoding="utf-8").splitlines():
+            key, raw_value = line.split(":", 1)
+            if key == name:
+                parts = raw_value.strip().split()
+                return int(parts[0]) if parts else None
+    except OSError:
+        return None
+    return None
+
+
+def _ru_maxrss_bytes() -> int:
+    value = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    if sys.platform == "darwin":
+        return int(value)
+    return int(value) * 1024
+
+
+def _memory_snapshot_fields() -> dict[str, str]:
+    vmrss_kib = _proc_status_kib("VmRSS")
+    vmhwm_kib = _proc_status_kib("VmHWM")
+    cgroup = Path("/sys/fs/cgroup")
+    cg_current = _read_int(cgroup / "memory.current")
+    cg_peak = _read_int(cgroup / "memory.peak")
+    cg_max = _read_int(cgroup / "memory.max")
+    fields = {
+        "rss_bytes": str(vmrss_kib * 1024) if vmrss_kib is not None else "unknown",
+        "hwm_bytes": str(vmhwm_kib * 1024) if vmhwm_kib is not None else "unknown",
+        "ru_maxrss_bytes": str(_ru_maxrss_bytes()),
+        "cgroup_current_bytes": str(cg_current) if cg_current is not None else "unknown",
+        "cgroup_peak_bytes": str(cg_peak) if cg_peak is not None else "unknown",
+        "cgroup_max_bytes": str(cg_max) if cg_max is not None else "unknown",
+    }
+    if cg_current is not None and cg_max is not None:
+        fields["cgroup_available_bytes"] = str(cg_max - cg_current)
+    else:
+        fields["cgroup_available_bytes"] = "unknown"
+    return fields
+
+
+def _memory_profile(event: str, **kwargs: object) -> None:
+    if not _env_bool("LLAMA_CONVERT_PROFILE_MEMORY"):
+        return
+    fields: dict[str, object] = {"event": event, **kwargs, **_memory_snapshot_fields()}
+    logger.info("memory_profile %s", " ".join(f"{key}={value}" for key, value in fields.items()))
 
 
 SHARD_NAME_FORMAT = "{:s}-{:05d}-of-{:05d}.gguf"
@@ -402,13 +468,25 @@ class GGUFWriter:
         shape: Sequence[int] = raw_shape if raw_shape is not None else tensor.shape
         self.add_tensor_info(name, shape, tensor.dtype, tensor.nbytes, raw_dtype=raw_dtype)
         shard_idx = len(self.tensors) - 1
+        _memory_profile(
+            "writer_add_tensor_info",
+            name=name,
+            shard_idx=shard_idx,
+            dtype=tensor.dtype,
+            shape=shape,
+            nbytes=tensor.nbytes,
+            use_temp_file=self.use_temp_file,
+        )
 
         if not self.use_temp_file:
             self.tensors[-1][name].tensor = tensor
+            _memory_profile("writer_retain_tensor", name=name, shard_idx=shard_idx, nbytes=tensor.nbytes)
             return
 
         temp_file = self._get_temp_file(shard_idx)
+        _memory_profile("writer_temp_tofile_start", name=name, shard_idx=shard_idx, nbytes=tensor.nbytes)
         tensor.tofile(temp_file)
+        _memory_profile("writer_temp_tofile_done", name=name, shard_idx=shard_idx, nbytes=tensor.nbytes)
         self.write_padding(temp_file, tensor.nbytes)
 
     def write_padding(self, fp: IO[bytes], n: int, align: int | None = None) -> None:
@@ -443,7 +521,9 @@ class GGUFWriter:
         assert ti.nbytes == tensor.nbytes
 
         self.write_padding(fout, fout.tell())
+        _memory_profile("writer_direct_tofile_start", name=first_tensor_name, file_id=file_id, nbytes=tensor.nbytes)
         tensor.tofile(fout)
+        _memory_profile("writer_direct_tofile_done", name=first_tensor_name, file_id=file_id, nbytes=tensor.nbytes)
         self.write_padding(fout, tensor.nbytes)
 
         self.state = WriterState.WEIGHTS
@@ -479,7 +559,9 @@ class GGUFWriter:
                 for ti in tensors.values():
                     assert ti.tensor is not None  # can only iterate once over the tensors
                     assert ti.tensor.nbytes == ti.nbytes
+                    _memory_profile("writer_flush_tofile_start", file_id=i, nbytes=ti.nbytes)
                     ti.tensor.tofile(fout)
+                    _memory_profile("writer_flush_tofile_done", file_id=i, nbytes=ti.nbytes)
                     if shard_bar is not None:
                         shard_bar.update(ti.nbytes)
                     if bar is not None:

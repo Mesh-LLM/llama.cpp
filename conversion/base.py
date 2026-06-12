@@ -9,6 +9,7 @@ import contextlib
 import json
 import os
 import re
+import resource
 import sys
 from enum import IntEnum
 from pathlib import Path
@@ -56,6 +57,71 @@ logger = logging.getLogger("hf-to-gguf")
 
 
 AnyModel = TypeVar("AnyModel", bound="type[ModelBase]")
+
+
+def _env_bool(name: str) -> bool:
+    return os.environ.get(name, "").lower() in {"1", "true", "yes", "on"}
+
+
+def _read_int(path: Path) -> int | None:
+    try:
+        raw = path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    if raw == "max":
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        return None
+
+
+def _proc_status_kib(name: str) -> int | None:
+    try:
+        for line in Path("/proc/self/status").read_text(encoding="utf-8").splitlines():
+            key, raw_value = line.split(":", 1)
+            if key == name:
+                parts = raw_value.strip().split()
+                return int(parts[0]) if parts else None
+    except OSError:
+        return None
+    return None
+
+
+def _ru_maxrss_bytes() -> int:
+    value = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    if sys.platform == "darwin":
+        return int(value)
+    return int(value) * 1024
+
+
+def _memory_snapshot_fields() -> dict[str, str]:
+    vmrss_kib = _proc_status_kib("VmRSS")
+    vmhwm_kib = _proc_status_kib("VmHWM")
+    cgroup = Path("/sys/fs/cgroup")
+    cg_current = _read_int(cgroup / "memory.current")
+    cg_peak = _read_int(cgroup / "memory.peak")
+    cg_max = _read_int(cgroup / "memory.max")
+    fields = {
+        "rss_bytes": str(vmrss_kib * 1024) if vmrss_kib is not None else "unknown",
+        "hwm_bytes": str(vmhwm_kib * 1024) if vmhwm_kib is not None else "unknown",
+        "ru_maxrss_bytes": str(_ru_maxrss_bytes()),
+        "cgroup_current_bytes": str(cg_current) if cg_current is not None else "unknown",
+        "cgroup_peak_bytes": str(cg_peak) if cg_peak is not None else "unknown",
+        "cgroup_max_bytes": str(cg_max) if cg_max is not None else "unknown",
+    }
+    if cg_current is not None and cg_max is not None:
+        fields["cgroup_available_bytes"] = str(cg_max - cg_current)
+    else:
+        fields["cgroup_available_bytes"] = "unknown"
+    return fields
+
+
+def _memory_profile(event: str, **kwargs: object) -> None:
+    if not _env_bool("LLAMA_CONVERT_PROFILE_MEMORY"):
+        return
+    fields: dict[str, object] = {"event": event, **kwargs, **_memory_snapshot_fields()}
+    logger.info("memory_profile %s", " ".join(f"{key}={value}" for key, value in fields.items()))
 
 
 class SentencePieceTokenTypes(IntEnum):
@@ -646,6 +712,8 @@ class ModelBase:
     def _can_write_bf16_raw(self, data_torch: Tensor, data_qtype: gguf.GGMLQuantizationType) -> bool:
         native_endianess = gguf.GGUFEndian.BIG if sys.byteorder == 'big' else gguf.GGUFEndian.LITTLE
         return (
+            not _env_bool("LLAMA_CONVERT_DISABLE_BF16_RAW")
+            and
             data_qtype == gguf.GGMLQuantizationType.BF16
             and data_torch.dtype == torch.bfloat16
             and self.endianess == native_endianess
@@ -900,6 +968,14 @@ class ModelBase:
             for new_name, data_torch in (self.modify_tensors(data_torch, name, bid)):
                 n_dims = len(data_torch.shape)
                 data_qtype: gguf.GGMLQuantizationType | bool = self.tensor_force_quant(name, new_name, bid, n_dims)
+                _memory_profile(
+                    "tensor_start",
+                    name=name,
+                    new_name=new_name,
+                    source_dtype=data_torch.dtype,
+                    source_shape=tuple(data_torch.shape),
+                    source_nbytes=data_torch.element_size() * data_torch.nelement(),
+                )
 
                 # Most of the codebase that takes in 1D tensors or norms only handles F32 tensors
                 if n_dims <= 1 or new_name.endswith("_norm.weight"):
@@ -976,23 +1052,82 @@ class ModelBase:
                     else:
                         raise ValueError(f"Unknown file type: {self.ftype.name}")
 
+                _memory_profile(
+                    "tensor_qtype_selected",
+                    name=name,
+                    new_name=new_name,
+                    qtype=data_qtype.name,
+                    source_dtype=data_torch.dtype,
+                )
+
                 if self._can_write_bf16_raw(data_torch, data_qtype):
+                    _memory_profile("bf16_raw_start", name=name, new_name=new_name)
                     data = self._bf16_tensor_to_gguf_bytes(data_torch)
+                    _memory_profile(
+                        "bf16_raw_done",
+                        name=name,
+                        new_name=new_name,
+                        data_dtype=data.dtype,
+                        data_shape=data.shape,
+                        data_nbytes=data.nbytes,
+                    )
                 else:
                     # convert any unsupported data types to float32
                     if data_torch.dtype not in (torch.float16, torch.float32):
+                        _memory_profile(
+                            "to_float32_start",
+                            name=name,
+                            new_name=new_name,
+                            source_dtype=data_torch.dtype,
+                        )
                         data_torch = data_torch.to(torch.float32)
+                        _memory_profile(
+                            "to_float32_done",
+                            name=name,
+                            new_name=new_name,
+                            source_dtype=data_torch.dtype,
+                            source_nbytes=data_torch.element_size() * data_torch.nelement(),
+                        )
 
                     # TODO: why do we squeeze here?
                     # data = data_torch.squeeze().numpy()
+                    _memory_profile("numpy_start", name=name, new_name=new_name, source_dtype=data_torch.dtype)
                     data = data_torch.numpy()
+                    _memory_profile(
+                        "numpy_done",
+                        name=name,
+                        new_name=new_name,
+                        data_dtype=data.dtype,
+                        data_shape=data.shape,
+                        data_nbytes=data.nbytes,
+                    )
 
                     try:
+                        _memory_profile("quantize_start", name=name, new_name=new_name, qtype=data_qtype.name)
                         data = gguf.quants.quantize(data, data_qtype)
+                        _memory_profile(
+                            "quantize_done",
+                            name=name,
+                            new_name=new_name,
+                            qtype=data_qtype.name,
+                            data_dtype=data.dtype,
+                            data_shape=data.shape,
+                            data_nbytes=data.nbytes,
+                        )
                     except gguf.QuantError as e:
                         logger.warning("%s, %s", e, "falling back to F16")
                         data_qtype = gguf.GGMLQuantizationType.F16
+                        _memory_profile("quantize_fallback_start", name=name, new_name=new_name, qtype=data_qtype.name)
                         data = gguf.quants.quantize(data, data_qtype)
+                        _memory_profile(
+                            "quantize_fallback_done",
+                            name=name,
+                            new_name=new_name,
+                            qtype=data_qtype.name,
+                            data_dtype=data.dtype,
+                            data_shape=data.shape,
+                            data_nbytes=data.nbytes,
+                        )
 
                 shape = gguf.quant_shape_from_byte_shape(data.shape, data_qtype) if data.dtype == np.uint8 else data.shape
 
@@ -1002,7 +1137,17 @@ class ModelBase:
                 # n_dims is implicit in the shape
                 logger.info(f"{f'%-{max_name_len}s' % f'{new_name},'} {old_dtype} --> {data_qtype.name}, shape = {shape_str}")
 
+                _memory_profile(
+                    "add_tensor_start",
+                    name=name,
+                    new_name=new_name,
+                    qtype=data_qtype.name,
+                    data_dtype=data.dtype,
+                    data_shape=data.shape,
+                    data_nbytes=data.nbytes,
+                )
                 self.gguf_writer.add_tensor(new_name, data, raw_dtype=data_qtype)
+                _memory_profile("add_tensor_done", name=name, new_name=new_name, qtype=data_qtype.name)
 
     def set_type(self):
         self.gguf_writer.add_type(gguf.GGUFType.MODEL)
