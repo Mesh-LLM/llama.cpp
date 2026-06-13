@@ -60,8 +60,40 @@ class TestWriterMemoryOptimizations(unittest.TestCase):
             for direct, temp in zip(direct_files, temp_files):
                 self.assertEqual(direct.read_bytes(), temp.read_bytes())
 
+    def test_chunked_temp_file_writer_matches_single_tensor_writer(self):
+        tensor = np.arange(16, dtype=np.uint8).reshape(2, 8)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            direct_dir = root / "direct"
+            chunked_dir = root / "chunked"
+            direct_dir.mkdir()
+            chunked_dir.mkdir()
+
+            direct_files = self._write_split_model(
+                direct_dir / "model.gguf",
+                {"tensor_a": tensor},
+                use_temp_file=True,
+                raw_dtype=gguf.GGMLQuantizationType.BF16,
+            )
+            chunked_files = self._write_chunked_model(
+                chunked_dir / "model.gguf",
+                tensor,
+                raw_dtype=gguf.GGMLQuantizationType.BF16,
+            )
+
+            self.assertEqual([p.name for p in direct_files], [p.name for p in chunked_files])
+            for direct, chunked in zip(direct_files, chunked_files):
+                self.assertEqual(direct.read_bytes(), chunked.read_bytes())
+
     @staticmethod
-    def _write_split_model(path: Path, tensors: dict[str, np.ndarray], *, use_temp_file: bool) -> list[Path]:
+    def _write_split_model(
+        path: Path,
+        tensors: dict[str, np.ndarray],
+        *,
+        use_temp_file: bool,
+        raw_dtype: gguf.GGMLQuantizationType | None = None,
+    ) -> list[Path]:
         writer = gguf.GGUFWriter(
             path=None,
             arch="llama",
@@ -69,7 +101,31 @@ class TestWriterMemoryOptimizations(unittest.TestCase):
             split_max_tensors=1,
         )
         for name, tensor in tensors.items():
-            writer.add_tensor(name, tensor)
+            writer.add_tensor(name, tensor, raw_dtype=raw_dtype)
+
+        writer.write_header_to_file(path=path)
+        writer.write_kv_data_to_file()
+        writer.write_tensors_to_file()
+        writer.close()
+
+        return sorted(path.parent.glob(f"{path.stem}-*.gguf"))
+
+    @staticmethod
+    def _write_chunked_model(path: Path, tensor: np.ndarray, *, raw_dtype: gguf.GGMLQuantizationType) -> list[Path]:
+        writer = gguf.GGUFWriter(
+            path=None,
+            arch="llama",
+            use_temp_file=True,
+            split_max_tensors=1,
+        )
+        chunks = (chunk for chunk in np.split(tensor, 2, axis=0))
+        writer.add_tensor_from_chunks(
+            "tensor_a",
+            chunks,
+            raw_shape=tensor.shape,
+            tensor_nbytes=tensor.nbytes,
+            raw_dtype=raw_dtype,
+        )
 
         writer.write_header_to_file(path=path)
         writer.write_kv_data_to_file()

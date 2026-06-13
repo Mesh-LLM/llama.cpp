@@ -12,7 +12,7 @@ from enum import Enum, auto
 from math import prod
 from pathlib import Path
 from io import BufferedWriter
-from typing import IO, Any, Sequence, Mapping
+from typing import IO, Any, Iterable, Sequence, Mapping
 from string import ascii_letters, digits
 
 import numpy as np
@@ -499,6 +499,56 @@ class GGUFWriter:
         tensor.tofile(temp_file)
         _memory_profile("writer_temp_tofile_done", name=name, shard_idx=shard_idx, nbytes=tensor.nbytes)
         self.write_padding(temp_file, tensor.nbytes)
+
+    def add_tensor_from_chunks(
+        self, name: str, chunks: Iterable[np.ndarray[Any, Any]], *,
+        raw_shape: Sequence[int], tensor_nbytes: int,
+        raw_dtype: GGMLQuantizationType | None = None,
+    ) -> None:
+        if not self.use_temp_file:
+            raise ValueError("chunked tensor writing requires use_temp_file=True")
+
+        shard_idx = self.add_tensor_info(name, raw_shape, np.dtype(np.uint8), tensor_nbytes, raw_dtype=raw_dtype)
+        _memory_profile(
+            "writer_add_tensor_info",
+            name=name,
+            shard_idx=shard_idx,
+            dtype=np.dtype(np.uint8),
+            shape=raw_shape,
+            nbytes=tensor_nbytes,
+            use_temp_file=self.use_temp_file,
+            chunked=True,
+        )
+
+        temp_file = self._get_temp_file(shard_idx)
+        written = 0
+        _memory_profile("writer_temp_chunks_start", name=name, shard_idx=shard_idx, nbytes=tensor_nbytes)
+        for chunk_idx, chunk in enumerate(chunks):
+            if chunk.dtype != np.uint8:
+                raise ValueError(f"chunk {chunk_idx} for tensor {name!r} has dtype {chunk.dtype}, expected uint8")
+            _memory_profile(
+                "writer_temp_chunk_tofile_start",
+                name=name,
+                shard_idx=shard_idx,
+                chunk_idx=chunk_idx,
+                nbytes=chunk.nbytes,
+            )
+            chunk.tofile(temp_file)
+            written += chunk.nbytes
+            _memory_profile(
+                "writer_temp_chunk_tofile_done",
+                name=name,
+                shard_idx=shard_idx,
+                chunk_idx=chunk_idx,
+                nbytes=chunk.nbytes,
+                written=written,
+            )
+
+        if written != tensor_nbytes:
+            raise ValueError(f"chunked tensor {name!r} wrote {written} bytes, expected {tensor_nbytes}")
+
+        _memory_profile("writer_temp_chunks_done", name=name, shard_idx=shard_idx, nbytes=written)
+        self.write_padding(temp_file, written)
 
     def write_padding(self, fp: IO[bytes], n: int, align: int | None = None) -> None:
         pad = GGUFWriter.ggml_pad(n, align if align is not None else self.data_alignment) - n

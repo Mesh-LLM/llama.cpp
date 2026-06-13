@@ -433,6 +433,67 @@ class DeepseekV2Model(TextModel):
 
     _experts: list[dict[str, Tensor]] | None = None
 
+    def _write_merged_expert_bf16_tensor(
+        self,
+        *,
+        bid: int,
+        w_name: str,
+        datas: list[Tensor],
+        merged_name: str,
+    ) -> bool:
+        new_name = self.map_tensor_name(merged_name)
+        data_qtype = self._select_tensor_qtype(merged_name, new_name, bid, len(datas[0].shape) + 1)
+        if not self._can_write_bf16_raw_dtype(datas[0].dtype, data_qtype):
+            return False
+
+        logical_shape = (len(datas), *tuple(datas[0].shape))
+        raw_shape = gguf.quant_shape_to_byte_shape(logical_shape, gguf.GGMLQuantizationType.BF16)
+        tensor_nbytes = sum(data.element_size() * data.nelement() for data in datas)
+
+        logger.info(
+            "streaming merged expert tensor %s from %d %s experts as BF16",
+            new_name,
+            len(datas),
+            w_name,
+        )
+
+        def chunks() -> Iterable[Any]:
+            for xid, data in enumerate(datas):
+                _memory_profile(
+                    "merged_expert_chunk_start",
+                    name=merged_name,
+                    new_name=new_name,
+                    bid=bid,
+                    expert=xid,
+                    source_dtype=data.dtype,
+                    source_shape=tuple(data.shape),
+                    source_nbytes=data.element_size() * data.nelement(),
+                )
+                raw = self._bf16_tensor_to_gguf_bytes(data)
+                _memory_profile(
+                    "merged_expert_chunk_done",
+                    name=merged_name,
+                    new_name=new_name,
+                    bid=bid,
+                    expert=xid,
+                    data_dtype=raw.dtype,
+                    data_shape=raw.shape,
+                    data_nbytes=raw.nbytes,
+                )
+                yield raw
+
+        self.gguf_writer.add_tensor_from_chunks(
+            new_name,
+            chunks(),
+            raw_shape=raw_shape,
+            tensor_nbytes=tensor_nbytes,
+            raw_dtype=data_qtype,
+        )
+
+        shape_str = f"{{{', '.join(str(n) for n in reversed(logical_shape))}}}"
+        logger.info(f"{f'{new_name},'} {datas[0].dtype} --> {data_qtype.name}, shape = {shape_str}")
+        return True
+
     def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
         # skip lm_head.weight if tie_word_embeddings is True
         if self.hparams.get("tie_word_embeddings", False):
@@ -467,9 +528,17 @@ class DeepseekV2Model(TextModel):
                         datas.append(self._experts[bid][ename])
                         del self._experts[bid][ename]
 
-                    data_torch = torch.stack(datas, dim=0)
-
                     merged_name = f"model.layers.{bid}.mlp.experts.{w_name}.weight"
+
+                    if self._write_merged_expert_bf16_tensor(
+                        bid=bid,
+                        w_name=w_name,
+                        datas=datas,
+                        merged_name=merged_name,
+                    ):
+                        continue
+
+                    data_torch = torch.stack(datas, dim=0)
 
                     yield from super().modify_tensors(data_torch, merged_name, bid)
                 return
