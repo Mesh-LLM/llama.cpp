@@ -3,7 +3,6 @@ from __future__ import annotations
 import logging
 import os
 import resource
-import shutil
 import struct
 import sys
 import tempfile
@@ -134,6 +133,7 @@ class GGUFWriter:
     temp_file: IO[bytes] | None
     temp_files: list[IO[bytes] | None]
     temp_file_advise_offsets: list[int]
+    output_file_advise_offsets: list[int]
     tensors: list[dict[str, TensorInfo]]
     kv_data: list[dict[str, GGUFValue]]
     state: WriterState
@@ -164,6 +164,7 @@ class GGUFWriter:
         self.temp_file = None
         self.temp_files = []
         self.temp_file_advise_offsets = []
+        self.output_file_advise_offsets = []
         self.tensors = [{}]
         self.kv_data = [{}]
         self.split_max_tensors = split_max_tensors
@@ -196,29 +197,77 @@ class GGUFWriter:
 
         return fp
 
-    def _drop_temp_file_cache(self, fp: IO[bytes], shard_idx: int, *, force: bool = False) -> None:
+    @staticmethod
+    def _drop_file_range_cache(fp: IO[bytes], offset: int, length: int, event: str, **fields: Any) -> None:
         if not hasattr(os, "posix_fadvise"):
             return
 
-        threshold = int(os.environ.get("GGUF_WRITER_TEMP_FADVISE_BYTES", 256 * 1024 * 1024))
+        if length <= 0:
+            return
+
+        os.posix_fadvise(fp.fileno(), offset, length, os.POSIX_FADV_DONTNEED)
+        _memory_profile(event, offset=offset, nbytes=length, **fields)
+
+    def _drop_write_file_cache(
+        self,
+        fp: IO[bytes],
+        offsets: list[int],
+        file_idx: int,
+        *,
+        threshold_env: str,
+        sync_env: str,
+        event: str,
+        index_field: str,
+        force: bool = False,
+    ) -> None:
+        if not hasattr(os, "posix_fadvise"):
+            return
+
+        threshold = int(os.environ.get(threshold_env, 256 * 1024 * 1024))
         if threshold <= 0:
             return
 
-        offset = self.temp_file_advise_offsets[shard_idx]
+        offset = offsets[file_idx]
         current = fp.tell()
         length = current - offset
         if length <= 0 or (not force and length < threshold):
             return
 
         fp.flush()
-        if os.environ.get("GGUF_WRITER_TEMP_FDATASYNC", "1").lower() in {"1", "true", "yes", "on"}:
+        if os.environ.get(sync_env, "1").lower() in {"1", "true", "yes", "on"}:
             if hasattr(os, "fdatasync"):
                 os.fdatasync(fp.fileno())
             else:
                 os.fsync(fp.fileno())
-        os.posix_fadvise(fp.fileno(), offset, length, os.POSIX_FADV_DONTNEED)
-        self.temp_file_advise_offsets[shard_idx] = current
-        _memory_profile("writer_temp_fadvise_done", shard_idx=shard_idx, offset=offset, nbytes=length)
+        self._drop_file_range_cache(fp, offset, length, event, **{index_field: file_idx})
+        offsets[file_idx] = current
+
+    def _drop_temp_file_cache(self, fp: IO[bytes], shard_idx: int, *, force: bool = False) -> None:
+        self._drop_write_file_cache(
+            fp,
+            self.temp_file_advise_offsets,
+            shard_idx,
+            threshold_env="GGUF_WRITER_TEMP_FADVISE_BYTES",
+            sync_env="GGUF_WRITER_TEMP_FDATASYNC",
+            event="writer_temp_fadvise_done",
+            index_field="shard_idx",
+            force=force,
+        )
+
+    def _drop_output_file_cache(self, fp: IO[bytes], file_idx: int, *, force: bool = False) -> None:
+        while len(self.output_file_advise_offsets) <= file_idx:
+            self.output_file_advise_offsets.append(0)
+
+        self._drop_write_file_cache(
+            fp,
+            self.output_file_advise_offsets,
+            file_idx,
+            threshold_env="GGUF_WRITER_OUTPUT_FADVISE_BYTES",
+            sync_env="GGUF_WRITER_OUTPUT_FDATASYNC",
+            event="writer_output_fadvise_done",
+            index_field="file_id",
+            force=force,
+        )
 
     def get_total_parameter_count(self) -> tuple[int, int, int, int]:
         total_params = 0
@@ -290,6 +339,7 @@ class GGUFWriter:
         if self.path is not None:
             filenames = self.print_plan()
             self.fout = [open(filename, "wb") for filename in filenames]
+            self.output_file_advise_offsets = [0 for _ in filenames]
             self.state = WriterState.EMPTY
 
     def print_plan(self) -> list[Path]:
@@ -336,12 +386,13 @@ class GGUFWriter:
 
         self.add_shard_kv_data()
 
-        for fout, tensors, kv_data in zip(self.fout, self.tensors, self.kv_data):
+        for file_id, (fout, tensors, kv_data) in enumerate(zip(self.fout, self.tensors, self.kv_data)):
             fout.write(self._pack("<I", GGUF_MAGIC, skip_pack_prefix = True))
             fout.write(self._pack("I", GGUF_VERSION))
             fout.write(self._pack("Q", len(tensors)))
             fout.write(self._pack("Q", len(kv_data)))
             fout.flush()
+            self._drop_output_file_cache(fout, file_id)
         self.state = WriterState.HEADER
 
     def write_kv_data_to_file(self) -> None:
@@ -349,7 +400,7 @@ class GGUFWriter:
             raise ValueError(f'Expected output file to contain the header, got {self.state}')
         assert self.fout is not None
 
-        for fout, kv_data in zip(self.fout, self.kv_data):
+        for file_id, (fout, kv_data) in enumerate(zip(self.fout, self.kv_data)):
             kv_bytes = bytearray()
 
             for key, val in kv_data.items():
@@ -357,6 +408,7 @@ class GGUFWriter:
                 kv_bytes += self._pack_val(val.value, val.type, add_vtype=True, sub_type=val.sub_type)
 
             fout.write(kv_bytes)
+            self._drop_output_file_cache(fout, file_id)
 
         self.flush()
         self.state = WriterState.KV_DATA
@@ -366,7 +418,7 @@ class GGUFWriter:
             raise ValueError(f'Expected output file to contain KV data, got {self.state}')
         assert self.fout is not None
 
-        for fout, tensors in zip(self.fout, self.tensors):
+        for file_id, (fout, tensors) in enumerate(zip(self.fout, self.tensors)):
             ti_data = bytearray()
             offset_tensor = 0
 
@@ -382,6 +434,7 @@ class GGUFWriter:
 
             fout.write(ti_data)
             fout.flush()
+            self._drop_output_file_cache(fout, file_id)
         self.state = WriterState.TI_DATA
 
     def add_key_value(self, key: str, val: Any, vtype: GGUFValueType, sub_type: GGUFValueType | None = None) -> None:
@@ -581,6 +634,40 @@ class GGUFWriter:
         self.write_padding(temp_file, written)
         self._drop_temp_file_cache(temp_file, shard_idx, force=True)
 
+    def _copy_temp_file_to_output(self, temp_file: IO[bytes], fout: IO[bytes], shard_idx: int) -> None:
+        chunk_size = int(os.environ.get("GGUF_WRITER_COPY_BUFFER_BYTES", 16 * 1024 * 1024))
+        if chunk_size <= 0:
+            raise ValueError("GGUF_WRITER_COPY_BUFFER_BYTES must be positive")
+
+        copied = 0
+        _memory_profile("writer_temp_copy_start", shard_idx=shard_idx)
+        while True:
+            chunk = temp_file.read(chunk_size)
+            if not chunk:
+                break
+
+            offset = copied
+            fout.write(chunk)
+            copied += len(chunk)
+            _memory_profile(
+                "writer_temp_copy_chunk_done",
+                shard_idx=shard_idx,
+                offset=offset,
+                nbytes=len(chunk),
+                copied=copied,
+            )
+            self._drop_output_file_cache(fout, shard_idx)
+            self._drop_file_range_cache(
+                temp_file,
+                offset,
+                len(chunk),
+                "writer_temp_read_fadvise_done",
+                shard_idx=shard_idx,
+            )
+
+        self._drop_output_file_cache(fout, shard_idx, force=True)
+        _memory_profile("writer_temp_copy_done", shard_idx=shard_idx, nbytes=copied)
+
     def write_padding(self, fp: IO[bytes], n: int, align: int | None = None) -> None:
         pad = GGUFWriter.ggml_pad(n, align if align is not None else self.data_alignment) - n
         if pad != 0:
@@ -616,7 +703,9 @@ class GGUFWriter:
         _memory_profile("writer_direct_tofile_start", name=first_tensor_name, file_id=file_id, nbytes=tensor.nbytes)
         tensor.tofile(fout)
         _memory_profile("writer_direct_tofile_done", name=first_tensor_name, file_id=file_id, nbytes=tensor.nbytes)
+        self._drop_output_file_cache(fout, file_id)
         self.write_padding(fout, tensor.nbytes)
+        self._drop_output_file_cache(fout, file_id)
 
         self.state = WriterState.WEIGHTS
 
@@ -654,11 +743,13 @@ class GGUFWriter:
                     _memory_profile("writer_flush_tofile_start", file_id=i, nbytes=ti.nbytes)
                     ti.tensor.tofile(fout)
                     _memory_profile("writer_flush_tofile_done", file_id=i, nbytes=ti.nbytes)
+                    self._drop_output_file_cache(fout, i)
                     if shard_bar is not None:
                         shard_bar.update(ti.nbytes)
                     if bar is not None:
                         bar.update(ti.nbytes)
                     self.write_padding(fout, ti.nbytes)
+                    self._drop_output_file_cache(fout, i)
                     ti.tensor = None
         else:
             for shard_idx, (temp_file, fout) in enumerate(zip(self.temp_files, self.fout)):
@@ -667,7 +758,7 @@ class GGUFWriter:
 
                 self._drop_temp_file_cache(temp_file, shard_idx, force=True)
                 temp_file.seek(0)
-                shutil.copyfileobj(temp_file, fout)
+                self._copy_temp_file_to_output(temp_file, fout, shard_idx)
                 temp_file.close()
             self.temp_files = []
             self.temp_file = None
@@ -678,14 +769,17 @@ class GGUFWriter:
 
     def flush(self) -> None:
         assert self.fout is not None
-        for fout in self.fout:
+        for file_id, fout in enumerate(self.fout):
             fout.flush()
+            self._drop_output_file_cache(fout, file_id)
 
     def close(self) -> None:
         if self.fout is not None:
-            for fout in self.fout:
+            for file_id, fout in enumerate(self.fout):
+                self._drop_output_file_cache(fout, file_id, force=True)
                 fout.close()
             self.fout = None
+            self.output_file_advise_offsets = []
 
     def add_type(self, type_name: str) -> None:
         self.add_string(Keys.General.TYPE, type_name)

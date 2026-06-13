@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import importlib.util
+import importlib
 import os
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
 
@@ -85,6 +87,47 @@ class TestWriterMemoryOptimizations(unittest.TestCase):
             self.assertEqual([p.name for p in direct_files], [p.name for p in chunked_files])
             for direct, chunked in zip(direct_files, chunked_files):
                 self.assertEqual(direct.read_bytes(), chunked.read_bytes())
+
+    def test_split_temp_file_writer_drops_output_cache(self):
+        tensor = np.arange(1024, dtype=np.float32)
+        events: list[str] = []
+
+        def record_cache_drop(_fp, _offset: int, _length: int, event: str, **_fields) -> None:
+            events.append(event)
+
+        env = {
+            "GGUF_WRITER_TEMP_FADVISE_BYTES": "1",
+            "GGUF_WRITER_TEMP_FDATASYNC": "0",
+            "GGUF_WRITER_OUTPUT_FADVISE_BYTES": "1",
+            "GGUF_WRITER_OUTPUT_FDATASYNC": "0",
+            "GGUF_WRITER_COPY_BUFFER_BYTES": "128",
+        }
+        writer_module = importlib.import_module("gguf.gguf_writer")
+
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, env), patch.object(
+            writer_module.os,
+            "posix_fadvise",
+            lambda *_args: None,
+            create=True,
+        ), patch.object(
+            writer_module.os,
+            "POSIX_FADV_DONTNEED",
+            4,
+            create=True,
+        ), patch.object(
+            gguf.GGUFWriter,
+            "_drop_file_range_cache",
+            staticmethod(record_cache_drop),
+        ):
+            self._write_split_model(
+                Path(tmp) / "model.gguf",
+                {"tensor_a": tensor},
+                use_temp_file=True,
+            )
+
+        self.assertIn("writer_temp_fadvise_done", events)
+        self.assertIn("writer_temp_read_fadvise_done", events)
+        self.assertIn("writer_output_fadvise_done", events)
 
     @staticmethod
     def _write_split_model(
