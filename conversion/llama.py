@@ -10,7 +10,7 @@ import torch
 if TYPE_CHECKING:
     from torch import Tensor
 
-from .base import ModelBase, TextModel, gguf
+from .base import ModelBase, TensorPlan, TextModel, gguf
 
 
 @ModelBase.register(
@@ -173,6 +173,18 @@ class LlamaModel(TextModel):
                 return
 
         yield from super().modify_tensors(data_torch, name, bid)
+
+    def plan_tensor_outputs(self, name: str, data_torch: Tensor, bid: int | None) -> Iterable[TensorPlan] | None:
+        if self.hf_arch == "LlamaModel":
+            name = "model." + name
+
+        if name.find("block_sparse_moe.experts") != -1:
+            return None
+
+        new_name = self.map_tensor_name(name)
+        shape = tuple(int(dim) for dim in data_torch.shape)
+        qtype = self._select_tensor_qtype(name, new_name, bid, len(shape))
+        return (TensorPlan(new_name, shape, data_torch.dtype, qtype),)
 
     def generate_extra_tensors(self) -> Iterable[tuple[str, Tensor]]:
         if rope_params := self.rope_parameters.get("full_attention", self.rope_parameters):

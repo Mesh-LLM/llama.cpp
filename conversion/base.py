@@ -11,6 +11,7 @@ import os
 import re
 import resource
 import sys
+from dataclasses import dataclass
 from enum import IntEnum
 from pathlib import Path
 from hashlib import sha256
@@ -57,6 +58,14 @@ logger = logging.getLogger("hf-to-gguf")
 
 
 AnyModel = TypeVar("AnyModel", bound="type[ModelBase]")
+
+
+@dataclass(frozen=True)
+class TensorPlan:
+    name: str
+    shape: tuple[int, ...]
+    torch_dtype: torch.dtype
+    qtype: gguf.GGMLQuantizationType
 
 
 def _env_bool(name: str) -> bool:
@@ -712,6 +721,92 @@ class ModelBase:
             return gguf.GGMLQuantizationType.Q8_0
         return False
 
+    def _select_tensor_qtype(
+        self,
+        name: str,
+        new_name: str,
+        bid: int | None,
+        n_dims: int,
+    ) -> gguf.GGMLQuantizationType:
+        data_qtype: gguf.GGMLQuantizationType | bool = self.tensor_force_quant(name, new_name, bid, n_dims)
+
+        # Most of the codebase that takes in 1D tensors or norms only handles F32 tensors
+        if n_dims <= 1 or new_name.endswith("_norm.weight"):
+            data_qtype = gguf.GGMLQuantizationType.F32
+
+        # Conditions should closely match those in llama_model_quantize_internal in llama.cpp
+        # Some tensor types are always in float32
+        if data_qtype is False and (
+            any(
+                self.match_model_tensor_name(new_name, key, bid)
+                for key in (
+                    gguf.MODEL_TENSOR.FFN_GATE_INP,
+                    gguf.MODEL_TENSOR.FFN_GATE_INP_SHEXP,
+                    gguf.MODEL_TENSOR.POS_EMBD,
+                    gguf.MODEL_TENSOR.TOKEN_TYPES,
+                    gguf.MODEL_TENSOR.SSM_CONV1D,
+                    gguf.MODEL_TENSOR.SHORTCONV_CONV,
+                    gguf.MODEL_TENSOR.TIME_MIX_FIRST,
+                    gguf.MODEL_TENSOR.TIME_MIX_W1,
+                    gguf.MODEL_TENSOR.TIME_MIX_W2,
+                    gguf.MODEL_TENSOR.TIME_MIX_DECAY_W1,
+                    gguf.MODEL_TENSOR.TIME_MIX_DECAY_W2,
+                    gguf.MODEL_TENSOR.TIME_MIX_LERP_FUSED,
+                    gguf.MODEL_TENSOR.POSNET_NORM1,
+                    gguf.MODEL_TENSOR.POSNET_NORM2,
+                    gguf.MODEL_TENSOR.V_ENC_EMBD_POS,
+                    gguf.MODEL_TENSOR.A_ENC_EMBD_POS,
+                    gguf.MODEL_TENSOR.ALTUP_CORRECT_COEF,
+                    gguf.MODEL_TENSOR.ALTUP_PREDICT_COEF,
+                    # Kimi KDA conv weights should be F32
+                    gguf.MODEL_TENSOR.SSM_CONV1D_Q,
+                    gguf.MODEL_TENSOR.SSM_CONV1D_K,
+                    gguf.MODEL_TENSOR.SSM_CONV1D_V,
+                    # DSA indexer weights should be F32
+                    gguf.MODEL_TENSOR.INDEXER_PROJ,
+                )
+            )
+            or new_name[-7:] not in (".weight", ".lora_a", ".lora_b")
+        ):
+            data_qtype = gguf.GGMLQuantizationType.F32
+
+        if data_qtype is False and any(
+            self.match_model_tensor_name(new_name, key, bid)
+            for key in (
+                gguf.MODEL_TENSOR.TOKEN_EMBD,
+                gguf.MODEL_TENSOR.PER_LAYER_TOKEN_EMBD,
+                gguf.MODEL_TENSOR.OUTPUT,
+                gguf.MODEL_TENSOR.ALTUP_ROUTER,
+                gguf.MODEL_TENSOR.LAUREL_L,
+                gguf.MODEL_TENSOR.LAUREL_R,
+            )
+        ):
+            if self.ftype in (
+                gguf.LlamaFileType.MOSTLY_TQ1_0,
+                gguf.LlamaFileType.MOSTLY_TQ2_0,
+            ):
+                # TODO: use Q4_K and Q6_K
+                data_qtype = gguf.GGMLQuantizationType.F16
+
+        # No override (data_qtype is False), or wants to be quantized (data_qtype is True)
+        if isinstance(data_qtype, bool):
+            if self.ftype == gguf.LlamaFileType.ALL_F32:
+                data_qtype = gguf.GGMLQuantizationType.F32
+            elif self.ftype == gguf.LlamaFileType.MOSTLY_F16:
+                data_qtype = gguf.GGMLQuantizationType.F16
+            elif self.ftype == gguf.LlamaFileType.MOSTLY_BF16:
+                data_qtype = gguf.GGMLQuantizationType.BF16
+            elif self.ftype == gguf.LlamaFileType.MOSTLY_Q8_0:
+                data_qtype = gguf.GGMLQuantizationType.Q8_0
+            elif self.ftype == gguf.LlamaFileType.MOSTLY_TQ1_0:
+                data_qtype = gguf.GGMLQuantizationType.TQ1_0
+            elif self.ftype == gguf.LlamaFileType.MOSTLY_TQ2_0:
+                data_qtype = gguf.GGMLQuantizationType.TQ2_0
+            else:
+                raise ValueError(f"Unknown file type: {self.ftype.name}")
+
+        return data_qtype
+
     def _can_write_bf16_raw(self, data_torch: Tensor, data_qtype: gguf.GGMLQuantizationType) -> bool:
         native_endianess = gguf.GGUFEndian.BIG if sys.byteorder == 'big' else gguf.GGUFEndian.LITTLE
         return (
@@ -719,6 +814,15 @@ class ModelBase:
             and
             data_qtype == gguf.GGMLQuantizationType.BF16
             and data_torch.dtype == torch.bfloat16
+            and self.endianess == native_endianess
+        )
+
+    def _can_write_bf16_raw_dtype(self, torch_dtype: torch.dtype, data_qtype: gguf.GGMLQuantizationType) -> bool:
+        native_endianess = gguf.GGUFEndian.BIG if sys.byteorder == 'big' else gguf.GGUFEndian.LITTLE
+        return (
+            not _env_bool("LLAMA_CONVERT_DISABLE_BF16_RAW")
+            and data_qtype == gguf.GGMLQuantizationType.BF16
+            and torch_dtype == torch.bfloat16
             and self.endianess == native_endianess
         )
 
@@ -762,6 +866,75 @@ class ModelBase:
 
         byte_shape = gguf.quant_shape_to_byte_shape(shape, data_qtype)
         return byte_shape, np.dtype(np.uint8), int(np.prod(byte_shape)), data_qtype
+
+    def _planned_tensor_storage_from_plan(
+        self,
+        plan: TensorPlan,
+    ) -> tuple[tuple[int, ...], np.dtype, int, gguf.GGMLQuantizationType | None]:
+        if self._can_write_bf16_raw_dtype(plan.torch_dtype, plan.qtype) or plan.qtype == gguf.GGMLQuantizationType.BF16:
+            byte_shape = gguf.quant_shape_to_byte_shape(plan.shape, plan.qtype)
+            return byte_shape, np.dtype(np.uint8), int(np.prod(byte_shape)), plan.qtype
+
+        if plan.qtype in (gguf.GGMLQuantizationType.F64, gguf.GGMLQuantizationType.F32, gguf.GGMLQuantizationType.F16,
+                          gguf.GGMLQuantizationType.I64, gguf.GGMLQuantizationType.I32, gguf.GGMLQuantizationType.I16,
+                          gguf.GGMLQuantizationType.I8):
+            dtype = self._np_dtype_for_unquantized_qtype(plan.qtype)
+            return plan.shape, dtype, int(np.prod(plan.shape)) * dtype.itemsize, None
+
+        byte_shape = gguf.quant_shape_to_byte_shape(plan.shape, plan.qtype)
+        return byte_shape, np.dtype(np.uint8), int(np.prod(byte_shape)), plan.qtype
+
+    def plan_tensor_outputs(self, name: str, data_torch: Tensor, bid: int | None) -> Iterable[TensorPlan] | None:
+        if type(self).modify_tensors is not ModelBase.modify_tensors:
+            return None
+
+        new_name = self.map_tensor_name(name)
+        shape = tuple(int(dim) for dim in data_torch.shape)
+        qtype = self._select_tensor_qtype(name, new_name, bid, len(shape))
+        return (TensorPlan(new_name, shape, data_torch.dtype, qtype),)
+
+    def _skip_source_tensor_if_resumed(self, name: str, data_torch: Tensor, bid: int | None) -> bool:
+        if self.skip_output_shards_before <= 1:
+            return False
+
+        plans = self.plan_tensor_outputs(name, data_torch, bid)
+        if plans is None:
+            return False
+
+        return self._skip_planned_source_if_resumed(name, plans)
+
+    def _skip_planned_source_if_resumed(self, name: str, plans: Iterable[TensorPlan]) -> bool:
+        plan_list = list(plans)
+        if len(plan_list) == 0:
+            return False
+
+        added: list[tuple[str, int]] = []
+        max_shard_no = 0
+        for plan in plan_list:
+            tensor_shape, tensor_dtype, tensor_nbytes, raw_dtype = self._planned_tensor_storage_from_plan(plan)
+            shard_idx = self.gguf_writer.add_tensor_info_only(
+                plan.name,
+                tensor_shape,
+                tensor_dtype,
+                tensor_nbytes,
+                raw_dtype=raw_dtype,
+            )
+            added.append((plan.name, shard_idx))
+            max_shard_no = max(max_shard_no, shard_idx + 1)
+
+        if max_shard_no < self.skip_output_shards_before:
+            _memory_profile("resume_skip_source_tensor", name=name, shard_no=max_shard_no)
+            logger.info(
+                "resume-skip-source: %s planned through shard %05d before resume shard %05d",
+                name,
+                max_shard_no,
+                self.skip_output_shards_before,
+            )
+            return True
+
+        for planned_name, shard_idx in reversed(added):
+            self.gguf_writer.remove_tensor_info(planned_name, shard_idx)
+        return False
 
     def _skip_planned_tensor_if_resumed(
         self,
@@ -1046,9 +1219,12 @@ class ModelBase:
                     bid = int(part)
                     break
 
+            if self._skip_source_tensor_if_resumed(name, data_torch, bid):
+                continue
+
             for new_name, data_torch in (self.modify_tensors(data_torch, name, bid)):
                 n_dims = len(data_torch.shape)
-                data_qtype: gguf.GGMLQuantizationType | bool = self.tensor_force_quant(name, new_name, bid, n_dims)
+                data_qtype = self._select_tensor_qtype(name, new_name, bid, n_dims)
                 _memory_profile(
                     "tensor_start",
                     name=name,
@@ -1057,81 +1233,6 @@ class ModelBase:
                     source_shape=tuple(data_torch.shape),
                     source_nbytes=data_torch.element_size() * data_torch.nelement(),
                 )
-
-                # Most of the codebase that takes in 1D tensors or norms only handles F32 tensors
-                if n_dims <= 1 or new_name.endswith("_norm.weight"):
-                    data_qtype = gguf.GGMLQuantizationType.F32
-
-                # Conditions should closely match those in llama_model_quantize_internal in llama.cpp
-                # Some tensor types are always in float32
-                if data_qtype is False and (
-                    any(
-                        self.match_model_tensor_name(new_name, key, bid)
-                        for key in (
-                            gguf.MODEL_TENSOR.FFN_GATE_INP,
-                            gguf.MODEL_TENSOR.FFN_GATE_INP_SHEXP,
-                            gguf.MODEL_TENSOR.POS_EMBD,
-                            gguf.MODEL_TENSOR.TOKEN_TYPES,
-                            gguf.MODEL_TENSOR.SSM_CONV1D,
-                            gguf.MODEL_TENSOR.SHORTCONV_CONV,
-                            gguf.MODEL_TENSOR.TIME_MIX_FIRST,
-                            gguf.MODEL_TENSOR.TIME_MIX_W1,
-                            gguf.MODEL_TENSOR.TIME_MIX_W2,
-                            gguf.MODEL_TENSOR.TIME_MIX_DECAY_W1,
-                            gguf.MODEL_TENSOR.TIME_MIX_DECAY_W2,
-                            gguf.MODEL_TENSOR.TIME_MIX_LERP_FUSED,
-                            gguf.MODEL_TENSOR.POSNET_NORM1,
-                            gguf.MODEL_TENSOR.POSNET_NORM2,
-                            gguf.MODEL_TENSOR.V_ENC_EMBD_POS,
-                            gguf.MODEL_TENSOR.A_ENC_EMBD_POS,
-                            gguf.MODEL_TENSOR.ALTUP_CORRECT_COEF,
-                            gguf.MODEL_TENSOR.ALTUP_PREDICT_COEF,
-                            # Kimi KDA conv weights should be F32
-                            gguf.MODEL_TENSOR.SSM_CONV1D_Q,
-                            gguf.MODEL_TENSOR.SSM_CONV1D_K,
-                            gguf.MODEL_TENSOR.SSM_CONV1D_V,
-                            # DSA indexer weights should be F32
-                            gguf.MODEL_TENSOR.INDEXER_PROJ,
-                        )
-                    )
-                    or new_name[-7:] not in (".weight", ".lora_a", ".lora_b")
-                ):
-                    data_qtype = gguf.GGMLQuantizationType.F32
-
-                if data_qtype is False and any(
-                    self.match_model_tensor_name(new_name, key, bid)
-                    for key in (
-                        gguf.MODEL_TENSOR.TOKEN_EMBD,
-                        gguf.MODEL_TENSOR.PER_LAYER_TOKEN_EMBD,
-                        gguf.MODEL_TENSOR.OUTPUT,
-                        gguf.MODEL_TENSOR.ALTUP_ROUTER,
-                        gguf.MODEL_TENSOR.LAUREL_L,
-                        gguf.MODEL_TENSOR.LAUREL_R,
-                    )
-                ):
-                    if self.ftype in (
-                        gguf.LlamaFileType.MOSTLY_TQ1_0,
-                        gguf.LlamaFileType.MOSTLY_TQ2_0,
-                    ):
-                        # TODO: use Q4_K and Q6_K
-                        data_qtype = gguf.GGMLQuantizationType.F16
-
-                # No override (data_qtype is False), or wants to be quantized (data_qtype is True)
-                if isinstance(data_qtype, bool):
-                    if self.ftype == gguf.LlamaFileType.ALL_F32:
-                        data_qtype = gguf.GGMLQuantizationType.F32
-                    elif self.ftype == gguf.LlamaFileType.MOSTLY_F16:
-                        data_qtype = gguf.GGMLQuantizationType.F16
-                    elif self.ftype == gguf.LlamaFileType.MOSTLY_BF16:
-                        data_qtype = gguf.GGMLQuantizationType.BF16
-                    elif self.ftype == gguf.LlamaFileType.MOSTLY_Q8_0:
-                        data_qtype = gguf.GGMLQuantizationType.Q8_0
-                    elif self.ftype == gguf.LlamaFileType.MOSTLY_TQ1_0:
-                        data_qtype = gguf.GGMLQuantizationType.TQ1_0
-                    elif self.ftype == gguf.LlamaFileType.MOSTLY_TQ2_0:
-                        data_qtype = gguf.GGMLQuantizationType.TQ2_0
-                    else:
-                        raise ValueError(f"Unknown file type: {self.ftype.name}")
 
                 _memory_profile(
                     "tensor_qtype_selected",

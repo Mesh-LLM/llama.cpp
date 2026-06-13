@@ -9,7 +9,7 @@ import torch
 if TYPE_CHECKING:
     from torch import Tensor
 
-from .base import MmprojModel, ModelBase, TextModel, gguf, logger
+from .base import MmprojModel, ModelBase, TensorPlan, TextModel, _memory_profile, gguf, logger
 
 from .qwen import QwenModel
 
@@ -222,6 +222,8 @@ class DeepseekV2Model(TextModel):
         super().__init__(*args, **kwargs)
         hparams: dict = ModelBase.load_hparams(self.dir_model, is_mistral_format=False)
         self.origin_hf_arch = hparams.get('architectures', [None])[0]
+        self._resume_checked_expert_layers: set[int] = set()
+        self._resume_skipped_expert_layers: set[int] = set()
 
         # special handling for Deepseek OCR
         if self.origin_hf_arch in ("DeepseekOCRForCausalLM", "DeepseekOCR2ForCausalLM"):
@@ -230,6 +232,79 @@ class DeepseekV2Model(TextModel):
             self.gguf_writer.add_architecture()
             # default jinja template
             self.gguf_writer.add_chat_template("{% for m in messages %}{{m['content']}}{% endfor %}")
+
+    def _merged_expert_plans(self, bid: int, torch_dtype: torch.dtype) -> Iterable[TensorPlan]:
+        n_experts = self.hparams["n_routed_experts"]
+        hidden_size = self.hparams["hidden_size"]
+        moe_size = self.hparams.get("moe_intermediate_size", self.hparams.get("intermediate_size"))
+        if moe_size is None:
+            raise KeyError("could not find moe_intermediate_size or intermediate_size")
+
+        for w_name, shape in (
+            ("down_proj", (n_experts, hidden_size, moe_size)),
+            ("gate_proj", (n_experts, moe_size, hidden_size)),
+            ("up_proj", (n_experts, moe_size, hidden_size)),
+        ):
+            merged_name = f"model.layers.{bid}.mlp.experts.{w_name}.weight"
+            new_name = self.map_tensor_name(merged_name)
+            qtype = self._select_tensor_qtype(merged_name, new_name, bid, len(shape))
+            yield TensorPlan(new_name, shape, torch_dtype, qtype)
+
+    def _skip_source_tensor_if_resumed(self, name: str, data_torch: Tensor, bid: int | None) -> bool:
+        if self.skip_output_shards_before <= 1:
+            return False
+
+        if self.merge_expert and name.find("mlp.experts") != -1:
+            assert bid is not None
+            if bid in self._resume_skipped_expert_layers:
+                _memory_profile("resume_skip_expert_source_tensor", name=name, bid=bid)
+                logger.info("resume-skip-expert-source: %s already covered by layer %d plan", name, bid)
+                return True
+
+            if bid not in self._resume_checked_expert_layers:
+                self._resume_checked_expert_layers.add(bid)
+                plans = self._merged_expert_plans(bid, data_torch.dtype)
+                if self._skip_planned_source_if_resumed(name, plans):
+                    self._resume_skipped_expert_layers.add(bid)
+                    return True
+
+            return False
+
+        return super()._skip_source_tensor_if_resumed(name, data_torch, bid)
+
+    def plan_tensor_outputs(self, name: str, data_torch: Tensor, bid: int | None) -> Iterable[TensorPlan] | None:
+        if self.hparams.get("tie_word_embeddings", False):
+            if name == "lm_head.weight" or name == "model.lm_head.weight":
+                return ()
+
+        if self.skip_mtp:
+            block_count = self.hparams["num_hidden_layers"]
+            match = re.match(r"model.layers.(\d+)", name)
+            if match and int(match.group(1)) >= block_count:
+                return ()
+
+        if self.merge_expert and name.find("mlp.experts") != -1:
+            return None
+
+        if name.endswith("kv_b_proj.weight"):
+            n_head_kv = self.hparams["num_key_value_heads"]
+            v_head_dim = self.hparams["v_head_dim"]
+            qk_nope_head_dim = self.hparams["qk_nope_head_dim"]
+            last_dim = int(data_torch.shape[-1])
+            plans: list[TensorPlan] = []
+            for planned_name, shape in (
+                (name.replace("kv_b_proj", "k_b_proj"), (n_head_kv, last_dim, qk_nope_head_dim)),
+                (name.replace("kv_b_proj", "v_b_proj"), (n_head_kv, v_head_dim, last_dim)),
+            ):
+                new_name = self.map_tensor_name(planned_name)
+                qtype = self._select_tensor_qtype(planned_name, new_name, bid, len(shape))
+                plans.append(TensorPlan(new_name, shape, data_torch.dtype, qtype))
+            return plans
+
+        new_name = self.map_tensor_name(name)
+        shape = tuple(int(dim) for dim in data_torch.shape)
+        qtype = self._select_tensor_qtype(name, new_name, bid, len(shape))
+        return (TensorPlan(new_name, shape, data_torch.dtype, qtype),)
 
     @classmethod
     def filter_tensors(cls, item: tuple[str, Callable[[], Tensor]]) -> tuple[str, Callable[[], Tensor]] | None:
