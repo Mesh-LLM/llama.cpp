@@ -412,7 +412,7 @@ class GGUFWriter:
     def add_tensor_info(
         self, name: str, tensor_shape: Sequence[int], tensor_dtype: np.dtype,
         tensor_nbytes: int, raw_dtype: GGMLQuantizationType | None = None,
-    ) -> None:
+    ) -> int:
         if self.state is not WriterState.NO_FILE:
             raise ValueError(f'Expected output file to be not yet opened, got {self.state}')
 
@@ -453,6 +453,18 @@ class GGUFWriter:
                 self.tensors.append({})
 
         self.tensors[-1][name] = TensorInfo(shape=tensor_shape, dtype=dtype, nbytes=tensor_nbytes)
+        return len(self.tensors) - 1
+
+    def add_tensor_info_only(
+        self, name: str, tensor_shape: Sequence[int], tensor_dtype: np.dtype,
+        tensor_nbytes: int, raw_dtype: GGMLQuantizationType | None = None,
+    ) -> int:
+        return self.add_tensor_info(name, tensor_shape, tensor_dtype, tensor_nbytes, raw_dtype=raw_dtype)
+
+    def remove_tensor_info(self, name: str, shard_idx: int) -> None:
+        del self.tensors[shard_idx][name]
+        if shard_idx > 0 and shard_idx == len(self.tensors) - 1 and not self.tensors[shard_idx]:
+            self.tensors.pop()
 
     def add_tensor(
         self, name: str, tensor: np.ndarray[Any, Any], raw_shape: Sequence[int] | None = None,
@@ -466,8 +478,7 @@ class GGUFWriter:
             # Don't byteswap inplace since lazy copies cannot handle it
             tensor = tensor.byteswap(inplace=False)
         shape: Sequence[int] = raw_shape if raw_shape is not None else tensor.shape
-        self.add_tensor_info(name, shape, tensor.dtype, tensor.nbytes, raw_dtype=raw_dtype)
-        shard_idx = len(self.tensors) - 1
+        shard_idx = self.add_tensor_info(name, shape, tensor.dtype, tensor.nbytes, raw_dtype=raw_dtype)
         _memory_profile(
             "writer_add_tensor_info",
             name=name,

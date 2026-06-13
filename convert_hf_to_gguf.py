@@ -94,6 +94,10 @@ def parse_args() -> argparse.Namespace:
         help="max size per split N(M|G)",
     )
     parser.add_argument(
+        "--skip-output-shards-before", type=int, default=1,
+        help="metadata-plan but do not materialize tensors assigned to output shards before this 1-based shard number",
+    )
+    parser.add_argument(
         "--dry-run", action="store_true",
         help="only print out a split plan and exit, without writing any new files",
     )
@@ -271,6 +275,7 @@ def main() -> None:
                                      sentence_transformers_dense_modules=args.sentence_transformers_dense_modules,
                                      fuse_gate_up_exps=args.fuse_gate_up_exps,
                                      fp8_as_q8=args.fp8_as_q8,
+                                     skip_output_shards_before=args.skip_output_shards_before,
                                      )
 
         if args.vocab_only:

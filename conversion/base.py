@@ -150,6 +150,7 @@ class ModelBase:
     is_big_endian: bool
     endianess: gguf.GGUFEndian
     use_temp_file: bool
+    skip_output_shards_before: int
     lazy: bool
     dry_run: bool
     hparams: dict[str, Any]
@@ -186,7 +187,8 @@ class ModelBase:
                  disable_mistral_community_chat_template: bool = False,
                  sentence_transformers_dense_modules: bool = False,
                  fuse_gate_up_exps: bool = False,
-                 fp8_as_q8: bool = False):
+                 fp8_as_q8: bool = False,
+                 skip_output_shards_before: int = 1):
         if type(self) is ModelBase or \
                 type(self) is TextModel or \
                 type(self) is MmprojModel:
@@ -201,6 +203,7 @@ class ModelBase:
         self.is_big_endian = is_big_endian
         self.endianess = gguf.GGUFEndian.BIG if is_big_endian else gguf.GGUFEndian.LITTLE
         self.use_temp_file = use_temp_file
+        self.skip_output_shards_before = max(skip_output_shards_before, 1)
         self.lazy = not eager or (remote_hf_model_id is not None)
         self.dry_run = dry_run
         self.remote_hf_model_id = remote_hf_model_id
@@ -720,6 +723,84 @@ class ModelBase:
         )
 
     @staticmethod
+    def _np_dtype_for_unquantized_qtype(data_qtype: gguf.GGMLQuantizationType) -> np.dtype:
+        if data_qtype == gguf.GGMLQuantizationType.F64:
+            return np.dtype(np.float64)
+        if data_qtype == gguf.GGMLQuantizationType.F32:
+            return np.dtype(np.float32)
+        if data_qtype == gguf.GGMLQuantizationType.F16:
+            return np.dtype(np.float16)
+        if data_qtype == gguf.GGMLQuantizationType.I64:
+            return np.dtype(np.int64)
+        if data_qtype == gguf.GGMLQuantizationType.I32:
+            return np.dtype(np.int32)
+        if data_qtype == gguf.GGMLQuantizationType.I16:
+            return np.dtype(np.int16)
+        if data_qtype == gguf.GGMLQuantizationType.I8:
+            return np.dtype(np.int8)
+        raise ValueError(f"Cannot predict numpy dtype for {data_qtype.name}")
+
+    def _planned_tensor_storage(
+        self,
+        data_torch: Tensor,
+        data_qtype: gguf.GGMLQuantizationType,
+    ) -> tuple[tuple[int, ...], np.dtype, int, gguf.GGMLQuantizationType | None]:
+        shape = tuple(int(dim) for dim in data_torch.shape)
+        if self._can_write_bf16_raw(data_torch, data_qtype):
+            byte_shape = gguf.quant_shape_to_byte_shape(shape, data_qtype)
+            return byte_shape, np.dtype(np.uint8), int(np.prod(byte_shape)), data_qtype
+
+        if data_qtype == gguf.GGMLQuantizationType.BF16:
+            byte_shape = gguf.quant_shape_to_byte_shape(shape, data_qtype)
+            return byte_shape, np.dtype(np.uint8), int(np.prod(byte_shape)), data_qtype
+
+        if data_qtype in (gguf.GGMLQuantizationType.F64, gguf.GGMLQuantizationType.F32, gguf.GGMLQuantizationType.F16,
+                          gguf.GGMLQuantizationType.I64, gguf.GGMLQuantizationType.I32, gguf.GGMLQuantizationType.I16,
+                          gguf.GGMLQuantizationType.I8):
+            dtype = self._np_dtype_for_unquantized_qtype(data_qtype)
+            return shape, dtype, int(np.prod(shape)) * dtype.itemsize, None
+
+        byte_shape = gguf.quant_shape_to_byte_shape(shape, data_qtype)
+        return byte_shape, np.dtype(np.uint8), int(np.prod(byte_shape)), data_qtype
+
+    def _skip_planned_tensor_if_resumed(
+        self,
+        new_name: str,
+        data_torch: Tensor,
+        data_qtype: gguf.GGMLQuantizationType,
+    ) -> bool:
+        if self.skip_output_shards_before <= 1:
+            return False
+
+        tensor_shape, tensor_dtype, tensor_nbytes, raw_dtype = self._planned_tensor_storage(data_torch, data_qtype)
+        shard_idx = self.gguf_writer.add_tensor_info_only(
+            new_name,
+            tensor_shape,
+            tensor_dtype,
+            tensor_nbytes,
+            raw_dtype=raw_dtype,
+        )
+        shard_no = shard_idx + 1
+        if shard_no >= self.skip_output_shards_before:
+            self.gguf_writer.remove_tensor_info(new_name, shard_idx)
+            return False
+
+        _memory_profile(
+            "resume_skip_tensor",
+            new_name=new_name,
+            shard_no=shard_no,
+            qtype=data_qtype.name,
+            tensor_nbytes=tensor_nbytes,
+        )
+        logger.info(
+            "resume-skip: %s planned in shard %05d before resume shard %05d",
+            new_name,
+            shard_no,
+            self.skip_output_shards_before,
+        )
+        return True
+
+    @staticmethod
     def _bf16_tensor_to_gguf_bytes(data_torch: Tensor) -> np.ndarray:
         raw_shape = gguf.quant_shape_to_byte_shape(tuple(data_torch.shape), gguf.GGMLQuantizationType.BF16)
 
@@ -1059,6 +1140,9 @@ class ModelBase:
                     qtype=data_qtype.name,
                     source_dtype=data_torch.dtype,
                 )
+
+                if self._skip_planned_tensor_if_resumed(new_name, data_torch, data_qtype):
+                    continue
 
                 if self._can_write_bf16_raw(data_torch, data_qtype):
                     _memory_profile("bf16_raw_start", name=name, new_name=new_name)
