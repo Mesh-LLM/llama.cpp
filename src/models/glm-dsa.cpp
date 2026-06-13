@@ -75,11 +75,6 @@ void llama_model_glm_dsa::load_arch_tensors(llama_model_loader &) {
 
     for (int i = 0; i < n_layer_all; ++i) {
         int flags = 0;
-        if (i >= n_layer) {
-            // skip all tensors in the NextN layers
-            // TODO @ngxson : TENSOR_NOT_REQUIRED was a hack, need to remove it later
-            flags |= TENSOR_SKIP | TENSOR_NOT_REQUIRED;
-        }
 
         auto & layer = layers[i];
 
@@ -132,7 +127,7 @@ void llama_model_glm_dsa::load_arch_tensors(llama_model_loader &) {
             layer.ffn_up_shexp   = create_tensor(tn(LLM_TENSOR_FFN_UP_SHEXP,   "weight", i), {n_embd, n_ff_exp * n_expert_shared}, flags);
         }
 
-        // NextN/MTP tensors (preserved but unused) - conditionally load for last n_layer_nextn
+        // NextN/MTP tensors - conditionally load for last n_layer_nextn
         if (i >= n_layer) {
             layer.nextn.eh_proj          = create_tensor(tn(LLM_TENSOR_NEXTN_EH_PROJ, "weight", i), { 2 * n_embd, n_embd }, flags);
             layer.nextn.enorm            = create_tensor(tn(LLM_TENSOR_NEXTN_ENORM, "weight", i), { n_embd }, flags);

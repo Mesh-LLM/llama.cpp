@@ -704,8 +704,9 @@ llama_model_deepseek2::graph_mtp::graph_mtp(const llama_model & model, const llm
     cb(cur, "mtp_head_norm", -1);
 
     ggml_tensor * head_w = layer.nextn.shared_head_head ? layer.nextn.shared_head_head : model.output;
+    ggml_tensor * head_s = layer.nextn.shared_head_head ? layer.nextn.shared_head_head_s : model.output_s;
     GGML_ASSERT(head_w && "DEEPSEEK2 MTP: missing LM head (nextn.shared_head_head or model.output)");
-    cur = build_lora_mm(head_w, cur, layer.nextn.shared_head_head_s);
+    cur = build_lora_mm(head_w, cur, head_s);
     cb(cur, "result_output", -1);
 
     res->t_logits = cur;
