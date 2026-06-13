@@ -202,6 +202,11 @@ def main() -> None:
         "auto": gguf.LlamaFileType.GUESSED,
     }
 
+    is_split = args.split_max_tensors > 0 or args.split_max_size != "0"
+    if is_split and not args.use_temp_file:
+        logger.info("Split output requested; using a temporary tensor spool to avoid retaining all tensors in memory")
+        args.use_temp_file = True
+
     if args.outfile is not None:
         fname_out = args.outfile
     elif hf_repo_id:
