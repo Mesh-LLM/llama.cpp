@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gc
 import re
 
 from typing import Any, Callable, Iterable, TYPE_CHECKING
@@ -12,6 +13,11 @@ if TYPE_CHECKING:
 from .base import MmprojModel, ModelBase, TensorPlan, TextModel, _memory_profile, gguf, logger
 
 from .qwen import QwenModel
+
+
+def _discard_lazy_eager(value: Any) -> None:
+    if isinstance(value, gguf.LazyBase):
+        value._data = None
 
 
 @ModelBase.register("DeepseekOCRForCausalLM")
@@ -479,7 +485,13 @@ class DeepseekV2Model(TextModel):
                     data_shape=raw.shape,
                     data_nbytes=raw.nbytes,
                 )
-                yield raw
+                try:
+                    yield raw
+                finally:
+                    _discard_lazy_eager(raw)
+                    _discard_lazy_eager(data)
+                    if xid % 16 == 15:
+                        gc.collect()
 
         self.gguf_writer.add_tensor_from_chunks(
             new_name,
