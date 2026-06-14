@@ -2983,7 +2983,17 @@ class LazyTorchTensor(gguf.LazyBase):
                 return tensor
             dtype = cls._dtype_str_map[tensor.dtype]
             numpy_dtype = cls._dtype_byteswap_map[dtype]
-            return torch.from_numpy(byteswap_tensor(tensor.mmap_bytes(), numpy_dtype)).view(dtype).reshape(tensor.shape)
+            io_mode = os.environ.get("LLAMA_CONVERT_LOCAL_SAFETENSORS_IO", "mmap").lower()
+            if io_mode == "mmap":
+                tensor_bytes = tensor.mmap_bytes()
+            elif io_mode == "read":
+                tensor_bytes = tensor.read_bytes()
+            else:
+                raise ValueError(
+                    "LLAMA_CONVERT_LOCAL_SAFETENSORS_IO must be either 'mmap' or 'read', "
+                    f"got {io_mode!r}"
+                )
+            return torch.from_numpy(byteswap_tensor(tensor_bytes, numpy_dtype)).view(dtype).reshape(tensor.shape)
         dtype = cls._dtype_str_map[t.dtype]
         shape = t.shape
         lazy = cls(meta=cls.meta_with_dtype_and_shape(dtype, shape), args=(t,), func=lambda r: load_tensor(r))

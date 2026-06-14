@@ -4,9 +4,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
+import logging
 import os
 import json
+import time
 import numpy as np
+
+logger = logging.getLogger(__name__)
 
 
 def fill_templated_filename(filename: str, output_type: str | None) -> str:
@@ -339,7 +343,73 @@ class LocalTensor:
     data_range: LocalTensorRange
 
     def mmap_bytes(self) -> np.ndarray:
-        return np.memmap(self.data_range.filename, mode='c', offset=self.data_range.offset, shape=self.data_range.size)
+        started_at = time.time()
+        logger.info(
+            "local_safetensors_mmap_start file=%s offset=%d size=%d",
+            self.data_range.filename,
+            self.data_range.offset,
+            self.data_range.size,
+        )
+        data = np.memmap(
+            self.data_range.filename,
+            mode='c',
+            offset=self.data_range.offset,
+            shape=self.data_range.size,
+        )
+        logger.info(
+            "local_safetensors_mmap_done file=%s offset=%d size=%d elapsed_seconds=%.3f",
+            self.data_range.filename,
+            self.data_range.offset,
+            self.data_range.size,
+            time.time() - started_at,
+        )
+        return data
+
+    def read_bytes(self) -> np.ndarray:
+        read_size = int(os.environ.get("LLAMA_CONVERT_LOCAL_SAFETENSORS_READ_BYTES", str(64 * 1024 * 1024)))
+        if read_size <= 0:
+            raise ValueError("LLAMA_CONVERT_LOCAL_SAFETENSORS_READ_BYTES must be greater than zero")
+
+        started_at = time.time()
+        logger.info(
+            "local_safetensors_read_start file=%s offset=%d size=%d read_size=%d",
+            self.data_range.filename,
+            self.data_range.offset,
+            self.data_range.size,
+            read_size,
+        )
+        data = bytearray(self.data_range.size)
+        view = memoryview(data)
+        pos = 0
+        fd = os.open(self.data_range.filename, os.O_RDONLY)
+        try:
+            while pos < self.data_range.size:
+                chunk = os.pread(
+                    fd,
+                    min(read_size, self.data_range.size - pos),
+                    self.data_range.offset + pos,
+                )
+                if len(chunk) == 0:
+                    raise EOFError(
+                        f"short read from {self.data_range.filename}: "
+                        f"got {pos} of {self.data_range.size} bytes"
+                    )
+                view[pos:pos + len(chunk)] = chunk
+                pos += len(chunk)
+        finally:
+            os.close(fd)
+
+        elapsed = time.time() - started_at
+        mib_per_s = (self.data_range.size / (1024 * 1024)) / elapsed if elapsed > 0 else 0.0
+        logger.info(
+            "local_safetensors_read_done file=%s offset=%d size=%d elapsed_seconds=%.3f throughput_mib_s=%.1f",
+            self.data_range.filename,
+            self.data_range.offset,
+            self.data_range.size,
+            elapsed,
+            mib_per_s,
+        )
+        return np.frombuffer(data, dtype=np.uint8)
 
 
 class SafetensorsLocal:
