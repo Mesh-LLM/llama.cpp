@@ -980,8 +980,7 @@ class ModelBase:
             max_shard_no = max(max_shard_no, shard_idx + 1)
 
         if max_shard_no < self.skip_output_shards_before:
-            _memory_profile("resume_skip_source_tensor", name=name, shard_no=max_shard_no)
-            logger.info(
+            logger.debug(
                 "resume-skip-source: %s planned through shard %05d before resume shard %05d",
                 name,
                 max_shard_no,

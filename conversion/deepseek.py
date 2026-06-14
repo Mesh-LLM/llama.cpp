@@ -257,8 +257,7 @@ class DeepseekV2Model(TextModel):
         if self.merge_expert and name.find("mlp.experts") != -1:
             assert bid is not None
             if bid in self._resume_skipped_expert_layers:
-                _memory_profile("resume_skip_expert_source_tensor", name=name, bid=bid)
-                logger.info("resume-skip-expert-source: %s already covered by layer %d plan", name, bid)
+                logger.debug("resume-skip-expert-source: %s already covered by layer %d plan", name, bid)
                 return True
 
             if bid not in self._resume_checked_expert_layers:
