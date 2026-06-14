@@ -396,6 +396,15 @@ class LocalTensor:
                     )
                 view[pos:pos + len(chunk)] = chunk
                 pos += len(chunk)
+            try:
+                os.posix_fadvise(
+                    fd,
+                    self.data_range.offset,
+                    self.data_range.size,
+                    os.POSIX_FADV_DONTNEED,
+                )
+            except (AttributeError, OSError):
+                pass
         finally:
             os.close(fd)
 

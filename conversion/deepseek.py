@@ -18,6 +18,7 @@ from .qwen import QwenModel
 def _discard_lazy_eager(value: Any) -> None:
     if isinstance(value, gguf.LazyBase):
         value._data = None
+        value._args = ()
 
 
 @ModelBase.register("DeepseekOCRForCausalLM")
