@@ -11,6 +11,7 @@ import os
 import re
 import resource
 import sys
+import time
 from dataclasses import dataclass
 from enum import IntEnum
 from pathlib import Path
@@ -277,20 +278,34 @@ class ModelBase:
             is_safetensors = True
 
             logger.info(f"Using remote model with HuggingFace id: {remote_hf_model_id}")
+            started_at = time.time()
+            logger.info("gguf: indexing remote safetensors metadata")
             remote_tensors = gguf.utility.SafetensorRemote.get_list_tensors_hf_model(remote_hf_model_id)
             for name, remote_tensor in remote_tensors.items():
                 data_gen = lambda r=remote_tensor: LazyTorchTensor.from_remote_tensor(r)  # noqa: E731
                 if titem := self.filter_tensors((name, data_gen)):
                     tname, tgen = titem
                     tensors[tname] = tgen
+            logger.info(
+                "gguf: indexed remote safetensors metadata: tensors=%d elapsed=%.1fs",
+                len(tensors),
+                time.time() - started_at,
+            )
 
             return tensors
 
+        started_at = time.time()
+        logger.info("gguf: indexing local model tensors from '%s'", self.dir_model)
         prefix = "model" if not self.is_mistral_format else "consolidated"
         part_names: list[str] = ModelBase.get_model_part_names(self.dir_model, prefix, ".safetensors")
         is_safetensors: bool = len(part_names) > 0
         if not is_safetensors:
             part_names = ModelBase.get_model_part_names(self.dir_model, "pytorch_model", ".bin")
+        logger.info(
+            "gguf: discovered local model parts: count=%d safetensors=%s",
+            len(part_names),
+            is_safetensors,
+        )
 
         tensor_names_from_index: set[str] = set()
         tensor_names_from_parts: set[str] = set()
@@ -358,6 +373,12 @@ class ModelBase:
                     raise ValueError("Mismatch between weight map and model parts for tensor names:\n"
                                      f"Missing tensors: {missing}\n"
                                      f"Extra tensors: {extra}")
+
+        logger.info(
+            "gguf: indexed local model tensors: tensors=%d elapsed=%.1fs",
+            len(tensors),
+            time.time() - started_at,
+        )
 
         return tensors
 

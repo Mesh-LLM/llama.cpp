@@ -119,11 +119,24 @@ class SafetensorRemote:
         Returns a dictionary of tensor names and their metadata.
         Each tensor is represented as a tuple of (dtype, shape, offset_start, size, remote_safetensor_url)
         """
+        import sys
+        import time
+
+        started_at = time.time()
+        print(f"remote_safetensors_index_start model_id={model_id}", file=sys.stderr, flush=True)
         # case 1: model has only one single model.safetensor file
         is_single_file = cls.check_file_exist(f"{cls.BASE_DOMAIN}/{model_id}/resolve/main/model.safetensors")
         if is_single_file:
             url = f"{cls.BASE_DOMAIN}/{model_id}/resolve/main/model.safetensors"
-            return cls.get_list_tensors(url)
+            tensors = cls.get_list_tensors(url)
+            print(
+                "remote_safetensors_index_done "
+                f"model_id={model_id} file_count=1 tensor_count={len(tensors)} "
+                f"elapsed_seconds={time.time() - started_at:.1f}",
+                file=sys.stderr,
+                flush=True,
+            )
+            return tensors
 
         # case 2: model has multiple files
         index_url = f"{cls.BASE_DOMAIN}/{model_id}/resolve/main/model.safetensors.index.json"
@@ -140,10 +153,32 @@ class SafetensorRemote:
             all_files.sort() # make sure we load shard files in order
             # get the list of tensors
             tensors: dict[str, RemoteTensor] = {}
-            for file in all_files:
+            for index, file in enumerate(all_files, start=1):
+                shard_started_at = time.time()
+                print(
+                    "remote_safetensors_metadata_start "
+                    f"file_index={index} file_count={len(all_files)} file={file}",
+                    file=sys.stderr,
+                    flush=True,
+                )
                 url = f"{cls.BASE_DOMAIN}/{model_id}/resolve/main/{file}"
-                for key, val in cls.get_list_tensors(url).items():
+                shard_tensors = cls.get_list_tensors(url)
+                for key, val in shard_tensors.items():
                     tensors[key] = val
+                print(
+                    "remote_safetensors_metadata_done "
+                    f"file_index={index} file_count={len(all_files)} file={file} "
+                    f"tensor_count={len(shard_tensors)} elapsed_seconds={time.time() - shard_started_at:.1f}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            print(
+                "remote_safetensors_index_done "
+                f"model_id={model_id} file_count={len(all_files)} tensor_count={len(tensors)} "
+                f"elapsed_seconds={time.time() - started_at:.1f}",
+                file=sys.stderr,
+                flush=True,
+            )
             return tensors
 
         raise ValueError(
@@ -275,7 +310,7 @@ class SafetensorRemote:
         try:
             headers = cls._get_request_headers()
             headers["Range"] = "bytes=0-0"
-            response = requests.head(url, allow_redirects=True, headers=headers)
+            response = requests.head(url, allow_redirects=True, headers=headers, timeout=30)
             # Success (2xx) or redirect (3xx)
             return 200 <= response.status_code < 400
         except requests.RequestException:
