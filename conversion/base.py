@@ -198,7 +198,8 @@ class ModelBase:
                  sentence_transformers_dense_modules: bool = False,
                  fuse_gate_up_exps: bool = False,
                  fp8_as_q8: bool = False,
-                 skip_output_shards_before: int = 1):
+                 skip_output_shards_before: int = 1,
+                 stop_output_shards_after: int = 0):
         if type(self) is ModelBase or \
                 type(self) is TextModel or \
                 type(self) is MmprojModel:
@@ -214,6 +215,7 @@ class ModelBase:
         self.endianess = gguf.GGUFEndian.BIG if is_big_endian else gguf.GGUFEndian.LITTLE
         self.use_temp_file = use_temp_file
         self.skip_output_shards_before = max(skip_output_shards_before, 1)
+        self.stop_output_shards_after = max(stop_output_shards_after, 0)
         self.lazy = not eager or (remote_hf_model_id is not None)
         self.dry_run = dry_run
         self.remote_hf_model_id = remote_hf_model_id
@@ -223,11 +225,12 @@ class ModelBase:
         self._up_exp_buffer: dict[int, Tensor] = {}
         init_started_at = time.time()
         logger.info(
-            "modelbase_init_start class=%s dir_model=%s remote=%s skip_output_shards_before=%d",
+            "modelbase_init_start class=%s dir_model=%s remote=%s skip_output_shards_before=%d stop_output_shards_after=%d",
             type(self).__name__,
             self.dir_model,
             remote_hf_model_id is not None,
             self.skip_output_shards_before,
+            self.stop_output_shards_after,
         )
         hparams_started_at = time.time()
         logger.info("modelbase_init_load_hparams_start class=%s", type(self).__name__)
@@ -277,6 +280,10 @@ class ModelBase:
         # Configure GGUF Writer
         writer_started_at = time.time()
         logger.info("modelbase_init_writer_start class=%s", type(self).__name__)
+        if self.skip_output_shards_before > 1:
+            os.environ["GGUF_WRITER_OUTPUT_SHARD_MIN"] = str(self.skip_output_shards_before)
+        if self.stop_output_shards_after > 0:
+            os.environ["GGUF_WRITER_OUTPUT_SHARD_MAX"] = str(self.stop_output_shards_after)
         self.gguf_writer = gguf.GGUFWriter(path=None, arch=gguf.MODEL_ARCH_NAMES[self.model_arch], endianess=self.endianess, use_temp_file=self.use_temp_file,
                                            split_max_tensors=split_max_tensors, split_max_size=split_max_size, dry_run=dry_run, small_first_shard=small_first_shard)
         logger.info(
@@ -951,22 +958,26 @@ class ModelBase:
         return (TensorPlan(new_name, shape, data_torch.dtype, qtype),)
 
     def _skip_source_tensor_if_resumed(self, name: str, data_torch: Tensor, bid: int | None) -> bool:
-        if self.skip_output_shards_before <= 1:
+        if self.skip_output_shards_before <= 1 and self.stop_output_shards_after <= 0:
             return False
 
         plans = self.plan_tensor_outputs(name, data_torch, bid)
         if plans is None:
             return False
 
-        return self._skip_planned_source_if_resumed(name, plans)
+        return self._skip_planned_source_outside_window(name, plans)
 
     def _skip_planned_source_if_resumed(self, name: str, plans: Iterable[TensorPlan]) -> bool:
+        return self._skip_planned_source_outside_window(name, plans)
+
+    def _skip_planned_source_outside_window(self, name: str, plans: Iterable[TensorPlan]) -> bool:
         plan_list = list(plans)
         if len(plan_list) == 0:
             return False
 
         added: list[tuple[str, int]] = []
         max_shard_no = 0
+        min_shard_no = 0
         for plan in plan_list:
             tensor_shape, tensor_dtype, tensor_nbytes, raw_dtype = self._planned_tensor_storage_from_plan(plan)
             shard_idx = self.gguf_writer.add_tensor_info_only(
@@ -977,7 +988,9 @@ class ModelBase:
                 raw_dtype=raw_dtype,
             )
             added.append((plan.name, shard_idx))
-            max_shard_no = max(max_shard_no, shard_idx + 1)
+            shard_no = shard_idx + 1
+            max_shard_no = max(max_shard_no, shard_no)
+            min_shard_no = shard_no if min_shard_no == 0 else min(min_shard_no, shard_no)
 
         if max_shard_no < self.skip_output_shards_before:
             logger.debug(
@@ -985,6 +998,14 @@ class ModelBase:
                 name,
                 max_shard_no,
                 self.skip_output_shards_before,
+            )
+            return True
+        if self.stop_output_shards_after > 0 and min_shard_no > self.stop_output_shards_after:
+            logger.debug(
+                "window-skip-source: %s planned from shard %05d after stop shard %05d",
+                name,
+                min_shard_no,
+                self.stop_output_shards_after,
             )
             return True
 
@@ -998,7 +1019,7 @@ class ModelBase:
         data_torch: Tensor,
         data_qtype: gguf.GGMLQuantizationType,
     ) -> bool:
-        if self.skip_output_shards_before <= 1:
+        if self.skip_output_shards_before <= 1 and self.stop_output_shards_after <= 0:
             return False
 
         tensor_shape, tensor_dtype, tensor_nbytes, raw_dtype = self._planned_tensor_storage(data_torch, data_qtype)
@@ -1028,6 +1049,52 @@ class ModelBase:
             self.skip_output_shards_before,
         )
         return True
+
+    def _skip_planned_tensor_outside_window(
+        self,
+        new_name: str,
+        data_torch: Tensor,
+        data_qtype: gguf.GGMLQuantizationType,
+    ) -> bool:
+        if self.skip_output_shards_before <= 1 and self.stop_output_shards_after <= 0:
+            return False
+
+        tensor_shape, tensor_dtype, tensor_nbytes, raw_dtype = self._planned_tensor_storage(data_torch, data_qtype)
+        shard_idx = self.gguf_writer.add_tensor_info_only(
+            new_name,
+            tensor_shape,
+            tensor_dtype,
+            tensor_nbytes,
+            raw_dtype=raw_dtype,
+        )
+        shard_no = shard_idx + 1
+        if shard_no < self.skip_output_shards_before:
+            _memory_profile(
+                "resume_skip_tensor",
+                new_name=new_name,
+                shard_no=shard_no,
+                qtype=data_qtype.name,
+                tensor_nbytes=tensor_nbytes,
+            )
+            logger.info(
+                "resume-skip: %s planned in shard %05d before resume shard %05d",
+                new_name,
+                shard_no,
+                self.skip_output_shards_before,
+            )
+            return True
+
+        if self.stop_output_shards_after > 0 and shard_no > self.stop_output_shards_after:
+            logger.debug(
+                "window-skip: %s planned in shard %05d after stop shard %05d",
+                new_name,
+                shard_no,
+                self.stop_output_shards_after,
+            )
+            return True
+
+        self.gguf_writer.remove_tensor_info(new_name, shard_idx)
+        return False
 
     @staticmethod
     def _bf16_tensor_to_gguf_bytes(data_torch: Tensor) -> np.ndarray:
@@ -1298,7 +1365,7 @@ class ModelBase:
                     source_dtype=data_torch.dtype,
                 )
 
-                if self._skip_planned_tensor_if_resumed(new_name, data_torch, data_qtype):
+                if self._skip_planned_tensor_outside_window(new_name, data_torch, data_qtype):
                     continue
 
                 if self._can_write_bf16_raw(data_torch, data_qtype):

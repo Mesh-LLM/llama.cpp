@@ -127,6 +127,10 @@ def parse_args() -> argparse.Namespace:
         help="metadata-plan but do not materialize tensors assigned to output shards before this 1-based shard number",
     )
     parser.add_argument(
+        "--stop-output-shards-after", type=int, default=0,
+        help="metadata-plan but do not materialize tensors assigned to output shards after this 1-based shard number",
+    )
+    parser.add_argument(
         "--dry-run", action="store_true",
         help="only print out a split plan and exit, without writing any new files",
     )
@@ -311,6 +315,7 @@ def main() -> None:
             remote_hf_model_id=hf_repo_id,
             split_max_size=args.split_max_size,
             skip_output_shards_before=args.skip_output_shards_before,
+            stop_output_shards_after=args.stop_output_shards_after,
         )
         model_instance = model_class(dir_model, output_type, fname_out,
                                      is_big_endian=args.bigendian, use_temp_file=args.use_temp_file,
@@ -324,6 +329,7 @@ def main() -> None:
                                      fuse_gate_up_exps=args.fuse_gate_up_exps,
                                      fp8_as_q8=args.fp8_as_q8,
                                      skip_output_shards_before=args.skip_output_shards_before,
+                                     stop_output_shards_after=args.stop_output_shards_after,
                                      )
         _log_phase_done("model_init", phase_started_at, model_class=model_class.__name__)
 

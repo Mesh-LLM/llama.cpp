@@ -258,7 +258,7 @@ class DeepseekV2Model(TextModel):
             yield TensorPlan(new_name, shape, torch_dtype, qtype)
 
     def _skip_source_tensor_if_resumed(self, name: str, data_torch: Tensor, bid: int | None) -> bool:
-        if self.skip_output_shards_before <= 1:
+        if self.skip_output_shards_before <= 1 and self.stop_output_shards_after <= 0:
             return False
 
         if self.merge_expert and name.find("mlp.experts") != -1:
@@ -270,7 +270,7 @@ class DeepseekV2Model(TextModel):
             if bid not in self._resume_checked_expert_layers:
                 self._resume_checked_expert_layers.add(bid)
                 plans = self._merged_expert_plans(bid, data_torch.dtype)
-                if self._skip_planned_source_if_resumed(name, plans):
+                if self._skip_planned_source_outside_window(name, plans):
                     self._resume_skipped_expert_layers.add(bid)
                     return True
 
@@ -453,6 +453,10 @@ class DeepseekV2Model(TextModel):
             return False
 
         logical_shape = (len(datas), *tuple(datas[0].shape))
+        plan = TensorPlan(new_name, logical_shape, datas[0].dtype, data_qtype)
+        if self._skip_planned_source_outside_window(merged_name, (plan,)):
+            return True
+
         raw_shape = gguf.quant_shape_to_byte_shape(logical_shape, gguf.GGMLQuantizationType.BF16)
         tensor_nbytes = sum(data.element_size() * data.nelement() for data in datas)
 

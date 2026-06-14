@@ -128,7 +128,7 @@ class WriterState(Enum):
 
 
 class GGUFWriter:
-    fout: list[BufferedWriter] | None
+    fout: list[BufferedWriter | None] | None
     path: Path | None
     temp_file: IO[bytes] | None
     temp_files: list[IO[bytes] | None]
@@ -169,6 +169,8 @@ class GGUFWriter:
         self.kv_data = [{}]
         self.split_max_tensors = split_max_tensors
         self.split_max_size = split_max_size
+        self.output_shard_min = int(os.environ.get("GGUF_WRITER_OUTPUT_SHARD_MIN", "0"))
+        self.output_shard_max = int(os.environ.get("GGUF_WRITER_OUTPUT_SHARD_MAX", "0"))
         self.dry_run = dry_run
         self.small_first_shard = small_first_shard
         logger.info("gguf: This GGUF file is for {0} Endian only".format(
@@ -356,9 +358,18 @@ class GGUFWriter:
 
         if self.path is not None:
             filenames = self.print_plan()
-            self.fout = [open(filename, "wb") for filename in filenames]
+            self.fout = [
+                open(filename, "wb") if self._should_materialize_shard(i) else None
+                for i, filename in enumerate(filenames)
+            ]
             self.output_file_advise_offsets = [0 for _ in filenames]
             self.state = WriterState.EMPTY
+
+    def _should_materialize_shard(self, shard_idx: int) -> bool:
+        shard_no = shard_idx + 1
+        if self.output_shard_min > 0 and shard_no < self.output_shard_min:
+            return False
+        return not (self.output_shard_max > 0 and shard_no > self.output_shard_max)
 
     def print_plan(self) -> list[Path]:
         logger.info("Writing the following files:")
@@ -405,6 +416,8 @@ class GGUFWriter:
         self.add_shard_kv_data()
 
         for file_id, (fout, tensors, kv_data) in enumerate(zip(self.fout, self.tensors, self.kv_data)):
+            if fout is None:
+                continue
             fout.write(self._pack("<I", GGUF_MAGIC, skip_pack_prefix = True))
             fout.write(self._pack("I", GGUF_VERSION))
             fout.write(self._pack("Q", len(tensors)))
@@ -419,6 +432,8 @@ class GGUFWriter:
         assert self.fout is not None
 
         for file_id, (fout, kv_data) in enumerate(zip(self.fout, self.kv_data)):
+            if fout is None:
+                continue
             kv_bytes = bytearray()
 
             for key, val in kv_data.items():
@@ -437,6 +452,8 @@ class GGUFWriter:
         assert self.fout is not None
 
         for file_id, (fout, tensors) in enumerate(zip(self.fout, self.tensors)):
+            if fout is None:
+                continue
             ti_data = bytearray()
             offset_tensor = 0
 
@@ -711,6 +728,8 @@ class GGUFWriter:
                 break
 
         fout = self.fout[file_id]
+        if fout is None:
+            raise ValueError(f"Output shard {file_id + 1} is outside the materialized shard window")
 
         # pop the first tensor info
         first_tensor_name = next(iter(self.tensors[file_id]))
@@ -733,6 +752,8 @@ class GGUFWriter:
         assert self.fout is not None
 
         for fout in self.fout:
+            if fout is None:
+                continue
             self.write_padding(fout, fout.tell())
 
         if not self.use_temp_file:
@@ -749,6 +770,8 @@ class GGUFWriter:
                 bar = tqdm(desc="Writing", total=total_bytes, unit="byte", unit_scale=True)
 
             for i, (fout, tensors) in enumerate(zip(self.fout, self.tensors)):
+                if fout is None:
+                    continue
                 if shard_bar is not None:
                     shard_bar.set_description(f"Shard ({i + 1}/{len(self.fout)})")
                     total = sum(ti.nbytes for ti in tensors.values())
@@ -771,7 +794,7 @@ class GGUFWriter:
                     ti.tensor = None
         else:
             for shard_idx, (temp_file, fout) in enumerate(zip(self.temp_files, self.fout)):
-                if temp_file is None:
+                if temp_file is None or fout is None:
                     continue
 
                 self._drop_temp_file_cache(temp_file, shard_idx, force=True)
@@ -788,12 +811,16 @@ class GGUFWriter:
     def flush(self) -> None:
         assert self.fout is not None
         for file_id, fout in enumerate(self.fout):
+            if fout is None:
+                continue
             fout.flush()
             self._drop_output_file_cache(fout, file_id)
 
     def close(self) -> None:
         if self.fout is not None:
             for file_id, fout in enumerate(self.fout):
+                if fout is None:
+                    continue
                 self._drop_output_file_cache(fout, file_id, force=True)
                 fout.close()
             self.fout = None
