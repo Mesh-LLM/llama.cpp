@@ -221,8 +221,32 @@ class ModelBase:
         self.fuse_gate_up_exps = fuse_gate_up_exps
         self._gate_exp_buffer: dict[int, Tensor] = {}
         self._up_exp_buffer: dict[int, Tensor] = {}
+        init_started_at = time.time()
+        logger.info(
+            "modelbase_init_start class=%s dir_model=%s remote=%s skip_output_shards_before=%d",
+            type(self).__name__,
+            self.dir_model,
+            remote_hf_model_id is not None,
+            self.skip_output_shards_before,
+        )
+        hparams_started_at = time.time()
+        logger.info("modelbase_init_load_hparams_start class=%s", type(self).__name__)
         self.hparams = ModelBase.load_hparams(self.dir_model, self.is_mistral_format) if hparams is None else hparams
+        logger.info(
+            "modelbase_init_load_hparams_done class=%s keys=%d elapsed=%.3fs",
+            type(self).__name__,
+            len(self.hparams),
+            time.time() - hparams_started_at,
+        )
+        index_started_at = time.time()
+        logger.info("modelbase_init_index_tensors_start class=%s", type(self).__name__)
         self.model_tensors = self.index_tensors(remote_hf_model_id=remote_hf_model_id)
+        logger.info(
+            "modelbase_init_index_tensors_done class=%s tensors=%d elapsed=%.3fs",
+            type(self).__name__,
+            len(self.model_tensors),
+            time.time() - index_started_at,
+        )
         self.metadata_override = metadata_override
         self.model_name = model_name
         self.dir_model_card = dir_model  # overridden in convert_lora_to_gguf.py
@@ -251,11 +275,23 @@ class ModelBase:
                 logger.info("heuristics unable to detect tensor dtype, defaulting to --outtype f16")
 
         # Configure GGUF Writer
+        writer_started_at = time.time()
+        logger.info("modelbase_init_writer_start class=%s", type(self).__name__)
         self.gguf_writer = gguf.GGUFWriter(path=None, arch=gguf.MODEL_ARCH_NAMES[self.model_arch], endianess=self.endianess, use_temp_file=self.use_temp_file,
                                            split_max_tensors=split_max_tensors, split_max_size=split_max_size, dry_run=dry_run, small_first_shard=small_first_shard)
+        logger.info(
+            "modelbase_init_writer_done class=%s elapsed=%.3fs",
+            type(self).__name__,
+            time.time() - writer_started_at,
+        )
 
         # Mistral specific
         self.disable_mistral_community_chat_template = disable_mistral_community_chat_template
+        logger.info(
+            "modelbase_init_done class=%s elapsed=%.3fs",
+            type(self).__name__,
+            time.time() - init_started_at,
+        )
 
     @classmethod
     def add_prefix_to_filename(cls, path: Path, prefix: str) -> Path:

@@ -4,9 +4,11 @@
 from __future__ import annotations
 
 import argparse
+import faulthandler
 import logging
 import os
 import sys
+import time
 from pathlib import Path
 
 import torch
@@ -25,6 +27,33 @@ from conversion import (
     _mistral_common_installed,
     _mistral_import_error_msg,
 )
+
+
+def _enable_traceback_watchdog() -> None:
+    raw = os.environ.get("CONVERT_TRACEBACK_SECONDS", "0")
+    try:
+        seconds = int(raw)
+    except ValueError:
+        seconds = 0
+    if seconds <= 0:
+        return
+    faulthandler.enable()
+    faulthandler.dump_traceback_later(seconds, repeat=True)
+    logger.info("convert_phase=traceback_watchdog_enabled seconds=%d", seconds)
+
+
+def _log_phase(phase: str, **fields: object) -> float:
+    if fields:
+        suffix = " " + " ".join(f"{key}={value}" for key, value in fields.items())
+    else:
+        suffix = ""
+    logger.info("convert_phase=%s%s", phase, suffix)
+    return time.time()
+
+
+def _log_phase_done(phase: str, started_at: float, **fields: object) -> None:
+    fields = {"elapsed_seconds": f"{time.time() - started_at:.3f}", **fields}
+    _log_phase(f"{phase}_done", **fields)
 
 
 def split_str_to_n_bytes(split_str: str) -> int:
@@ -176,6 +205,9 @@ def main() -> None:
     else:
         logging.basicConfig(level=logging.INFO)
 
+    _enable_traceback_watchdog()
+    _log_phase("start", model=args.model, remote=args.remote, outfile=args.outfile)
+
     if args.remote:
         hf_repo_id = args.model
         from huggingface_hub import snapshot_download
@@ -183,14 +215,17 @@ def main() -> None:
         if args.sentence_transformers_dense_modules:
             # include sentence-transformers dense modules safetensors files
             allowed_patterns.append("*.safetensors")
+        phase_started_at = _log_phase("snapshot_download_start", repo_id=hf_repo_id, allowed_patterns=",".join(allowed_patterns))
         local_dir = snapshot_download(
             repo_id=hf_repo_id,
             allow_patterns=allowed_patterns)
+        _log_phase_done("snapshot_download", phase_started_at, local_dir=local_dir)
         dir_model = Path(local_dir)
         logger.info(f"Downloaded config and tokenizer to {local_dir}")
     else:
         hf_repo_id = None
         dir_model = Path(args.model)
+        _log_phase("local_model_selected", dir_model=dir_model)
 
     if not dir_model.is_dir():
         logger.error(f'Error: {dir_model} is not a directory')
@@ -229,12 +264,18 @@ def main() -> None:
     with torch.inference_mode():
         output_type = ftype_map[args.outtype]
         model_type = ModelType.MMPROJ if args.mmproj else ModelType.TEXT
+        phase_started_at = _log_phase("load_hparams_start", dir_model=dir_model)
         hparams = ModelBase.load_hparams(dir_model, is_mistral_format)
+        _log_phase_done("load_hparams", phase_started_at, keys=len(hparams))
         if not is_mistral_format:
+            phase_started_at = _log_phase("architecture_detect_start", model_type=model_type.name)
             model_architecture = get_model_architecture(hparams, model_type)
+            _log_phase_done("architecture_detect", phase_started_at, architecture=model_architecture)
             logger.info(f"Model architecture: {model_architecture}")
             try:
+                phase_started_at = _log_phase("model_class_lookup_start", architecture=model_architecture)
                 model_class = get_model_class(model_architecture, mmproj=(model_type == ModelType.MMPROJ))
+                _log_phase_done("model_class_lookup", phase_started_at, model_class=model_class.__name__)
             except NotImplementedError:
                 logger.error(f"Model {model_architecture} is not supported")
                 sys.exit(1)
@@ -264,6 +305,13 @@ def main() -> None:
             if args.mtp:
                 model_class.mtp_only = True
 
+        phase_started_at = _log_phase(
+            "model_init_start",
+            model_class=model_class.__name__,
+            remote_hf_model_id=hf_repo_id,
+            split_max_size=args.split_max_size,
+            skip_output_shards_before=args.skip_output_shards_before,
+        )
         model_instance = model_class(dir_model, output_type, fname_out,
                                      is_big_endian=args.bigendian, use_temp_file=args.use_temp_file,
                                      eager=args.no_lazy,
@@ -277,14 +325,19 @@ def main() -> None:
                                      fp8_as_q8=args.fp8_as_q8,
                                      skip_output_shards_before=args.skip_output_shards_before,
                                      )
+        _log_phase_done("model_init", phase_started_at, model_class=model_class.__name__)
 
         if args.vocab_only:
+            phase_started_at = _log_phase("write_vocab_start")
             logger.info("Exporting model vocab...")
             model_instance.write_vocab()
+            _log_phase_done("write_vocab", phase_started_at)
             logger.info(f"Model vocab successfully exported to {model_instance.fname_out}")
         else:
+            phase_started_at = _log_phase("write_model_start")
             logger.info("Exporting model...")
             model_instance.write()
+            _log_phase_done("write_model", phase_started_at)
             is_split = len(model_instance.gguf_writer.tensors) > 1
             out_path = f"{model_instance.fname_out.parent}{os.sep}" if is_split else model_instance.fname_out
             logger.info(f"Model successfully exported to {out_path}")
