@@ -129,6 +129,29 @@ class TestWriterMemoryOptimizations(unittest.TestCase):
         self.assertIn("writer_temp_read_fadvise_done", events)
         self.assertIn("writer_output_fadvise_done", events)
 
+    def test_split_temp_file_writer_honors_temp_dir_env(self):
+        tensor = np.arange(8, dtype=np.float32)
+        opened_temp_dirs: list[str] = []
+
+        writer_module = importlib.import_module("gguf.gguf_writer")
+        original_temporary_file = writer_module.tempfile.TemporaryFile
+
+        def record_temporary_file(*args, **kwargs):
+            opened_temp_dirs.append(str(kwargs.get("dir")))
+            return original_temporary_file(*args, **kwargs)
+
+        with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as writer_tmp, patch.dict(
+            os.environ,
+            {"GGUF_WRITER_TEMP_DIR": writer_tmp},
+        ), patch.object(writer_module.tempfile, "TemporaryFile", record_temporary_file):
+            self._write_split_model(
+                Path(tmp) / "model.gguf",
+                {"tensor_a": tensor},
+                use_temp_file=True,
+            )
+
+        self.assertEqual(opened_temp_dirs, [writer_tmp])
+
     @staticmethod
     def _write_split_model(
         path: Path,
