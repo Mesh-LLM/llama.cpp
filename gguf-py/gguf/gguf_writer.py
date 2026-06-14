@@ -192,10 +192,24 @@ class GGUFWriter:
             temp_dir = os.environ.get("GGUF_WRITER_TEMP_DIR")
             if temp_dir:
                 Path(temp_dir).mkdir(parents=True, exist_ok=True)
-            fp = tempfile.TemporaryFile(mode="w+b", dir=temp_dir)
+            if _env_bool("GGUF_WRITER_NAMED_TEMP_FILES"):
+                fp = tempfile.NamedTemporaryFile(
+                    mode="w+b",
+                    dir=temp_dir,
+                    prefix=f"gguf-shard-{shard_idx + 1:05d}-",
+                    suffix=".tmp",
+                    delete=True,
+                )
+            else:
+                fp = tempfile.TemporaryFile(mode="w+b", dir=temp_dir)
             fp.seek(0)
             self.temp_files[shard_idx] = fp
-            _memory_profile("writer_temp_file_open", shard_idx=shard_idx, temp_dir=temp_dir or tempfile.gettempdir())
+            _memory_profile(
+                "writer_temp_file_open",
+                shard_idx=shard_idx,
+                temp_dir=temp_dir or tempfile.gettempdir(),
+                path=getattr(fp, "name", "unknown"),
+            )
             if self.temp_file is None:
                 self.temp_file = fp
 
