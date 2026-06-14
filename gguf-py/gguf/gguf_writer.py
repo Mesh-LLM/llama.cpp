@@ -358,10 +358,13 @@ class GGUFWriter:
 
         if self.path is not None:
             filenames = self.print_plan()
-            self.fout = [
-                open(filename, "wb") if self._should_materialize_shard(i) else None
-                for i, filename in enumerate(filenames)
-            ]
+            self.fout = []
+            for i, filename in enumerate(filenames):
+                if self._should_materialize_shard(i):
+                    filename.parent.mkdir(parents=True, exist_ok=True)
+                    self.fout.append(open(filename, "wb"))
+                else:
+                    self.fout.append(None)
             self.output_file_advise_offsets = [0 for _ in filenames]
             self.state = WriterState.EMPTY
 
