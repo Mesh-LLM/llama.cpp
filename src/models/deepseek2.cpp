@@ -439,14 +439,14 @@ llama_model_deepseek2::graph::graph(const llama_model & model, const llm_graph_p
     }
     cur = inpL;
 
+    cur = build_norm(cur, model.output_norm, NULL, LLM_NORM_RMS, -1);
+
     cb(cur, "h_nextn", -1);
     res->t_h_nextn = cur;
 
     if (!cparams.embeddings_nextn_masked && inp_out_ids) {
         cur = ggml_get_rows(ctx0, cur, inp_out_ids);
     }
-
-    cur = build_norm(cur, model.output_norm, NULL, LLM_NORM_RMS, -1);
 
     cb(cur, "result_norm", -1);
     res->t_embd = cur;
