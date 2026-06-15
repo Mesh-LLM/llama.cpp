@@ -1244,6 +1244,22 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
             n_split = std::max(uint16_t(it->idx + 1), n_split);
         }
     }
+
+    if (!params->keep_split && (params->first_split > 0 || params->last_split > 0)) {
+        throw std::runtime_error("--first-split and --last-split require --keep-split");
+    }
+
+    const uint16_t first_split = params->keep_split && params->first_split > 0 ? uint16_t(params->first_split - 1) : 0;
+    const uint16_t last_split  = params->keep_split && params->last_split  > 0 ? uint16_t(params->last_split  - 1) : uint16_t(n_split - 1);
+    if (first_split > last_split || last_split >= n_split) {
+        throw std::runtime_error(format("invalid split window: first=%d last=%d split_count=%d",
+                params->first_split, params->last_split, n_split));
+    }
+
+    auto split_in_window = [&](uint16_t split_idx) {
+        return !params->keep_split || (split_idx >= first_split && split_idx <= last_split);
+    };
+
     std::vector<gguf_context_ptr> ctx_outs(n_split);
     ctx_outs[0] = std::move(ctx_out);
 
@@ -1259,6 +1275,11 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
         const struct ggml_tensor * tensor = it->tensor;
 
         uint16_t i_split = params->keep_split ? it->idx : 0;
+        if (!split_in_window(i_split)) {
+            metadata[i].target_type = tensor->type;
+            continue;
+        }
+
         if (!ctx_outs[i_split]) {
             ctx_outs[i_split].reset(gguf_init_empty());
         }
@@ -1294,6 +1315,9 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
     // Set split info if needed
     if (n_split > 1) {
         for (size_t i = 0; i < ctx_outs.size(); ++i) {
+            if (!ctx_outs[i]) {
+                continue;
+            }
             gguf_set_val_u16(ctx_outs[i].get(), ml.llm_kv(LLM_KV_SPLIT_NO).c_str(), i);
             gguf_set_val_u16(ctx_outs[i].get(), ml.llm_kv(LLM_KV_SPLIT_COUNT).c_str(), n_split);
             gguf_set_val_i32(ctx_outs[i].get(), ml.llm_kv(LLM_KV_SPLIT_TENSORS_COUNT).c_str(), (int32_t)tensors.size());
@@ -1342,7 +1366,7 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
     };
 
     // no output file for --dry-run
-    if (!params->dry_run) {
+    if (!params->dry_run && !params->keep_split) {
         new_ofstream(0);
     }
 
@@ -1356,14 +1380,20 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
         const auto & weight = *tensors[i];
         const auto & tm = metadata[i];
         ggml_tensor * tensor = weight.tensor;
+        if (!split_in_window(params->keep_split ? weight.idx : 0)) {
+            continue;
+        }
+
         const size_t tensor_index = i + 1;
         const std::string tensor_name = ggml_get_name(tensor);
         const std::string tensor_shape = llama_format_tensor_shape(tensor);
         const ggml_type cur_type = tensor->type;
         const ggml_type new_type = tm.target_type;
 
-        if (!params->dry_run && (weight.idx != cur_split && params->keep_split)) {
-            close_ofstream();
+        if (!params->dry_run && params->keep_split && weight.idx != cur_split) {
+            if (cur_split >= 0) {
+                close_ofstream();
+            }
             new_ofstream(weight.idx);
         }
 
@@ -1814,7 +1844,9 @@ llama_model_quantize_params llama_model_quantize_default_params() {
         /*.imatrix                     =*/ nullptr,
         /*.kv_overrides                =*/ nullptr,
         /*.tensor_type                 =*/ nullptr,
-        /*.prune_layers                =*/ nullptr
+        /*.prune_layers                =*/ nullptr,
+        /*.first_split                 =*/ 0,
+        /*.last_split                  =*/ 0,
     };
 
     return result;
