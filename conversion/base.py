@@ -282,8 +282,12 @@ class ModelBase:
         logger.info("modelbase_init_writer_start class=%s", type(self).__name__)
         if self.skip_output_shards_before > 1:
             os.environ["GGUF_WRITER_OUTPUT_SHARD_MIN"] = str(self.skip_output_shards_before)
+        else:
+            os.environ.pop("GGUF_WRITER_OUTPUT_SHARD_MIN", None)
         if self.stop_output_shards_after > 0:
             os.environ["GGUF_WRITER_OUTPUT_SHARD_MAX"] = str(self.stop_output_shards_after)
+        else:
+            os.environ.pop("GGUF_WRITER_OUTPUT_SHARD_MAX", None)
         self.gguf_writer = gguf.GGUFWriter(path=None, arch=gguf.MODEL_ARCH_NAMES[self.model_arch], endianess=self.endianess, use_temp_file=self.use_temp_file,
                                            split_max_tensors=split_max_tensors, split_max_size=split_max_size, dry_run=dry_run, small_first_shard=small_first_shard)
         logger.info(

@@ -7,6 +7,7 @@ import argparse
 import faulthandler
 import logging
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -27,6 +28,8 @@ from conversion import (
     _mistral_common_installed,
     _mistral_import_error_msg,
 )
+
+SHARD_NAME_FORMAT = "{:s}-{:05d}-of-{:05d}.gguf"
 
 
 def _enable_traceback_watchdog() -> None:
@@ -72,6 +75,95 @@ def split_str_to_n_bytes(split_str: str) -> int:
         raise ValueError(f"Invalid split size: {split_str}, must be positive")
 
     return n
+
+
+def _hub_prefix(prefix: str) -> str:
+    prefix = prefix.strip("/")
+    return f"{prefix}/" if prefix else ""
+
+
+def _split_shard_paths(fname_out: Path, total_shards: int) -> list[Path]:
+    if total_shards <= 1:
+        return [fname_out]
+    return [
+        fname_out.with_name(SHARD_NAME_FORMAT.format(fname_out.stem, i + 1, total_shards))
+        for i in range(total_shards)
+    ]
+
+
+def _materialized_shard_paths(fname_out: Path, start_shard: int, stop_shard: int, total_shards: int) -> list[Path]:
+    paths = _split_shard_paths(fname_out, total_shards)
+    selected: list[Path] = []
+    for shard_no, path in enumerate(paths, start=1):
+        if shard_no < start_shard:
+            continue
+        if stop_shard > 0 and shard_no > stop_shard:
+            continue
+        if path.is_file():
+            selected.append(path)
+    return selected
+
+
+def _uploaded_split_shards(repo_id: str, prefix: str, fname_out: Path) -> tuple[set[int], int]:
+    from huggingface_hub import HfApi
+
+    repo_prefix = _hub_prefix(prefix)
+    escaped_stem = re.escape(fname_out.stem)
+    pattern = re.compile(rf"^{re.escape(repo_prefix)}{escaped_stem}-(\d{{5}})-of-(\d{{5}})\.gguf$")
+    uploaded: set[int] = set()
+    expected_total = 0
+    api = HfApi(token=os.environ.get("HF_TOKEN"))
+    try:
+        files = api.list_repo_files(repo_id=repo_id, repo_type="model")
+    except Exception as exc:
+        logger.warning("hub_resume_list_failed repo=%s reason=%s", repo_id, exc)
+        return uploaded, expected_total
+
+    for path in files:
+        match = pattern.match(path)
+        if match is None:
+            continue
+        uploaded.add(int(match.group(1)))
+        expected_total = max(expected_total, int(match.group(2)))
+    return uploaded, expected_total
+
+
+def _first_missing_shard(uploaded: set[int], expected_total: int) -> int:
+    if expected_total <= 0:
+        return 1
+    for shard_no in range(1, expected_total + 1):
+        if shard_no not in uploaded:
+            return shard_no
+    return expected_total + 1
+
+
+def _upload_materialized_shards(
+    *,
+    repo_id: str,
+    prefix: str,
+    paths: list[Path],
+    private: bool,
+    delete_uploaded: bool,
+) -> None:
+    from huggingface_hub import HfApi
+
+    api = HfApi(token=os.environ.get("HF_TOKEN"))
+    api.create_repo(repo_id=repo_id, repo_type="model", private=private, exist_ok=True)
+    repo_prefix = _hub_prefix(prefix)
+    for path in paths:
+        rel_path = f"{repo_prefix}{path.name}"
+        size = path.stat().st_size
+        logger.info("hub_shard_upload_start path=%s size_bytes=%d repo=%s", rel_path, size, repo_id)
+        api.upload_file(
+            path_or_fileobj=str(path),
+            path_in_repo=rel_path,
+            repo_id=repo_id,
+            repo_type="model",
+        )
+        logger.info("hub_shard_upload_done path=%s size_bytes=%d repo=%s", rel_path, size, repo_id)
+        if delete_uploaded:
+            path.unlink()
+            logger.info("hub_shard_delete_done path=%s size_bytes=%d", path, size)
 
 
 def parse_args() -> argparse.Namespace:
@@ -129,6 +221,30 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--stop-output-shards-after", type=int, default=0,
         help="metadata-plan but do not materialize tensors assigned to output shards after this 1-based shard number",
+    )
+    parser.add_argument(
+        "--materialize-output-shard-window-size", type=int, default=0,
+        help="materialize split output in repeated windows of this many shards; intended for upload/delete workflows that must bound local disk",
+    )
+    parser.add_argument(
+        "--upload-finalized-shards-to-repo", type=str, default="",
+        help="upload each materialized split GGUF shard to this Hugging Face model repo after its window completes",
+    )
+    parser.add_argument(
+        "--upload-finalized-shards-prefix", type=str, default="",
+        help="optional path prefix in the target Hugging Face repo for uploaded split GGUF shards",
+    )
+    parser.add_argument(
+        "--upload-finalized-shards-private", action="store_true",
+        help="create the target Hugging Face model repo as private if it does not already exist",
+    )
+    parser.add_argument(
+        "--resume-uploaded-shards", action="store_true",
+        help="when uploading split shards, inspect the target repo and resume from the first missing split shard",
+    )
+    parser.add_argument(
+        "--delete-uploaded-shards", action="store_true",
+        help="delete each local split GGUF shard after it uploads successfully",
     )
     parser.add_argument(
         "--dry-run", action="store_true",
@@ -309,44 +425,143 @@ def main() -> None:
             if args.mtp:
                 model_class.mtp_only = True
 
-        phase_started_at = _log_phase(
-            "model_init_start",
-            model_class=model_class.__name__,
-            remote_hf_model_id=hf_repo_id,
-            split_max_size=args.split_max_size,
-            skip_output_shards_before=args.skip_output_shards_before,
-            stop_output_shards_after=args.stop_output_shards_after,
-        )
-        model_instance = model_class(dir_model, output_type, fname_out,
-                                     is_big_endian=args.bigendian, use_temp_file=args.use_temp_file,
-                                     eager=args.no_lazy,
-                                     metadata_override=args.metadata, model_name=args.model_name,
-                                     split_max_tensors=args.split_max_tensors,
-                                     split_max_size=split_str_to_n_bytes(args.split_max_size), dry_run=args.dry_run,
-                                     small_first_shard=args.no_tensor_first_split,
-                                     remote_hf_model_id=hf_repo_id, disable_mistral_community_chat_template=disable_mistral_community_chat_template,
-                                     sentence_transformers_dense_modules=args.sentence_transformers_dense_modules,
-                                     fuse_gate_up_exps=args.fuse_gate_up_exps,
-                                     fp8_as_q8=args.fp8_as_q8,
-                                     skip_output_shards_before=args.skip_output_shards_before,
-                                     stop_output_shards_after=args.stop_output_shards_after,
-                                     )
-        _log_phase_done("model_init", phase_started_at, model_class=model_class.__name__)
+        def build_model_instance(skip_output_shards_before: int, stop_output_shards_after: int) -> ModelBase:
+            phase_started_at = _log_phase(
+                "model_init_start",
+                model_class=model_class.__name__,
+                remote_hf_model_id=hf_repo_id,
+                split_max_size=args.split_max_size,
+                skip_output_shards_before=skip_output_shards_before,
+                stop_output_shards_after=stop_output_shards_after,
+            )
+            model_instance = model_class(dir_model, output_type, fname_out,
+                                         is_big_endian=args.bigendian, use_temp_file=args.use_temp_file,
+                                         eager=args.no_lazy,
+                                         metadata_override=args.metadata, model_name=args.model_name,
+                                         split_max_tensors=args.split_max_tensors,
+                                         split_max_size=split_str_to_n_bytes(args.split_max_size), dry_run=args.dry_run,
+                                         small_first_shard=args.no_tensor_first_split,
+                                         remote_hf_model_id=hf_repo_id, disable_mistral_community_chat_template=disable_mistral_community_chat_template,
+                                         sentence_transformers_dense_modules=args.sentence_transformers_dense_modules,
+                                         fuse_gate_up_exps=args.fuse_gate_up_exps,
+                                         fp8_as_q8=args.fp8_as_q8,
+                                         skip_output_shards_before=skip_output_shards_before,
+                                         stop_output_shards_after=stop_output_shards_after,
+                                         )
+            _log_phase_done("model_init", phase_started_at, model_class=model_class.__name__)
+            return model_instance
+
+        def write_model_window(skip_output_shards_before: int, stop_output_shards_after: int) -> ModelBase:
+            model_instance = build_model_instance(skip_output_shards_before, stop_output_shards_after)
+            phase_started_at = _log_phase(
+                "write_model_start",
+                skip_output_shards_before=skip_output_shards_before,
+                stop_output_shards_after=stop_output_shards_after,
+            )
+            logger.info("Exporting model...")
+            model_instance.write()
+            _log_phase_done("write_model", phase_started_at)
+            is_split_output = len(model_instance.gguf_writer.tensors) > 1
+            out_path = f"{model_instance.fname_out.parent}{os.sep}" if is_split_output else model_instance.fname_out
+            logger.info(f"Model successfully exported to {out_path}")
+            return model_instance
 
         if args.vocab_only:
+            if args.materialize_output_shard_window_size > 0:
+                logger.error("--materialize-output-shard-window-size cannot be combined with --vocab-only")
+                sys.exit(1)
+            model_instance = build_model_instance(args.skip_output_shards_before, args.stop_output_shards_after)
             phase_started_at = _log_phase("write_vocab_start")
             logger.info("Exporting model vocab...")
             model_instance.write_vocab()
             _log_phase_done("write_vocab", phase_started_at)
             logger.info(f"Model vocab successfully exported to {model_instance.fname_out}")
-        else:
-            phase_started_at = _log_phase("write_model_start")
-            logger.info("Exporting model...")
-            model_instance.write()
-            _log_phase_done("write_model", phase_started_at)
-            is_split = len(model_instance.gguf_writer.tensors) > 1
-            out_path = f"{model_instance.fname_out.parent}{os.sep}" if is_split else model_instance.fname_out
-            logger.info(f"Model successfully exported to {out_path}")
+            return
+
+        if args.materialize_output_shard_window_size <= 0:
+            model_instance = write_model_window(args.skip_output_shards_before, args.stop_output_shards_after)
+            if args.upload_finalized_shards_to_repo:
+                total_shards = len(model_instance.gguf_writer.tensors)
+                paths = _materialized_shard_paths(
+                    model_instance.fname_out,
+                    args.skip_output_shards_before,
+                    args.stop_output_shards_after,
+                    total_shards,
+                )
+                _upload_materialized_shards(
+                    repo_id=args.upload_finalized_shards_to_repo,
+                    prefix=args.upload_finalized_shards_prefix,
+                    paths=paths,
+                    private=args.upload_finalized_shards_private,
+                    delete_uploaded=args.delete_uploaded_shards,
+                )
+            return
+
+        if args.materialize_output_shard_window_size < 1:
+            logger.error("--materialize-output-shard-window-size must be positive")
+            sys.exit(1)
+
+        start_shard = max(args.skip_output_shards_before, 1)
+        if args.resume_uploaded_shards and args.upload_finalized_shards_to_repo:
+            uploaded, expected_total = _uploaded_split_shards(
+                args.upload_finalized_shards_to_repo,
+                args.upload_finalized_shards_prefix,
+                fname_out,
+            )
+            first_missing = _first_missing_shard(uploaded, expected_total)
+            start_shard = max(start_shard, first_missing)
+            logger.info(
+                "hub_shard_resume repo=%s uploaded_count=%d expected_total=%d first_missing=%d start_shard=%d",
+                args.upload_finalized_shards_to_repo,
+                len(uploaded),
+                expected_total,
+                first_missing,
+                start_shard,
+            )
+
+        stop_limit = args.stop_output_shards_after
+        current_shard = start_shard
+        total_shards = 0
+        while True:
+            window_stop = current_shard + args.materialize_output_shard_window_size - 1
+            if stop_limit > 0:
+                window_stop = min(window_stop, stop_limit)
+            logger.info(
+                "materialize_output_shard_window_start start=%d stop=%d",
+                current_shard,
+                window_stop,
+            )
+            model_instance = write_model_window(current_shard, window_stop)
+            total_shards = len(model_instance.gguf_writer.tensors)
+            materialized = _materialized_shard_paths(
+                model_instance.fname_out,
+                current_shard,
+                window_stop,
+                total_shards,
+            )
+            logger.info(
+                "materialize_output_shard_window_done start=%d stop=%d total_shards=%d materialized_count=%d",
+                current_shard,
+                window_stop,
+                total_shards,
+                len(materialized),
+            )
+            if args.upload_finalized_shards_to_repo:
+                _upload_materialized_shards(
+                    repo_id=args.upload_finalized_shards_to_repo,
+                    prefix=args.upload_finalized_shards_prefix,
+                    paths=materialized,
+                    private=args.upload_finalized_shards_private,
+                    delete_uploaded=args.delete_uploaded_shards,
+                )
+            if current_shard > total_shards:
+                break
+            if window_stop >= total_shards:
+                break
+            if stop_limit > 0 and window_stop >= stop_limit:
+                break
+            current_shard = window_stop + 1
+        logger.info("materialize_output_shard_windows_complete total_shards=%d", total_shards)
 
 
 if __name__ == '__main__':
