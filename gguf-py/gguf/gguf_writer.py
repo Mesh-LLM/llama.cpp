@@ -608,6 +608,15 @@ class GGUFWriter:
             use_temp_file=self.use_temp_file,
         )
 
+        if not self._should_materialize_shard(shard_idx):
+            _memory_profile(
+                "writer_skip_unmaterialized_tensor_data",
+                name=name,
+                shard_idx=shard_idx,
+                nbytes=tensor.nbytes,
+            )
+            return
+
         if not self.use_temp_file:
             self.tensors[-1][name].tensor = tensor
             _memory_profile("writer_retain_tensor", name=name, shard_idx=shard_idx, nbytes=tensor.nbytes)
@@ -639,6 +648,15 @@ class GGUFWriter:
             use_temp_file=self.use_temp_file,
             chunked=True,
         )
+
+        if not self._should_materialize_shard(shard_idx):
+            _memory_profile(
+                "writer_skip_unmaterialized_tensor_chunks",
+                name=name,
+                shard_idx=shard_idx,
+                nbytes=tensor_nbytes,
+            )
+            return
 
         temp_file = self._get_temp_file(shard_idx)
         written = 0

@@ -152,6 +152,73 @@ class TestWriterMemoryOptimizations(unittest.TestCase):
 
         self.assertEqual(opened_temp_dirs, [writer_tmp])
 
+    def test_split_temp_file_writer_does_not_spool_unmaterialized_shards(self):
+        tensors = {
+            "tensor_a": np.arange(8, dtype=np.float32),
+            "tensor_b": np.arange(8, dtype=np.float32),
+            "tensor_c": np.arange(8, dtype=np.float32),
+        }
+        opened_temp_files = 0
+
+        writer_module = importlib.import_module("gguf.gguf_writer")
+        original_temporary_file = writer_module.tempfile.TemporaryFile
+
+        def record_temporary_file(*args, **kwargs):
+            nonlocal opened_temp_files
+            opened_temp_files += 1
+            return original_temporary_file(*args, **kwargs)
+
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(
+            os.environ,
+            {"GGUF_WRITER_OUTPUT_SHARD_MAX": "1"},
+        ), patch.object(writer_module.tempfile, "TemporaryFile", record_temporary_file):
+            out_files = self._write_split_model(
+                Path(tmp) / "model.gguf",
+                tensors,
+                use_temp_file=True,
+            )
+
+        self.assertEqual(opened_temp_files, 1)
+        self.assertEqual([path.name for path in out_files], ["model-00001-of-00003.gguf"])
+
+    def test_chunked_writer_does_not_iterate_unmaterialized_shard_chunks(self):
+        tensor = np.arange(16, dtype=np.uint8).reshape(2, 8)
+        chunks_iterated = 0
+
+        def chunks():
+            nonlocal chunks_iterated
+            for chunk in np.split(tensor, 2, axis=0):
+                chunks_iterated += 1
+                yield chunk
+
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(
+            os.environ,
+            {"GGUF_WRITER_OUTPUT_SHARD_MIN": "2"},
+        ):
+            writer = gguf.GGUFWriter(
+                path=None,
+                arch="llama",
+                use_temp_file=True,
+                split_max_tensors=1,
+            )
+            writer.add_tensor_from_chunks(
+                "tensor_a",
+                chunks(),
+                raw_shape=tensor.shape,
+                tensor_nbytes=tensor.nbytes,
+                raw_dtype=gguf.GGMLQuantizationType.BF16,
+            )
+
+            path = Path(tmp) / "model.gguf"
+            writer.write_header_to_file(path=path)
+            writer.write_kv_data_to_file()
+            writer.write_tensors_to_file()
+            writer.close()
+
+            self.assertEqual(sorted(Path(tmp).glob("*.gguf")), [])
+
+        self.assertEqual(chunks_iterated, 0)
+
     @staticmethod
     def _write_split_model(
         path: Path,
