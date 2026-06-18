@@ -5,9 +5,11 @@ from __future__ import annotations
 
 import argparse
 import faulthandler
+import gc
 import logging
 import os
 import re
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -144,6 +146,8 @@ def _upload_materialized_shards(
     paths: list[Path],
     private: bool,
     delete_uploaded: bool,
+    timeout_seconds: float,
+    max_attempts: int,
 ) -> None:
     from huggingface_hub import HfApi
 
@@ -154,11 +158,12 @@ def _upload_materialized_shards(
         rel_path = f"{repo_prefix}{path.name}"
         size = path.stat().st_size
         logger.info("hub_shard_upload_start path=%s size_bytes=%d repo=%s", rel_path, size, repo_id)
-        api.upload_file(
-            path_or_fileobj=str(path),
-            path_in_repo=rel_path,
+        _upload_file_with_retries(
+            path=path,
+            rel_path=rel_path,
             repo_id=repo_id,
-            repo_type="model",
+            timeout_seconds=timeout_seconds,
+            max_attempts=max_attempts,
         )
         logger.info("hub_shard_upload_done path=%s size_bytes=%d repo=%s", rel_path, size, repo_id)
         if delete_uploaded:
@@ -167,6 +172,105 @@ def _upload_materialized_shards(
                 logger.info("hub_shard_delete_done path=%s size_bytes=%d", path, size)
             except FileNotFoundError:
                 logger.info("hub_shard_delete_skip_missing path=%s size_bytes=%d", path, size)
+        gc.collect()
+
+
+def _upload_file_with_retries(
+    *,
+    path: Path,
+    rel_path: str,
+    repo_id: str,
+    timeout_seconds: float,
+    max_attempts: int,
+) -> None:
+    max_attempts = max(max_attempts, 1)
+    for attempt in range(1, max_attempts + 1):
+        logger.info(
+            "hub_shard_upload_attempt_start path=%s attempt=%d/%d timeout_seconds=%.1f",
+            rel_path,
+            attempt,
+            max_attempts,
+            timeout_seconds,
+        )
+        try:
+            _upload_file(path=path, rel_path=rel_path, repo_id=repo_id, timeout_seconds=timeout_seconds)
+            return
+        except subprocess.TimeoutExpired as exc:
+            logger.warning(
+                "hub_shard_upload_timeout path=%s attempt=%d/%d timeout_seconds=%.1f",
+                rel_path,
+                attempt,
+                max_attempts,
+                timeout_seconds,
+            )
+            if attempt >= max_attempts:
+                raise RuntimeError(f"upload timed out for {rel_path}") from exc
+        except Exception:
+            logger.exception(
+                "hub_shard_upload_attempt_failed path=%s attempt=%d/%d",
+                rel_path,
+                attempt,
+                max_attempts,
+            )
+            if attempt >= max_attempts:
+                raise
+        time.sleep(min(30.0 * attempt, 120.0))
+
+
+def _upload_file(*, path: Path, rel_path: str, repo_id: str, timeout_seconds: float) -> None:
+    if timeout_seconds <= 0:
+        from huggingface_hub import HfApi
+
+        api = HfApi(token=os.environ.get("HF_TOKEN"))
+        api.upload_file(
+            path_or_fileobj=str(path),
+            path_in_repo=rel_path,
+            repo_id=repo_id,
+            repo_type="model",
+        )
+        return
+
+    env = os.environ.copy()
+    env["LLAMA_CONVERT_UPLOAD_PATH"] = str(path)
+    env["LLAMA_CONVERT_UPLOAD_RELPATH"] = rel_path
+    env["LLAMA_CONVERT_UPLOAD_REPO"] = repo_id
+    code = (
+        "import os\n"
+        "from huggingface_hub import HfApi\n"
+        "api = HfApi(token=os.environ.get('HF_TOKEN'))\n"
+        "api.upload_file(\n"
+        "    path_or_fileobj=os.environ['LLAMA_CONVERT_UPLOAD_PATH'],\n"
+        "    path_in_repo=os.environ['LLAMA_CONVERT_UPLOAD_RELPATH'],\n"
+        "    repo_id=os.environ['LLAMA_CONVERT_UPLOAD_REPO'],\n"
+        "    repo_type='model',\n"
+        ")\n"
+    )
+    subprocess.run([sys.executable, "-c", code], env=env, check=True, timeout=timeout_seconds)
+
+
+def _require_materialized_shards(
+    *,
+    paths: list[Path],
+    fname_out: Path,
+    start_shard: int,
+    stop_shard: int,
+    total_shards: int,
+) -> None:
+    if start_shard > total_shards:
+        return
+    expected_stop = min(stop_shard, total_shards)
+    expected_paths = _split_shard_paths(fname_out, total_shards)[start_shard - 1:expected_stop]
+    missing = [str(path) for path in expected_paths if not path.is_file()]
+    if missing:
+        raise RuntimeError(
+            "materialized shard window is incomplete: "
+            f"start={start_shard} stop={expected_stop} missing={missing}"
+        )
+    if len(paths) != len(expected_paths):
+        raise RuntimeError(
+            "materialized shard window count mismatch: "
+            f"start={start_shard} stop={expected_stop} expected={len(expected_paths)} actual={len(paths)}"
+        )
 
 
 def parse_args() -> argparse.Namespace:
@@ -240,6 +344,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--upload-finalized-shards-private", action="store_true",
         help="create the target Hugging Face model repo as private if it does not already exist",
+    )
+    parser.add_argument(
+        "--upload-finalized-shards-timeout-seconds", type=float, default=0,
+        help="timeout for each finalized shard upload; 0 disables the timeout",
+    )
+    parser.add_argument(
+        "--upload-finalized-shards-max-attempts", type=int, default=1,
+        help="maximum upload attempts for each finalized shard",
     )
     parser.add_argument(
         "--resume-uploaded-shards", action="store_true",
@@ -497,6 +609,8 @@ def main() -> None:
                     paths=paths,
                     private=args.upload_finalized_shards_private,
                     delete_uploaded=args.delete_uploaded_shards,
+                    timeout_seconds=args.upload_finalized_shards_timeout_seconds,
+                    max_attempts=args.upload_finalized_shards_max_attempts,
                 )
             return
 
@@ -542,6 +656,13 @@ def main() -> None:
                 window_stop,
                 total_shards,
             )
+            _require_materialized_shards(
+                paths=materialized,
+                fname_out=model_instance.fname_out,
+                start_shard=current_shard,
+                stop_shard=window_stop,
+                total_shards=total_shards,
+            )
             logger.info(
                 "materialize_output_shard_window_done start=%d stop=%d total_shards=%d materialized_count=%d",
                 current_shard,
@@ -556,7 +677,11 @@ def main() -> None:
                     paths=materialized,
                     private=args.upload_finalized_shards_private,
                     delete_uploaded=args.delete_uploaded_shards,
+                    timeout_seconds=args.upload_finalized_shards_timeout_seconds,
+                    max_attempts=args.upload_finalized_shards_max_attempts,
                 )
+            del model_instance
+            gc.collect()
             if current_shard > total_shards:
                 break
             if window_stop >= total_shards:
