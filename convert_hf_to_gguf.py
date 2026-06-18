@@ -162,8 +162,11 @@ def _upload_materialized_shards(
         )
         logger.info("hub_shard_upload_done path=%s size_bytes=%d repo=%s", rel_path, size, repo_id)
         if delete_uploaded:
-            path.unlink()
-            logger.info("hub_shard_delete_done path=%s size_bytes=%d", path, size)
+            try:
+                path.unlink()
+                logger.info("hub_shard_delete_done path=%s size_bytes=%d", path, size)
+            except FileNotFoundError:
+                logger.info("hub_shard_delete_skip_missing path=%s size_bytes=%d", path, size)
 
 
 def parse_args() -> argparse.Namespace:
