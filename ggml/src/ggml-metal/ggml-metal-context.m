@@ -19,6 +19,114 @@
 // max number of MTLCommandBuffer used to submit a graph for processing
 #define GGML_METAL_MAX_COMMAND_BUFFERS 8
 
+// Each command-buffer lane owns a separate private resource so fused kernels
+// can exchange intermediates without synchronizing the shared GGML arena.
+#define GGML_METAL_FUSION_SCRATCH_SIZE (1024*1024)
+
+static int ggml_metal_glm_dsa_sched_debug(void) {
+    const char * value = getenv("GGML_GLM_DSA_METAL_SCHED_DEBUG");
+    return value == NULL ? 0 : atoi(value);
+}
+
+static int ggml_metal_glm_dsa_sched_debug_limit(void) {
+    const char * value = getenv("GGML_GLM_DSA_METAL_SCHED_DEBUG_LIMIT");
+    return value == NULL ? 8 : atoi(value);
+}
+
+static int ggml_metal_glm_dsa_cb_timing(void) {
+    const char * value = getenv("GGML_GLM_DSA_METAL_CB_TIMING");
+    if (value != NULL && atoi(value) != 0) {
+        return 1;
+    }
+    value = getenv("GGML_METAL_CB_TIMING");
+    return value == NULL ? 0 : atoi(value) != 0;
+}
+
+static int ggml_metal_glm_dsa_cb_timing_limit(void) {
+    const char * value = getenv("GGML_GLM_DSA_METAL_CB_TIMING_LIMIT");
+    if (value != NULL) {
+        return atoi(value);
+    }
+    value = getenv("GGML_METAL_CB_TIMING_LIMIT");
+    return value == NULL ? 16 : atoi(value);
+}
+
+static int ggml_metal_host_timing(void) {
+    const char * value = getenv("GGML_GLM_DSA_METAL_HOST_TIMING");
+    if (value != NULL && atoi(value) != 0) {
+        return 1;
+    }
+    value = getenv("GGML_METAL_HOST_TIMING");
+    return value == NULL ? 0 : atoi(value) != 0;
+}
+
+static int ggml_metal_host_timing_limit(void) {
+    const char * value = getenv("GGML_GLM_DSA_METAL_HOST_TIMING_LIMIT");
+    if (value != NULL) {
+        return atoi(value);
+    }
+    value = getenv("GGML_METAL_HOST_TIMING_LIMIT");
+    return value == NULL ? 16 : atoi(value);
+}
+
+static void ggml_metal_attach_cb_timing(
+        id<MTLCommandBuffer> cmd_buf,
+        int graph_seq,
+        int cb_idx,
+        int idx_start,
+        int idx_end,
+        int n_nodes) {
+    const int64_t cpu_start_us = ggml_time_us();
+    [cmd_buf addCompletedHandler:^(id<MTLCommandBuffer> cb) {
+        const int64_t cpu_end_us = ggml_time_us();
+        const double gpu_start_s = cb.GPUStartTime;
+        const double gpu_end_s = cb.GPUEndTime;
+        const double gpu_ms = gpu_end_s > gpu_start_s ? 1000.0*(gpu_end_s - gpu_start_s) : -1.0;
+        GGML_LOG_INFO(
+            "ggml: metal_cb_timing graph=%d cb=%d node_start=%d node_end=%d nodes=%d total_nodes=%d status=%lu cpu_ms=%.3f gpu_ms=%.3f gpu_start=%.9f gpu_end=%.9f\n",
+            graph_seq,
+            cb_idx,
+            idx_start,
+            idx_end,
+            idx_end - idx_start,
+            n_nodes,
+            (unsigned long) cb.status,
+            (double) (cpu_end_us - cpu_start_us) / 1000.0,
+            gpu_ms,
+            gpu_start_s,
+            gpu_end_s);
+    }];
+}
+
+static bool ggml_metal_topk_moe_route_fusion_enabled(void) {
+    const char * value = getenv("GGML_METAL_ENABLE_TOPK_MOE_ROUTE_FUSION");
+    if (value != NULL) {
+        return atoi(value) != 0;
+    }
+    value = getenv("GGML_GLM_DSA_ENABLE_METAL_TOPK_MOE_FUSION");
+    if (value != NULL) {
+        return atoi(value) != 0;
+    }
+    value = getenv("GGML_METAL_DISABLE_TOPK_MOE_ROUTE_FUSION");
+    if (value != NULL && atoi(value) != 0) {
+        return false;
+    }
+    value = getenv("GGML_GLM_DSA_DISABLE_METAL_TOPK_MOE_FUSION");
+    if (value != NULL && atoi(value) != 0) {
+        return false;
+    }
+    return true;
+}
+
+static bool ggml_metal_topk_moe_route_single_cb_enabled(void) {
+    const char * value = getenv("GGML_METAL_TOPK_MOE_ROUTE_SINGLE_CB");
+    if (value != NULL) {
+        return atoi(value) != 0;
+    }
+    value = getenv("GGML_GLM_DSA_TOPK_MOE_ROUTE_SINGLE_CB");
+    return value != NULL && atoi(value) != 0;
+}
+
 struct ggml_metal_command_buffer {
     id<MTLCommandBuffer> obj;
 };
@@ -54,6 +162,7 @@ struct ggml_metal {
 
     // command buffer state
     int n_cb;           // number of extra threads used to submit the command buffers
+    int n_cb_active;    // number of extra command buffers used by the current graph
     int n_nodes_0;      // number of nodes submitted by the main thread
     int n_nodes_1;      // remaining number of nodes submitted by the n_cb threads
     int n_nodes_per_cb;
@@ -65,6 +174,7 @@ struct ggml_metal {
 
     // n_cb command buffers + 1 used by the main thread
     struct ggml_metal_command_buffer cmd_bufs[GGML_METAL_MAX_COMMAND_BUFFERS + 1];
+    ggml_metal_buffer_t fusion_scratch[GGML_METAL_MAX_COMMAND_BUFFERS + 1];
 
     // extra command buffers for things like getting, setting and copying tensors
     NSMutableArray * cmd_bufs_ext;
@@ -176,7 +286,14 @@ ggml_metal_t ggml_metal_init(ggml_metal_device_t dev) {
     for (int i = 0; i < GGML_METAL_MAX_COMMAND_BUFFERS; ++i) {
         res->cmd_bufs[i].obj = nil;
     }
-
+    for (int i = 0; i <= GGML_METAL_MAX_COMMAND_BUFFERS; ++i) {
+        res->fusion_scratch[i] = ggml_metal_buffer_init(
+            res->dev, GGML_METAL_FUSION_SCRATCH_SIZE, false);
+        if (res->fusion_scratch[i] == NULL) {
+            GGML_LOG_WARN("%s: failed to allocate fusion scratch lane %d; fused private-resource paths will fall back\n",
+                __func__, i);
+        }
+    }
     res->cmd_bufs_ext = [[NSMutableArray alloc] init];
 
     res->cmd_buf_last = nil;
@@ -192,6 +309,11 @@ void ggml_metal_free(ggml_metal_t ctx) {
     for (int i = 0; i < GGML_METAL_MAX_COMMAND_BUFFERS; ++i) {
         if (ctx->cmd_bufs[i].obj) {
             [ctx->cmd_bufs[i].obj release];
+        }
+    }
+    for (int i = 0; i <= GGML_METAL_MAX_COMMAND_BUFFERS; ++i) {
+        if (ctx->fusion_scratch[i]) {
+            ggml_metal_buffer_free(ctx->fusion_scratch[i]);
         }
     }
 
@@ -245,7 +367,7 @@ void ggml_metal_synchronize(ggml_metal_t ctx) {
 
     // check status of all command buffers
     {
-        const int n_cb = ctx->n_cb;
+        const int n_cb = ctx->n_cb_active;
 
         for (int cb_idx = 0; cb_idx <= n_cb; ++cb_idx) {
             id<MTLCommandBuffer> cmd_buf = ctx->cmd_bufs[cb_idx].obj;
@@ -441,11 +563,11 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
         return GGML_STATUS_FAILED;
     }
 
-    // number of nodes encoded by the main thread (empirically determined)
-    const int n_main = MAX(64, 0.1*gf->n_nodes);
+    const bool topk_moe_route_fusion = ggml_metal_topk_moe_route_fusion_enabled();
 
-    // number of threads in addition to the main thread
-    const int n_cb = ctx->n_cb;
+    // number of nodes encoded by the main thread (empirically determined)
+    const bool topk_moe_route_single_cb = topk_moe_route_fusion && ggml_metal_topk_moe_route_single_cb_enabled();
+    const int n_main = topk_moe_route_single_cb ? gf->n_nodes : MAX(64, 0.1*gf->n_nodes);
 
     // keep the memory wired
     ggml_metal_device_rsets_keep_alive(ctx->dev);
@@ -458,12 +580,69 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
     // tests on M1 Pro and M2 Ultra using LLaMA models, show that optimal values for n_cb are 1 or 2
 
     @autoreleasepool {
+        const int64_t host_start_us = ggml_time_us();
         ctx->gf = gf;
 
         ctx->n_nodes_0 = MIN(n_main, gf->n_nodes);
         ctx->n_nodes_1 = gf->n_nodes - ctx->n_nodes_0;
 
-        ctx->n_nodes_per_cb = (ctx->n_nodes_1 + ctx->n_cb - 1) / ctx->n_cb;
+        ctx->n_cb_active = ctx->n_nodes_1 > 0 ? ctx->n_cb : 0;
+        const int n_cb = ctx->n_cb_active;
+
+        ctx->n_nodes_per_cb = n_cb > 0 ? (ctx->n_nodes_1 + n_cb - 1) / n_cb : 0;
+
+        static int graph_seq = 0;
+        graph_seq++;
+
+        const int host_timing = ggml_metal_host_timing();
+        const int host_timing_limit = ggml_metal_host_timing_limit();
+        const bool host_timing_should_log =
+            host_timing && (host_timing_limit < 0 || graph_seq <= host_timing_limit);
+
+        const int glm_dsa_sched_debug = ggml_metal_glm_dsa_sched_debug();
+        const int glm_dsa_cb_timing = ggml_metal_glm_dsa_cb_timing();
+        const int glm_dsa_cb_timing_limit = ggml_metal_glm_dsa_cb_timing_limit();
+        const bool glm_dsa_cb_timing_should_log =
+            glm_dsa_cb_timing &&
+            (glm_dsa_cb_timing_limit < 0 || graph_seq <= glm_dsa_cb_timing_limit);
+        if (glm_dsa_sched_debug > 0) {
+            const int glm_dsa_sched_limit = ggml_metal_glm_dsa_sched_debug_limit();
+            const bool glm_dsa_sched_should_log = glm_dsa_sched_limit < 0 || graph_seq <= glm_dsa_sched_limit;
+            if (!glm_dsa_sched_should_log) {
+                goto glm_dsa_sched_debug_done;
+            }
+
+            GGML_LOG_INFO(
+                "ggml: metal_sched graph=%d nodes=%d n_main=%d n_cb=%d n_cb_configured=%d n_nodes_0=%d n_nodes_1=%d n_nodes_per_cb=%d use_concurrency=%d use_fusion=%d use_graph_optimize=%d topk_moe_route_fusion=%d topk_moe_route_single_cb=%d\n",
+                graph_seq,
+                gf->n_nodes,
+                n_main,
+                n_cb,
+                ctx->n_cb,
+                ctx->n_nodes_0,
+                ctx->n_nodes_1,
+                ctx->n_nodes_per_cb,
+                ctx->use_concurrency ? 1 : 0,
+                ctx->use_fusion ? 1 : 0,
+                ctx->use_graph_optimize ? 1 : 0,
+                topk_moe_route_fusion ? 1 : 0,
+                topk_moe_route_single_cb ? 1 : 0);
+
+            if (glm_dsa_sched_debug > 1) {
+                for (int i = 0; i < gf->n_nodes; ++i) {
+                    const struct ggml_tensor * node = gf->nodes[i];
+                    GGML_LOG_INFO(
+                        "ggml: metal_sched_node graph=%d idx=%d op=%s name=%s\n",
+                        graph_seq,
+                        i,
+                        ggml_op_name(node->op),
+                        node->name);
+                }
+            }
+
+glm_dsa_sched_debug_done:
+            ;
+        }
 
         if (ctx->capture_compute >= 0) {
             ctx->capture_compute--;
@@ -508,6 +687,7 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
 
         // the main thread commits the first few commands immediately
         // cmd_buf[n_cb]
+        const int64_t main_encode_start_us = host_timing_should_log ? ggml_time_us() : 0;
         {
             id<MTLCommandBuffer> cmd_buf = [queue commandBufferWithUnretainedReferences];
             [cmd_buf retain];
@@ -517,16 +697,22 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
             }
             ctx->cmd_bufs[n_cb].obj = cmd_buf;
 
+            if (glm_dsa_cb_timing_should_log) {
+                ggml_metal_attach_cb_timing(cmd_buf, graph_seq, n_cb, 0, ctx->n_nodes_0, gf->n_nodes);
+            }
+
             [cmd_buf enqueue];
 
             ctx->encode_async(n_cb);
         }
+        const int64_t main_encode_end_us = host_timing_should_log ? ggml_time_us() : 0;
 
         // remember the command buffer for the next iteration
         ctx->cmd_buf_last = ctx->cmd_bufs[n_cb].obj;
 
         // prepare the rest of the command buffers asynchronously (optional)
         // cmd_buf[0.. n_cb)
+        const int64_t secondary_setup_start_us = host_timing_should_log ? ggml_time_us() : 0;
         for (int cb_idx = 0; cb_idx < n_cb; ++cb_idx) {
             id<MTLCommandBuffer> cmd_buf = [queue commandBufferWithUnretainedReferences];
             [cmd_buf retain];
@@ -535,6 +721,12 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
                 [ctx->cmd_bufs[cb_idx].obj release];
             }
             ctx->cmd_bufs[cb_idx].obj = cmd_buf;
+
+            if (glm_dsa_cb_timing_should_log) {
+                const int idx_start = ctx->n_nodes_0 + ((cb_idx + 0) * ctx->n_nodes_per_cb);
+                const int idx_end = ctx->n_nodes_0 + MIN((cb_idx == n_cb - 1) ? ctx->n_nodes_1 : (cb_idx + 1) * ctx->n_nodes_per_cb, ctx->n_nodes_1);
+                ggml_metal_attach_cb_timing(cmd_buf, graph_seq, cb_idx, idx_start, idx_end, gf->n_nodes);
+            }
 
             // always enqueue the first two command buffers
             // enqueue all of the command buffers if we don't need to abort
@@ -546,8 +738,25 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
                 ctx->cmd_buf_last = cmd_buf;
             }
         }
+        const int64_t secondary_setup_end_us = host_timing_should_log ? ggml_time_us() : 0;
 
+        const int64_t parallel_encode_start_us = host_timing_should_log ? ggml_time_us() : 0;
         dispatch_apply(n_cb, ctx->d_queue, ctx->encode_async);
+        const int64_t parallel_encode_end_us = host_timing_should_log ? ggml_time_us() : 0;
+
+        if (host_timing_should_log) {
+            GGML_LOG_INFO(
+                "ggml: metal_host_timing graph=%d nodes=%d n_main=%d n_cb=%d pre_encode_us=%lld main_encode_us=%lld secondary_setup_us=%lld parallel_encode_us=%lld submit_us=%lld\n",
+                graph_seq,
+                gf->n_nodes,
+                ctx->n_nodes_0,
+                n_cb,
+                (long long) (main_encode_start_us - host_start_us),
+                (long long) (main_encode_end_us - main_encode_start_us),
+                (long long) (secondary_setup_end_us - secondary_setup_start_us),
+                (long long) (parallel_encode_end_us - parallel_encode_start_us),
+                (long long) (parallel_encode_end_us - host_start_us));
+        }
 
         // for debugging: block until graph is computed
         //[ctx->cmd_buf_last waitUntilCompleted];
@@ -661,6 +870,11 @@ ggml_metal_event_t ggml_metal_get_ev_cpy(ggml_metal_t ctx) {
 }
 
 void ggml_metal_set_n_cb(ggml_metal_t ctx, int n_cb) {
+    const char * profile_n_cb = getenv("GGML_GLM_DSA_METAL_PROFILE_N_CB");
+    if (profile_n_cb != NULL && profile_n_cb[0] != '\0') {
+        n_cb = atoi(profile_n_cb);
+    }
+
     if (ctx->n_cb != n_cb) {
         ctx->n_cb = MIN(n_cb, GGML_METAL_MAX_COMMAND_BUFFERS);
 
@@ -675,7 +889,7 @@ void ggml_metal_set_n_cb(ggml_metal_t ctx, int n_cb) {
 
     ctx->encode_async = Block_copy(^(size_t iter) {
         const int cb_idx = iter;
-        const int n_cb_l = ctx->n_cb;
+        const int n_cb_l = ctx->n_cb_active;
 
         const int n_nodes_0 = ctx->n_nodes_0;
         const int n_nodes_1 = ctx->n_nodes_1;
@@ -695,6 +909,8 @@ void ggml_metal_set_n_cb(ggml_metal_t ctx, int n_cb) {
         ggml_metal_op_t ctx_op = ggml_metal_op_init(
             ctx->dev,
             cmd_buf,
+            ggml_metal_buffer_get_base_id(ctx->fusion_scratch[cb_idx]),
+            GGML_METAL_FUSION_SCRATCH_SIZE,
             ctx->gf,
             idx_start,
             idx_end,

@@ -106,6 +106,12 @@ void ggml_compute_forward_solve_tri(const struct ggml_compute_params * params, s
 void ggml_compute_forward_gla(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_gated_delta_net(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_lightning_indexer(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+void ggml_compute_forward_dsa_sparse_mask(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+void ggml_compute_forward_dsa_sparse_attn(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+void ggml_compute_forward_dsa_top1_attn(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+void ggml_compute_forward_moe_route_weights(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+void ggml_compute_forward_moe_weighted_sum(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+void ggml_compute_forward_moe_mul_mat_id(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_map_custom1(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_map_custom2(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_map_custom3(const struct ggml_compute_params * params, struct ggml_tensor * dst);

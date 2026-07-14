@@ -571,6 +571,11 @@ extern "C" {
         GGML_OP_SOLVE_TRI,
         GGML_OP_GATED_DELTA_NET,
         GGML_OP_LIGHTNING_INDEXER,
+        GGML_OP_DSA_SPARSE_MASK,
+        GGML_OP_DSA_SPARSE_ATTN,
+        GGML_OP_DSA_TOP1_ATTN,
+        GGML_OP_MOE_ROUTE_WEIGHTS,
+        GGML_OP_MOE_WEIGHTED_SUM,
 
         GGML_OP_UNARY,
 
@@ -586,6 +591,9 @@ extern "C" {
         GGML_OP_OPT_STEP_SGD,
 
         GGML_OP_GLU,
+
+        // selected expert matmuls followed by a route-weighted reduction
+        GGML_OP_MOE_MUL_MAT_ID,
 
         GGML_OP_COUNT,
     };
@@ -1666,6 +1674,11 @@ extern "C" {
             struct ggml_tensor  * a,  // data
             struct ggml_tensor  * b); // row indices
 
+    GGML_API struct ggml_tensor * ggml_get_rows_typed(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,  // data
+            struct ggml_tensor  * b); // row indices
+
     GGML_API struct ggml_tensor * ggml_get_rows_back(
             struct ggml_context * ctx,
             struct ggml_tensor  * a,  // gradients of ggml_get_rows result
@@ -2593,6 +2606,51 @@ extern "C" {
         struct ggml_tensor  * k,
         struct ggml_tensor  * weights,
         struct ggml_tensor  * mask);
+
+    GGML_API struct ggml_tensor * ggml_dsa_sparse_mask(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * kq_mask,
+            struct ggml_tensor  * top_k);
+
+    GGML_API struct ggml_tensor * ggml_dsa_sparse_attn(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * v,
+            struct ggml_tensor  * kq_mask_rows,
+            struct ggml_tensor  * top_k,
+            float                 scale);
+
+    GGML_API struct ggml_tensor * ggml_dsa_top1_attn(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * v,
+            struct ggml_tensor  * top_k);
+
+    GGML_API struct ggml_tensor * ggml_moe_weighted_sum(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * experts,
+            struct ggml_tensor  * weights);
+
+    // experts: [n_ff, n_embd, n_expert]
+    // input:   [n_ff, n_expert_used, n_tokens]
+    // ids:     [n_expert_used, n_tokens]
+    // weights: [1, n_expert_used, n_tokens]
+    // result:  [n_embd, n_tokens]
+    GGML_API struct ggml_tensor * ggml_moe_mul_mat_id(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * experts,
+            struct ggml_tensor  * input,
+            struct ggml_tensor  * ids,
+            struct ggml_tensor  * weights);
+
+    GGML_API struct ggml_tensor * ggml_moe_route_weights(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * probs,
+            struct ggml_tensor  * ids,
+            bool                  norm,
+            float                 clamp_min,
+            float                 scale);
 
     // custom operators
 

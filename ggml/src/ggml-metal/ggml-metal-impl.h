@@ -23,6 +23,8 @@
 
 #define N_R0_Q1_0 8
 #define N_SG_Q1_0 2
+#define N_R0_TQ2_0 8
+#define N_SG_TQ2_0 4
 
 #define N_R0_Q4_0 4
 #define N_SG_Q4_0 2
@@ -45,7 +47,7 @@
 #define N_R0_Q2_K 4
 #define N_SG_Q2_K 2
 
-#define N_R0_Q3_K 2
+#define N_R0_Q3_K 4
 #define N_SG_Q3_K 2
 
 #define N_R0_Q4_K 2
@@ -546,6 +548,129 @@ typedef struct {
     int32_t  nr0;
 } ggml_metal_kargs_mul_mv_id;
 
+typedef struct {
+    int32_t  nei0;
+    int32_t  nei1;
+    uint64_t nbi1;
+    int32_t  ne00;
+    int32_t  ne01;
+    int32_t  ne02;
+    uint64_t nb00;
+    uint64_t nb01;
+    uint64_t nb02;
+    int32_t  ne10;
+    int32_t  ne11;
+    int32_t  ne12;
+    int32_t  ne13;
+    uint64_t nb10;
+    uint64_t nb11;
+    uint64_t nb12;
+    int32_t  ne0;
+    int32_t  ne1;
+    uint64_t nb1;
+    int32_t  nr0;
+    uint64_t weights_nb1;
+    uint64_t weights_nb2;
+    int32_t  weighted;
+    int32_t  _pad0;
+} ggml_metal_kargs_mul_mv_id_gate_up_swiglu;
+
+typedef struct {
+    int32_t  ne00;
+    uint64_t nb01;
+    int32_t  ne10;
+    uint64_t nb11;
+    int32_t  ne0;
+    int32_t  ne1;
+    uint64_t nb1;
+    int32_t  i00;
+    int32_t  i10;
+    uint64_t weights_nb1;
+    uint64_t weights_nb2;
+    uint64_t dst_nb1;
+} ggml_metal_kargs_glu_weighted;
+
+typedef struct {
+    int32_t  nei0;
+    int32_t  nei1;
+    uint64_t nbi1;
+    int32_t  ne00;
+    int32_t  ne01;
+    int32_t  ne02;
+    uint64_t nb00;
+    uint64_t nb01;
+    uint64_t nb02;
+    int32_t  ne10;
+    int32_t  ne11;
+    int32_t  ne12;
+    uint64_t nb10;
+    uint64_t nb11;
+    uint64_t nb12;
+    uint64_t weights_nb1;
+    uint64_t weights_nb2;
+    int32_t  ne0;
+    int32_t  ne1;
+    uint64_t nb0;
+    uint64_t nb1;
+    int32_t  nr0;
+    int32_t  already_weighted;
+} ggml_metal_kargs_mul_mv_id_weighted_reduce;
+
+typedef struct {
+    uint64_t weights_nb1;
+    uint64_t weights_nb2;
+    uint64_t dst_nb0;
+    uint64_t dst_nb1;
+    int32_t  already_weighted;
+    int32_t  _pad0;
+} ggml_metal_kargs_mul_mv_id_weighted_reduce_extra;
+
+typedef struct {
+    uint64_t gate_nb1;
+    uint64_t gate_nb2;
+    uint64_t up_nb1;
+    uint64_t up_nb2;
+} ggml_metal_kargs_glm_moe_swiglu_q3_down;
+
+typedef struct {
+    uint64_t gate_expert_bytes;
+    uint64_t gate_expert_stride;
+    uint64_t up_expert_bytes;
+    uint64_t up_expert_stride;
+    uint64_t down_expert_bytes;
+    uint64_t down_expert_stride;
+    uint64_t ids_nb1;
+    int32_t  top_k;
+    int32_t  n_tokens;
+    int32_t  n_experts;
+    int32_t  chunks_per_expert;
+    int32_t  storage_block_bytes;
+} ggml_metal_kargs_glm_moe_q2_weight_scan;
+
+typedef struct {
+    int32_t  n_embd;
+    int32_t  n_ff;
+    int32_t  n_out;
+    int32_t  routed_gate_groups;
+    uint64_t shared_gate_nb1;
+    uint64_t shared_up_nb1;
+    uint64_t shared_down_nb1;
+} ggml_metal_kargs_glm_moe_two_phase;
+
+typedef struct {
+    uint64_t q_b_nb1;
+    uint64_t wk_b_nb1;
+    uint64_t wk_b_nb2;
+    int32_t q_rank;
+    int32_t q_head_dim;
+    int32_t q_nope_dim;
+    int32_t q_abs_dim;
+    int32_t rope_dim;
+    int32_t n_head;
+    int32_t rope_mode;
+    int32_t _pad0;
+} ggml_metal_kargs_glm_absorbed_q;
+
 // NORM
 // RMS_NORM
 typedef struct {
@@ -944,6 +1069,49 @@ typedef struct {
     uint64_t nb11;
     uint64_t nb12;
     uint64_t nb13;
+    int32_t  ne20;
+    int32_t  ne21;
+    int32_t  ne22;
+    int32_t  ne23;
+    uint64_t nb20;
+    uint64_t nb21;
+    uint64_t nb22;
+    uint64_t nb23;
+    int32_t  ne30;
+    int32_t  ne31;
+    int32_t  ne32;
+    int32_t  ne33;
+    uint64_t nb30;
+    uint64_t nb31;
+    uint64_t nb32;
+    uint64_t nb33;
+    int32_t  ne0;
+    int32_t  ne1;
+    int32_t  ne2;
+    int32_t  ne3;
+    uint64_t nb0;
+    uint64_t nb1;
+    uint64_t nb2;
+    uint64_t nb3;
+} ggml_metal_kargs_lightning_indexer;
+
+typedef struct {
+    int32_t  ne00;
+    int32_t  ne01;
+    int32_t  ne02;
+    int32_t  ne03;
+    uint64_t nb00;
+    uint64_t nb01;
+    uint64_t nb02;
+    uint64_t nb03;
+    int32_t  ne10;
+    int32_t  ne11;
+    int32_t  ne12;
+    int32_t  ne13;
+    uint64_t nb10;
+    uint64_t nb11;
+    uint64_t nb12;
+    uint64_t nb13;
     int32_t  ne0;
     int32_t  ne1;
     int32_t  ne2;
@@ -984,6 +1152,116 @@ typedef struct {
     uint64_t nb2;
     uint64_t nb3;
 } ggml_metal_kargs_set_rows;
+
+typedef struct {
+    int32_t  n_kv;
+    int32_t  n_batch;
+    int32_t  n_stream;
+    int32_t  n_top_k;
+    int32_t  n_top_stream;
+    int32_t  elem_size;
+    int32_t  _pad1;
+    int32_t  _pad2;
+    uint64_t nb01;
+    uint64_t nb02;
+    uint64_t nb03;
+    uint64_t nb10;
+    uint64_t nb11;
+    uint64_t nb12;
+    uint64_t nb0;
+    uint64_t nb1;
+    uint64_t nb2;
+    uint64_t nb3;
+} ggml_metal_kargs_dsa_sparse_mask;
+
+typedef struct {
+    int32_t  ne00;
+    int32_t  ne01;
+    int32_t  ne02;
+    int32_t  ne03;
+    uint64_t nb00;
+    uint64_t nb01;
+    uint64_t nb02;
+    uint64_t nb03;
+    int32_t  ne10;
+    int32_t  ne11;
+    int32_t  ne12;
+    int32_t  ne13;
+    uint64_t nb10;
+    uint64_t nb11;
+    uint64_t nb12;
+    uint64_t nb13;
+    int32_t  ne20;
+    int32_t  ne21;
+    int32_t  ne22;
+    int32_t  ne23;
+    uint64_t nb20;
+    uint64_t nb21;
+    uint64_t nb22;
+    uint64_t nb23;
+    int32_t  ne30;
+    int32_t  ne31;
+    int32_t  ne32;
+    int32_t  ne33;
+    uint64_t nb30;
+    uint64_t nb31;
+    uint64_t nb32;
+    uint64_t nb33;
+    int32_t  ne40;
+    int32_t  ne41;
+    int32_t  ne42;
+    int32_t  ne43;
+    uint64_t nb40;
+    uint64_t nb41;
+    uint64_t nb42;
+    uint64_t nb43;
+    int32_t  ne0;
+    int32_t  ne1;
+    int32_t  ne2;
+    int32_t  ne3;
+    uint64_t nb0;
+    uint64_t nb1;
+    uint64_t nb2;
+    uint64_t nb3;
+    float    scale;
+} ggml_metal_kargs_dsa_sparse_attn;
+
+typedef ggml_metal_kargs_dsa_sparse_attn ggml_metal_kargs_selected_row_flash;
+
+typedef struct {
+    int32_t  ne00;
+    int32_t  ne01;
+    int32_t  ne02;
+    int32_t  ne03;
+    uint64_t nb00;
+    uint64_t nb01;
+    uint64_t nb02;
+    uint64_t nb03;
+    int32_t  ne10;
+    int32_t  ne11;
+    int32_t  ne12;
+    int32_t  ne13;
+    uint64_t nb10;
+    uint64_t nb11;
+    uint64_t nb12;
+    uint64_t nb13;
+    int32_t  ne20;
+    int32_t  ne21;
+    int32_t  ne22;
+    int32_t  ne23;
+    uint64_t nb20;
+    uint64_t nb21;
+    uint64_t nb22;
+    uint64_t nb23;
+    int32_t  ne0;
+    int32_t  ne1;
+    int32_t  ne2;
+    int32_t  ne3;
+    uint64_t nb0;
+    uint64_t nb1;
+    uint64_t nb2;
+    uint64_t nb3;
+} ggml_metal_kargs_dsa_top1_attn;
 
 typedef struct {
     int32_t  ne00;
@@ -1148,6 +1426,57 @@ typedef struct {
     int32_t  top_k;
     int32_t  len;
 } ggml_metal_kargs_argsort_merge;
+
+typedef struct {
+    int32_t  n_expert;
+    int32_t  n_tokens;
+    int32_t  top_k;
+    int32_t  has_bias;
+    int32_t  norm;
+    int32_t  _pad0;
+    int32_t  _pad1;
+    int32_t  _pad2;
+    float    scale;
+    float    clamp_min;
+    uint64_t logits_nb0;
+    uint64_t logits_nb1;
+    uint64_t bias_nb0;
+    uint64_t ids_nb0;
+    uint64_t ids_nb1;
+    uint64_t weights_nb1;
+    uint64_t weights_nb2;
+} ggml_metal_kargs_topk_moe_route;
+
+typedef struct {
+    int32_t  n_expert;
+    int32_t  n_tokens;
+    int32_t  n_expert_used;
+    int32_t  norm;
+    float    clamp_min;
+    float    scale;
+    int32_t  _pad0;
+    int32_t  _pad1;
+    uint64_t probs_nb1;
+    uint64_t probs_nb2;
+    uint64_t ids_nb0;
+    uint64_t ids_nb1;
+    uint64_t dst_nb1;
+    uint64_t dst_nb2;
+} ggml_metal_kargs_moe_route_weights;
+
+typedef struct {
+    int32_t  n_embd;
+    int32_t  n_tokens;
+    int32_t  n_expert_used;
+    int32_t  already_weighted;
+    uint64_t experts_nb0;
+    uint64_t experts_nb1;
+    uint64_t experts_nb2;
+    uint64_t weights_nb1;
+    uint64_t weights_nb2;
+    uint64_t dst_nb0;
+    uint64_t dst_nb1;
+} ggml_metal_kargs_moe_weighted_sum;
 
 typedef struct {
     int64_t  ne0;

@@ -982,6 +982,89 @@ static void ggml_backend_sched_print_assignments(ggml_backend_sched_t sched, str
     }
 }
 
+static bool ggml_backend_sched_glm_route_diag_enabled() {
+    const char * log = getenv("GGML_METAL_MOE_DISPATCH_LOG");
+    if (log && atoi(log) != 0) {
+        return true;
+    }
+    log = getenv("GGML_GLM_DSA_LOG_METAL_DISPATCH");
+    return log && atoi(log) != 0;
+}
+
+static int ggml_backend_sched_split_id_for_node(ggml_backend_sched_t sched, int node_idx) {
+    for (int i = 0; i < sched->n_splits; ++i) {
+        const ggml_backend_sched_split * split = &sched->splits[i];
+        if (node_idx >= split->i_start && node_idx < split->i_end) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+static void ggml_backend_sched_log_glm_route_splits(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
+    if (!ggml_backend_sched_glm_route_diag_enabled()) {
+        return;
+    }
+
+    for (int i = 0; i < graph->n_nodes; ++i) {
+        ggml_tensor * node = graph->nodes[i];
+        if (node->name[0] == '\0' || strstr(node->name, "ffn_moe_probs") == NULL ||
+                node->op != GGML_OP_UNARY || ggml_get_unary_op(node) != GGML_UNARY_OP_SIGMOID) {
+            continue;
+        }
+
+        char ops[1536] = {};
+        size_t offset = 0;
+        int first_split = -1;
+        int last_split = -1;
+        int split_count = 0;
+
+        for (int j = i; j < graph->n_nodes && j < i + 14 && offset < sizeof(ops); ++j) {
+            ggml_tensor * t = graph->nodes[j];
+            const int split_id = ggml_backend_sched_split_id_for_node(sched, j);
+            if (j == i) {
+                first_split = split_id;
+                last_split = split_id;
+                split_count = split_id >= 0 ? 1 : 0;
+            } else if (split_id != last_split) {
+                last_split = split_id;
+                if (split_id >= 0) {
+                    ++split_count;
+                }
+            }
+
+            const int backend_id = tensor_backend_id(t);
+            const char * backend_name =
+                backend_id >= 0 && backend_id < sched->n_backends ?
+                ggml_backend_name(sched->backends[backend_id]) :
+                "<unassigned>";
+            const int written = snprintf(
+                    ops + offset,
+                    sizeof(ops) - offset,
+                    "%s%d:%s/%s@split%d/%s",
+                    j == i ? "" : ",",
+                    j,
+                    ggml_op_name(t->op),
+                    t->name[0] == '\0' ? "<unnamed>" : t->name,
+                    split_id,
+                    backend_name);
+            if (written < 0) {
+                break;
+            }
+            offset += (size_t) written;
+        }
+
+        GGML_LOG_INFO(
+                "ggml_metal: moe_dispatch op=topk_moe_route_sched tensor=%s graph_uid=%llu split_start=%d split_end=%d split_count=%d candidate=%s grid_x=1 grid_y=1 grid_z=1 threads_x=1\n",
+                node->name,
+                (unsigned long long) graph->uid,
+                first_split,
+                last_split,
+                split_count,
+                ops);
+    }
+}
+
 static bool ggml_backend_sched_buffer_supported(ggml_backend_sched_t sched, struct ggml_tensor * t, int backend_id) {
     ggml_backend_buffer_t buf = t->view_src ? t->view_src->buffer : t->buffer;
     ggml_backend_buffer_type_t buft = NULL;
@@ -1378,6 +1461,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
     if (sched->debug) {
         ggml_backend_sched_print_assignments(sched, graph);
     }
+    ggml_backend_sched_log_glm_route_splits(sched, graph);
 
     // swap node_backend_ids and leaf _backend_ids with prevs
     {

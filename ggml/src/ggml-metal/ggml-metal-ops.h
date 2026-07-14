@@ -11,6 +11,8 @@ typedef struct ggml_metal_op * ggml_metal_op_t;
 ggml_metal_op_t ggml_metal_op_init(
         ggml_metal_device_t dev,
         ggml_metal_cmd_buf_t cmd_buf,
+        struct ggml_metal_buffer_id fusion_scratch,
+        size_t fusion_scratch_size,
         struct ggml_cgraph * gf,
         int  idx_start,
         int  idx_end,
@@ -36,12 +38,16 @@ size_t ggml_metal_op_mul_mat_id_extra_tpe(const struct ggml_tensor * op);
 // id map [n_tokens, n_expert]
 size_t ggml_metal_op_mul_mat_id_extra_ids(const struct ggml_tensor * op);
 
+// routed activation preserved across shared-expert work
+size_t ggml_metal_op_mul_mat_id_extra_src1_scratch(const struct ggml_tensor * op);
+
 // return true if we should use the FA vector kernel for this op
 bool ggml_metal_op_flash_attn_ext_use_vec(const struct ggml_tensor * op);
 
 size_t ggml_metal_op_flash_attn_ext_extra_pad(const struct ggml_tensor * op);
 size_t ggml_metal_op_flash_attn_ext_extra_blk(const struct ggml_tensor * op);
 size_t ggml_metal_op_flash_attn_ext_extra_tmp(const struct ggml_tensor * op);
+size_t ggml_metal_op_dsa_sparse_attn_extra_tmp(const struct ggml_tensor * op);
 
 int ggml_metal_op_concat            (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_repeat            (ggml_metal_op_t ctx, int idx);
@@ -59,6 +65,13 @@ int ggml_metal_op_ssm_conv          (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_ssm_scan          (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_rwkv              (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_gated_delta_net   (ggml_metal_op_t ctx, int idx);
+int ggml_metal_op_lightning_indexer (ggml_metal_op_t ctx, int idx);
+int ggml_metal_op_dsa_sparse_mask   (ggml_metal_op_t ctx, int idx);
+int ggml_metal_op_dsa_sparse_attn   (ggml_metal_op_t ctx, int idx);
+int ggml_metal_op_dsa_top1_attn     (ggml_metal_op_t ctx, int idx);
+int ggml_metal_op_moe_route_weights (ggml_metal_op_t ctx, int idx);
+int ggml_metal_op_moe_weighted_sum  (ggml_metal_op_t ctx, int idx);
+int ggml_metal_op_moe_mul_mat_id     (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_solve_tri         (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_set               (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_cpy               (ggml_metal_op_t ctx, int idx);

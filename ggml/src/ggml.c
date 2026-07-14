@@ -1080,6 +1080,11 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "SOLVE_TRI",
     "GATED_DELTA_NET",
     "LIGHTNING_INDEXER",
+    "DSA_SPARSE_MASK",
+    "DSA_SPARSE_ATTN",
+    "DSA_TOP1_ATTN",
+    "MOE_ROUTE_WEIGHTS",
+    "MOE_WEIGHTED_SUM",
 
     "UNARY",
 
@@ -1095,9 +1100,11 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "OPT_STEP_SGD",
 
     "GLU",
+
+    "MOE_MUL_MAT_ID",
 };
 
-static_assert(GGML_OP_COUNT == 98, "GGML_OP_COUNT != 98");
+static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1192,6 +1199,11 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "A X = B, A triangular, solve X",
     "gated_delta_net(q, k, v, g, beta, s)",
     "lightning_indexer(q, k, weights, mask)",
+    "dsa_sparse_mask(kq_mask, top_k)",
+    "dsa_sparse_attn(q, k, v, kq_mask, top_k)",
+    "dsa_top1_attn(q, v, top_k)",
+    "moe_route_weights(probs, ids)",
+    "moe_weighted_sum(experts, weights)",
 
     "unary(x)",
 
@@ -1207,9 +1219,11 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "sgd(x)",
 
     "glu(x)",
+
+    "moe_mul_mat_id(experts, input, ids, weights)",
 };
 
-static_assert(GGML_OP_COUNT == 98, "GGML_OP_COUNT != 98");
+static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -3893,6 +3907,29 @@ struct ggml_tensor * ggml_get_rows(
     return result;
 }
 
+struct ggml_tensor * ggml_get_rows_typed(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * b) {
+    GGML_ASSERT(a->ne[2] == b->ne[1]);
+    GGML_ASSERT(a->ne[3] == b->ne[2]);
+    GGML_ASSERT(b->ne[3] == 1);
+    GGML_ASSERT(b->type == GGML_TYPE_I32);
+
+    enum ggml_type type = a->type;
+    if (ggml_is_quantized(type) || type == GGML_TYPE_BF16) {
+        type = GGML_TYPE_F32;
+    }
+
+    struct ggml_tensor * result = ggml_new_tensor_4d(ctx, type, a->ne[0], b->ne[0], b->ne[1], b->ne[2]);
+
+    result->op     = GGML_OP_GET_ROWS;
+    result->src[0] = a;
+    result->src[1] = b;
+
+    return result;
+}
+
 // ggml_get_rows_back
 
 struct ggml_tensor * ggml_get_rows_back(
@@ -6321,6 +6358,200 @@ struct ggml_tensor * ggml_lightning_indexer(
     result->src[1] = k;
     result->src[2] = weights;
     result->src[3] = mask;
+
+    return result;
+}
+
+// ggml_dsa_sparse_mask
+
+struct ggml_tensor * ggml_dsa_sparse_mask(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * kq_mask_rows,
+        struct ggml_tensor  * top_k) {
+
+    GGML_ASSERT(kq_mask_rows->type == GGML_TYPE_F32 || kq_mask_rows->type == GGML_TYPE_F16);
+    GGML_ASSERT(top_k->type == GGML_TYPE_I32);
+    GGML_ASSERT(kq_mask_rows->ne[0] == 1);
+    GGML_ASSERT(kq_mask_rows->ne[2] == top_k->ne[1]);
+    GGML_ASSERT(kq_mask_rows->ne[3] % top_k->ne[2] == 0);
+    GGML_ASSERT(top_k->ne[3] == 1);
+
+    int64_t ne[4] = { kq_mask_rows->ne[0], kq_mask_rows->ne[1], kq_mask_rows->ne[2], kq_mask_rows->ne[3] };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, kq_mask_rows->type, 4, ne);
+
+    result->op     = GGML_OP_DSA_SPARSE_MASK;
+    result->src[0] = kq_mask_rows;
+    result->src[1] = top_k;
+
+    return result;
+}
+
+// ggml_dsa_sparse_attn
+
+struct ggml_tensor * ggml_dsa_sparse_attn(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * v,
+        struct ggml_tensor  * kq_mask_rows,
+        struct ggml_tensor  * top_k,
+        float                 scale) {
+
+    GGML_ASSERT(q->type == GGML_TYPE_F32);
+    GGML_ASSERT(k->type == GGML_TYPE_F32 || ggml_get_type_traits(k->type)->to_float);
+    GGML_ASSERT(v->type == GGML_TYPE_F32 || ggml_get_type_traits(v->type)->to_float);
+    GGML_ASSERT(kq_mask_rows->type == GGML_TYPE_F32 || kq_mask_rows->type == GGML_TYPE_F16);
+    GGML_ASSERT(top_k->type == GGML_TYPE_I32);
+
+    GGML_ASSERT(q->ne[0] == k->ne[0]);
+    GGML_ASSERT(k->ne[1] == v->ne[1]);
+    GGML_ASSERT(q->ne[3] == k->ne[3]);
+    GGML_ASSERT(q->ne[3] == v->ne[3]);
+
+    GGML_ASSERT(kq_mask_rows->ne[0] == 1);
+    GGML_ASSERT(kq_mask_rows->ne[1] == k->ne[1]);
+    GGML_ASSERT(kq_mask_rows->ne[2] == q->ne[1]);
+    GGML_ASSERT(kq_mask_rows->ne[3] == q->ne[3]);
+
+    GGML_ASSERT(top_k->ne[1] == q->ne[1]);
+    GGML_ASSERT(kq_mask_rows->ne[3] % top_k->ne[2] == 0);
+    GGML_ASSERT(top_k->ne[3] == 1);
+
+    GGML_ASSERT(q->ne[2] % k->ne[2] == 0);
+    GGML_ASSERT(q->ne[2] % v->ne[2] == 0);
+
+    int64_t ne[4] = { v->ne[0], q->ne[1], q->ne[2], q->ne[3] };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+
+    result->op     = GGML_OP_DSA_SPARSE_ATTN;
+    result->src[0] = q;
+    result->src[1] = k;
+    result->src[2] = v;
+    result->src[3] = kq_mask_rows;
+    result->src[4] = top_k;
+
+    ggml_set_op_params_f32(result, 0, scale);
+
+    return result;
+}
+
+// ggml_dsa_top1_attn
+
+struct ggml_tensor * ggml_dsa_top1_attn(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * v,
+        struct ggml_tensor  * top_k) {
+
+    GGML_ASSERT(q->type == GGML_TYPE_F32);
+    GGML_ASSERT(v->type == GGML_TYPE_F32 || v->type == GGML_TYPE_F16);
+    GGML_ASSERT(top_k->type == GGML_TYPE_I32);
+
+    GGML_ASSERT(q->ne[3] == v->ne[3]);
+    GGML_ASSERT(top_k->ne[0] == 1);
+    GGML_ASSERT(top_k->ne[1] == q->ne[1]);
+    GGML_ASSERT(q->ne[3] % top_k->ne[2] == 0);
+    GGML_ASSERT(top_k->ne[3] == 1);
+    GGML_ASSERT(q->ne[2] % v->ne[2] == 0);
+
+    int64_t ne[4] = { v->ne[0], q->ne[1], q->ne[2], q->ne[3] };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+
+    result->op     = GGML_OP_DSA_TOP1_ATTN;
+    result->src[0] = q;
+    result->src[1] = v;
+    result->src[2] = top_k;
+
+    return result;
+}
+
+// ggml_moe_weighted_sum
+
+struct ggml_tensor * ggml_moe_route_weights(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * probs,
+        struct ggml_tensor  * ids,
+        bool                  norm,
+        float                 clamp_min,
+        float                 scale) {
+
+    GGML_ASSERT(probs->type == GGML_TYPE_F32);
+    GGML_ASSERT(ids->type == GGML_TYPE_I32);
+    GGML_ASSERT(probs->ne[0] == 1);
+    GGML_ASSERT(ids->ne[0] > 0);
+    GGML_ASSERT(ids->ne[1] == probs->ne[2]);
+    GGML_ASSERT(ids->ne[2] == 1);
+    GGML_ASSERT(ids->ne[3] == 1);
+    GGML_ASSERT(probs->ne[3] == 1);
+
+    int64_t ne[3] = { 1, ids->ne[0], ids->ne[1] };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 3, ne);
+
+    ggml_set_op_params_f32(result, 0, clamp_min);
+    ggml_set_op_params_f32(result, 1, scale);
+    ggml_set_op_params_i32(result, 2, norm ? 1 : 0);
+
+    result->op     = GGML_OP_MOE_ROUTE_WEIGHTS;
+    result->src[0] = probs;
+    result->src[1] = ids;
+
+    return result;
+}
+
+struct ggml_tensor * ggml_moe_weighted_sum(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * experts,
+        struct ggml_tensor  * weights) {
+
+    GGML_ASSERT(experts->type == GGML_TYPE_F32);
+    GGML_ASSERT(weights->type == GGML_TYPE_F32);
+    GGML_ASSERT(weights->ne[0] == 1);
+    GGML_ASSERT(experts->ne[1] == weights->ne[1]);
+    GGML_ASSERT(experts->ne[2] == weights->ne[2]);
+    GGML_ASSERT(experts->ne[3] == 1);
+    GGML_ASSERT(weights->ne[3] == 1);
+
+    int64_t ne[2] = { experts->ne[0], experts->ne[2] };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 2, ne);
+
+    result->op     = GGML_OP_MOE_WEIGHTED_SUM;
+    result->src[0] = experts;
+    result->src[1] = weights;
+
+    return result;
+}
+
+struct ggml_tensor * ggml_moe_mul_mat_id(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * experts,
+        struct ggml_tensor  * input,
+        struct ggml_tensor  * ids,
+        struct ggml_tensor  * weights) {
+
+    GGML_ASSERT(experts->type == GGML_TYPE_F32 || ggml_get_type_traits(experts->type)->to_float);
+    GGML_ASSERT(input->type == GGML_TYPE_F32 || input->type == GGML_TYPE_F16);
+    GGML_ASSERT(ids->type == GGML_TYPE_I32);
+    GGML_ASSERT(weights->type == GGML_TYPE_F32);
+    GGML_ASSERT(experts->ne[0] == input->ne[0]);
+    GGML_ASSERT(experts->ne[2] > 0);
+    GGML_ASSERT(experts->ne[3] == 1);
+    GGML_ASSERT(ids->ne[0] == input->ne[1]);
+    GGML_ASSERT(ids->ne[1] == input->ne[2]);
+    GGML_ASSERT(ids->ne[2] == 1 && ids->ne[3] == 1);
+    GGML_ASSERT(weights->ne[0] == 1);
+    GGML_ASSERT(weights->ne[1] == ids->ne[0]);
+    GGML_ASSERT(weights->ne[2] == ids->ne[1]);
+    GGML_ASSERT(weights->ne[3] == 1);
+    GGML_ASSERT(input->ne[3] == 1);
+
+    int64_t ne[2] = { experts->ne[1], input->ne[2] };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 2, ne);
+
+    result->op     = GGML_OP_MOE_MUL_MAT_ID;
+    result->src[0] = experts;
+    result->src[1] = input;
+    result->src[2] = ids;
+    result->src[3] = weights;
 
     return result;
 }

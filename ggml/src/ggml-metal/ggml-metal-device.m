@@ -2,7 +2,6 @@
 
 #import "ggml-impl.h"
 #import "ggml-backend-impl.h"
-
 #include <Foundation/Foundation.h>
 
 #include <Metal/Metal.h>
@@ -511,6 +510,15 @@ void ggml_metal_encoder_dispatch_threadgroups(ggml_metal_encoder_t encoder, int 
 
 void ggml_metal_encoder_memory_barrier(ggml_metal_encoder_t encoder) {
     [encoder->obj memoryBarrierWithScope:MTLBarrierScopeBuffers];
+}
+
+void ggml_metal_encoder_memory_barrier_buffer(ggml_metal_encoder_t encoder, struct ggml_metal_buffer_id buffer) {
+    if (buffer.metal == nil) {
+        return;
+    }
+
+    id<MTLResource> resource = buffer.metal;
+    [encoder->obj memoryBarrierWithResources:&resource count:1];
 }
 
 void ggml_metal_encoder_end_encoding(ggml_metal_encoder_t encoder) {
@@ -1272,6 +1280,137 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
             return true;
         case GGML_OP_GATED_DELTA_NET:
             return has_simdgroup_reduction && op->src[2]->ne[0] % 32 == 0;
+        case GGML_OP_LIGHTNING_INDEXER:
+            {
+                const bool k_scalar =
+                    (op->src[1]->type == GGML_TYPE_F32 || op->src[1]->type == GGML_TYPE_F16) &&
+                    op->src[1]->nb[0] == ggml_type_size(op->src[1]->type);
+                const bool k_quant =
+                    (op->src[1]->type == GGML_TYPE_Q4_0 ||
+                     op->src[1]->type == GGML_TYPE_Q8_0 ||
+                     op->src[1]->type == GGML_TYPE_Q2_K ||
+                     op->src[1]->type == GGML_TYPE_Q3_K ||
+                     op->src[1]->type == GGML_TYPE_Q4_K ||
+                     op->src[1]->type == GGML_TYPE_Q5_K ||
+                     op->src[1]->type == GGML_TYPE_Q6_K) &&
+                    op->src[1]->ne[0] % ggml_blck_size(op->src[1]->type) == 0;
+                return op->type == GGML_TYPE_F32 &&
+                   op->src[0]->type == GGML_TYPE_F32 &&
+                   op->src[2]->type == GGML_TYPE_F32 &&
+                   (k_scalar || k_quant) &&
+                   op->nb[0] == sizeof(float) &&
+                   op->src[0]->nb[0] == sizeof(float) &&
+                   op->src[2]->nb[0] == sizeof(float) &&
+                   op->src[0]->ne[0] == op->src[1]->ne[0] &&
+                   op->src[0]->ne[1] == op->src[2]->ne[0] &&
+                   op->src[1]->ne[1] == 1 &&
+                   op->src[0]->ne[2] == op->src[2]->ne[1] &&
+                   op->src[2]->ne[2] == 1 &&
+                   op->src[0]->ne[3] == op->src[1]->ne[3] &&
+                   op->src[1]->ne[3] == op->src[2]->ne[3];
+            }
+        case GGML_OP_DSA_SPARSE_MASK:
+            return (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16) &&
+                   op->src[0]->type == op->type &&
+                   op->src[1]->type == GGML_TYPE_I32 &&
+                   op->src[0]->ne[0] == 1 &&
+                   op->src[0]->ne[2] == op->src[1]->ne[1] &&
+                   op->src[0]->ne[3] % op->src[1]->ne[2] == 0 &&
+                   op->src[1]->ne[3] == 1 &&
+                   op->ne[0] == op->src[0]->ne[0] &&
+                   op->ne[1] == op->src[0]->ne[1] &&
+                   op->ne[2] == op->src[0]->ne[2] &&
+                   op->ne[3] == op->src[0]->ne[3];
+        case GGML_OP_DSA_SPARSE_ATTN:
+            return op->type == GGML_TYPE_F32 &&
+                   op->src[0]->type == GGML_TYPE_F32 &&
+                   (op->src[1]->type == GGML_TYPE_F32 || op->src[1]->type == GGML_TYPE_F16) &&
+                   (op->src[2]->type == GGML_TYPE_F32 || op->src[2]->type == GGML_TYPE_F16) &&
+                   (op->src[3]->type == GGML_TYPE_F32 || op->src[3]->type == GGML_TYPE_F16) &&
+                   op->src[4]->type == GGML_TYPE_I32 &&
+                   op->src[0]->nb[0] == sizeof(float) &&
+                   op->src[1]->nb[0] == ggml_type_size(op->src[1]->type) &&
+                   op->src[2]->nb[0] == ggml_type_size(op->src[2]->type) &&
+                   op->src[3]->ne[0] == 1 &&
+                   op->src[3]->ne[1] == op->src[1]->ne[1] &&
+                   op->src[3]->ne[2] == op->src[0]->ne[1] &&
+                   op->src[3]->ne[3] == op->src[0]->ne[3] &&
+                   op->src[4]->ne[0] <= 4096 &&
+                   op->src[4]->ne[1] == op->src[0]->ne[1] &&
+                   op->src[0]->ne[3] % op->src[4]->ne[2] == 0 &&
+                   op->src[4]->ne[3] == 1 &&
+                   op->src[0]->ne[0] == op->src[1]->ne[0] &&
+                   op->src[1]->ne[1] == op->src[2]->ne[1] &&
+                   op->src[0]->ne[2] % op->src[1]->ne[2] == 0 &&
+                   op->src[0]->ne[2] % op->src[2]->ne[2] == 0 &&
+                   op->ne[0] == op->src[2]->ne[0] &&
+                   op->ne[1] == op->src[0]->ne[1] &&
+                   op->ne[2] == op->src[0]->ne[2] &&
+                   op->ne[3] == op->src[0]->ne[3];
+        case GGML_OP_DSA_TOP1_ATTN:
+            return op->type == GGML_TYPE_F32 &&
+                   op->src[0]->type == GGML_TYPE_F32 &&
+                   (op->src[1]->type == GGML_TYPE_F32 || op->src[1]->type == GGML_TYPE_F16) &&
+                   op->src[2]->type == GGML_TYPE_I32 &&
+                   op->nb[0] == sizeof(float) &&
+                   op->src[0]->nb[0] == sizeof(float) &&
+                   op->src[1]->nb[0] == ggml_type_size(op->src[1]->type) &&
+                   op->src[2]->ne[0] == 1 &&
+                   op->src[2]->ne[1] == op->src[0]->ne[1] &&
+                   op->src[0]->ne[3] == op->src[1]->ne[3] &&
+                   op->src[0]->ne[3] % op->src[2]->ne[2] == 0 &&
+                   op->src[2]->ne[3] == 1 &&
+                   op->src[0]->ne[2] % op->src[1]->ne[2] == 0 &&
+                   op->ne[0] == op->src[1]->ne[0] &&
+                   op->ne[1] == op->src[0]->ne[1] &&
+                   op->ne[2] == op->src[0]->ne[2] &&
+                   op->ne[3] == op->src[0]->ne[3];
+        case GGML_OP_MOE_WEIGHTED_SUM:
+            return op->type == GGML_TYPE_F32 &&
+                   op->src[0]->type == GGML_TYPE_F32 &&
+                   op->src[1]->type == GGML_TYPE_F32 &&
+                   op->nb[0] == sizeof(float) &&
+                   op->src[0]->nb[0] == sizeof(float) &&
+                   op->src[1]->nb[0] == sizeof(float) &&
+                   op->src[1]->ne[0] == 1 &&
+                   op->src[0]->ne[1] == op->src[1]->ne[1] &&
+                   op->src[0]->ne[2] == op->src[1]->ne[2] &&
+                   op->src[0]->ne[3] == 1 &&
+                   op->src[1]->ne[3] == 1 &&
+                   op->ne[0] == op->src[0]->ne[0] &&
+                   op->ne[1] == op->src[0]->ne[2];
+        case GGML_OP_MOE_MUL_MAT_ID:
+            return has_simdgroup_reduction &&
+                   op->type == GGML_TYPE_F32 &&
+                   (op->src[0]->type == GGML_TYPE_Q2_K || op->src[0]->type == GGML_TYPE_Q3_K) &&
+                   (op->src[1]->type == GGML_TYPE_F32 || op->src[1]->type == GGML_TYPE_F16) &&
+                   op->src[2]->type == GGML_TYPE_I32 &&
+                   op->src[3]->type == GGML_TYPE_F32 &&
+                   op->nb[0] == sizeof(float) &&
+                   op->src[0]->ne[0] == op->src[1]->ne[0] &&
+                   op->src[2]->ne[0] == op->src[1]->ne[1] &&
+                   op->src[2]->ne[1] == op->src[1]->ne[2] &&
+                   op->src[3]->ne[0] == 1 &&
+                   op->src[3]->ne[1] == op->src[2]->ne[0] &&
+                   op->src[3]->ne[2] == op->src[2]->ne[1] &&
+                   op->ne[0] == op->src[0]->ne[1] &&
+                   op->ne[1] == op->src[1]->ne[2];
+        case GGML_OP_MOE_ROUTE_WEIGHTS:
+            return op->type == GGML_TYPE_F32 &&
+                   op->src[0]->type == GGML_TYPE_F32 &&
+                   op->src[1]->type == GGML_TYPE_I32 &&
+                   op->nb[0] == sizeof(float) &&
+                   op->src[0]->nb[0] == sizeof(float) &&
+                   op->src[1]->nb[0] == sizeof(int32_t) &&
+                   op->src[0]->ne[0] == 1 &&
+                   op->src[1]->ne[0] <= 16 &&
+                   op->src[1]->ne[1] == op->src[0]->ne[2] &&
+                   op->src[1]->ne[2] == 1 &&
+                   op->src[1]->ne[3] == 1 &&
+                   op->src[0]->ne[3] == 1 &&
+                   op->ne[0] == 1 &&
+                   op->ne[1] == op->src[1]->ne[0] &&
+                   op->ne[2] == op->src[1]->ne[1];
         case GGML_OP_SOLVE_TRI:
         case GGML_OP_MUL_MAT:
         case GGML_OP_MUL_MAT_ID:
@@ -1405,6 +1544,7 @@ struct ggml_metal_buffer {
 
     // pointers to global device
     ggml_metal_device_t dev;
+
 };
 
 static void ggml_metal_log_allocated_size(id<MTLDevice> device, size_t size_aligned) {
@@ -1509,7 +1649,6 @@ ggml_metal_buffer_t ggml_metal_buffer_init(ggml_metal_device_t dev, size_t size,
     ggml_metal_buffer_t res = calloc(1, sizeof(struct ggml_metal_buffer));
 
     res->dev = dev;
-
     const size_t size_page = sysconf(_SC_PAGESIZE);
 
     size_t size_aligned = size;
@@ -1579,7 +1718,6 @@ ggml_metal_buffer_t ggml_metal_buffer_map(ggml_metal_device_t dev, void * ptr, s
     ggml_metal_buffer_t res = calloc(1, sizeof(struct ggml_metal_buffer));
 
     res->dev = dev;
-
     res->all_data = ptr;
     res->all_size = size;
 
@@ -1906,4 +2044,12 @@ struct ggml_metal_buffer_id ggml_metal_buffer_get_id(ggml_metal_buffer_t buf, co
     GGML_LOG_ERROR("%s: error: tensor '%s' buffer is nil\n", __func__, t->name);
 
     return res;
+}
+
+struct ggml_metal_buffer_id ggml_metal_buffer_get_base_id(ggml_metal_buffer_t buf) {
+    if (buf == NULL || buf->n_buffers <= 0) {
+        return (struct ggml_metal_buffer_id) { nil, 0 };
+    }
+
+    return (struct ggml_metal_buffer_id) { buf->buffers[0].metal, 0 };
 }

@@ -1569,6 +1569,9 @@ static void ggml_compute_forward_mul_mat_id(
 
     if (src1->type != vec_dot_type) {
         incr_ptr_aligned(&wdata_cur, ggml_row_size(vec_dot_type, ggml_nelements(src1)), sizeof(int64_t));
+        if (src1->type == GGML_TYPE_F16) {
+            incr_ptr_aligned(&wdata_cur, nth * ne10 * sizeof(float), sizeof(int64_t));
+        }
     }
 
     int64_t * matrix_row_counts = // [n_as]
@@ -1583,15 +1586,22 @@ static void ggml_compute_forward_mul_mat_id(
     GGML_ASSERT(params->wsize >= (size_t)((char *) wdata_cur - (char *) params->wdata));
 
     if (src1->type != vec_dot_type) {
-        char * wdata = params->wdata;
+        void * wdata_conv_cur = params->wdata;
 
         const size_t nbw0 = ggml_type_size(vec_dot_type);
         const size_t nbw1 = ggml_row_size(vec_dot_type, ne10);
         const size_t nbw2 = nbw1*ne11;
         const size_t nbw3 = nbw2*ne12;
 
-        assert(params->wsize >= ne13*nbw3);
-        GGML_ASSERT(src1->type == GGML_TYPE_F32);
+        char * wdata = incr_ptr_aligned(&wdata_conv_cur, ne13*nbw3, sizeof(int64_t));
+        float * src1_f32_scratch = NULL;
+        if (src1->type == GGML_TYPE_F16) {
+            src1_f32_scratch = incr_ptr_aligned(&wdata_conv_cur, nth * ne10 * sizeof(float), sizeof(int64_t));
+        } else {
+            GGML_ASSERT(src1->type == GGML_TYPE_F32);
+        }
+
+        assert(params->wsize >= (size_t)((char *) wdata_conv_cur - (char *) params->wdata));
 
 #if 0
         for (int64_t i13 = 0; i13 < ne13; ++i13) {
@@ -1610,9 +1620,17 @@ static void ggml_compute_forward_mul_mat_id(
                     size_t bs = ggml_blck_size(vec_dot_type);
                     int64_t ne10_block_start = (ith * ne10/bs) / nth;
                     int64_t ne10_block_end   = ((ith + 1) * ne10/bs) / nth;
-                    from_float((float *)((char *) src1->data + i13*nb13 + i12*nb12 + i11*nb11 + ne10_block_start*bs*nb10),
-                               (void *)               (wdata + i13*nbw3 + i12*nbw2 + i11*nbw1 + ne10_block_start*nbw0),
-                               (ne10_block_end - ne10_block_start) * bs);
+                    const int64_t n = (ne10_block_end - ne10_block_start) * bs;
+                    const char * src1_row = (const char *) src1->data + i13*nb13 + i12*nb12 + i11*nb11 + ne10_block_start*bs*nb10;
+                    const float * src1_f32 = (const float *) src1_row;
+                    if (src1_f32_scratch != NULL) {
+                        float * src1_f32_mut = src1_f32_scratch + ith * ne10;
+                        ggml_fp16_to_fp32_row((const ggml_fp16_t *) src1_row, src1_f32_mut, n);
+                        src1_f32 = src1_f32_mut;
+                    }
+                    from_float(src1_f32,
+                               (void *) (wdata + i13*nbw3 + i12*nbw2 + i11*nbw1 + ne10_block_start*nbw0),
+                               n);
                 }
             }
         }
@@ -2064,6 +2082,30 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_lightning_indexer(params, tensor);
             } break;
+        case GGML_OP_DSA_SPARSE_MASK:
+            {
+                ggml_compute_forward_dsa_sparse_mask(params, tensor);
+            } break;
+        case GGML_OP_DSA_SPARSE_ATTN:
+            {
+                ggml_compute_forward_dsa_sparse_attn(params, tensor);
+            } break;
+        case GGML_OP_DSA_TOP1_ATTN:
+            {
+                ggml_compute_forward_dsa_top1_attn(params, tensor);
+            } break;
+        case GGML_OP_MOE_ROUTE_WEIGHTS:
+            {
+                ggml_compute_forward_moe_route_weights(params, tensor);
+            } break;
+        case GGML_OP_MOE_WEIGHTED_SUM:
+            {
+                ggml_compute_forward_moe_weighted_sum(params, tensor);
+            } break;
+        case GGML_OP_MOE_MUL_MAT_ID:
+            {
+                ggml_compute_forward_moe_mul_mat_id(params, tensor);
+            } break;
         case GGML_OP_MAP_CUSTOM1:
             {
                 ggml_compute_forward_map_custom1(params, tensor);
@@ -2385,6 +2427,12 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_SSM_CONV:
         case GGML_OP_SSM_SCAN:
         case GGML_OP_LIGHTNING_INDEXER:
+        case GGML_OP_DSA_SPARSE_MASK:
+        case GGML_OP_DSA_SPARSE_ATTN:
+        case GGML_OP_DSA_TOP1_ATTN:
+        case GGML_OP_MOE_ROUTE_WEIGHTS:
+        case GGML_OP_MOE_WEIGHTED_SUM:
+        case GGML_OP_MOE_MUL_MAT_ID:
             {
                 n_tasks = n_threads;
             } break;
@@ -2849,6 +2897,9 @@ struct ggml_cplan ggml_graph_plan(
                         // src1
                         if (src1->type != vec_dot_type) {
                             cur += ggml_row_size(vec_dot_type, ggml_nelements(src1)) + sizeof(int64_t);
+                            if (src1->type == GGML_TYPE_F16) {
+                                cur += n_threads * src1->ne[0] * sizeof(float) + sizeof(int64_t);
+                            }
                         }
                         // matrix_row_counts
                         cur += n_as * sizeof(int64_t) + sizeof(int64_t);
@@ -2867,7 +2918,7 @@ struct ggml_cplan ggml_graph_plan(
                 case GGML_OP_ROPE:
                 case GGML_OP_ROPE_BACK:
                     {
-                        cur = ggml_type_size(GGML_TYPE_F32) * node->ne[0] * n_tasks;
+                        cur = ggml_type_size(GGML_TYPE_F32) * node->src[0]->ne[0] * n_tasks;
                     } break;
                 case GGML_OP_CONV_TRANSPOSE_1D:
                     {
@@ -2966,16 +3017,30 @@ struct ggml_cplan ggml_graph_plan(
                         const int64_t per_thread = S_v + (K > 1 ? S_v * S_v : 0);
                         cur = per_thread * sizeof(float) * n_tasks;
                     } break;
+                case GGML_OP_LIGHTNING_INDEXER:
+                    {
+                        const int64_t n_embd = node->src[1]->ne[0];
+                        cur = sizeof(float) * (n_embd + CACHE_LINE_SIZE_F32) * n_tasks;
+                    } break;
+                case GGML_OP_DSA_SPARSE_ATTN:
+                    {
+                        const int64_t dk      = node->src[0]->ne[0];
+                        const int64_t dv      = node->src[2]->ne[0];
+                        const int64_t n_top_k = node->src[4]->ne[0];
+                        cur = sizeof(float) * (dk + dv + n_top_k + CACHE_LINE_SIZE_F32) * n_tasks;
+                    } break;
+                case GGML_OP_DSA_TOP1_ATTN:
+                    {
+                        cur = 0;
+                    } break;
+                case GGML_OP_MOE_MUL_MAT_ID:
+                    {
+                        cur = sizeof(float)*node->src[0]->ne[0]*n_tasks;
+                    } break;
                 case GGML_OP_COUNT:
                     {
                         GGML_ABORT("fatal error");
                     }
-                case GGML_OP_LIGHTNING_INDEXER:
-                    {
-                        // temp buffer for dequantizing lightning indexer keys
-                        const int64_t ne10 = node->src[1]->ne[0];
-                        cur += sizeof(float)*ne10*n_tasks;
-                    } break;
                 default:
                     break;
             }
