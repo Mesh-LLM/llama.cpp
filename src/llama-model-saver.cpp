@@ -280,6 +280,18 @@ void llama_model_saver::add_kv_from_model() {
     add_kv(LLM_KV_ATTENTION_INDEXER_HEAD_COUNT,      hparams.indexer_n_head);
     add_kv(LLM_KV_ATTENTION_INDEXER_KEY_LENGTH,      hparams.indexer_head_size);
     add_kv(LLM_KV_ATTENTION_INDEXER_TOP_K,           hparams.indexer_top_k);
+    if (hparams.indexer_top_k_freq > 0) {
+        add_kv(LLM_KV_ATTENTION_INDEXER_TOP_K_FREQUENCY, hparams.indexer_top_k_freq);
+        add_kv(LLM_KV_ATTENTION_INDEXER_SKIP_TOP_K_OFFSET, hparams.indexer_skip_top_k_offset);
+    }
+    if (hparams.indexer_types_present) {
+        std::vector<std::string> indexer_types;
+        indexer_types.reserve(hparams.n_layer());
+        for (uint32_t il = 0; il < hparams.n_layer(); ++il) {
+            indexer_types.push_back(hparams.indexer_types[il] == 1 ? "full" : "shared");
+        }
+        add_kv(LLM_KV_ATTENTION_INDEXER_TYPES, indexer_types);
+    }
     add_kv(LLM_KV_ATTENTION_RECURRENT_LAYERS,        hparams.is_recr_impl, true);
 
     const float rope_scaling_factor = hparams.rope_freq_scale_train == 1.0f ? 0.0f : 1.0f/hparams.rope_freq_scale_train;

@@ -169,6 +169,7 @@ public:
     //
 
     uint32_t get_n_kv(const slot_info & sinfo) const;
+    uint32_t get_n_kv_used(const slot_info & sinfo) const;
 
     // get views of the current state of the cache
     ggml_tensor * get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
@@ -363,6 +364,7 @@ public:
     //
 
     uint32_t get_n_kv() const;
+    uint32_t get_n_kv_used() const;
 
     ggml_type type_k() const;
     ggml_type type_v() const;
@@ -431,4 +433,5 @@ private:
     // a heuristic, to avoid attending the full cache if it is not yet utilized
     // as the cache gets filled, the benefit from this heuristic disappears
     int32_t n_kv;
+    int32_t n_kv_used = 0;
 };

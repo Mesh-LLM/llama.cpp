@@ -61,6 +61,188 @@ static const llm_fused_op_probe llm_fused_op_lid_probe = {
     /*.n_tokens_per_seq =*/ 1,
 };
 
+static const char * llama_glm_dsa_required_backend_op_name(enum ggml_op op) {
+    switch (op) {
+        case GGML_OP_LIGHTNING_INDEXER: return "GLM-DSA lightning indexer";
+        case GGML_OP_DSA_SPARSE_MASK:   return "GLM-DSA sparse mask";
+        case GGML_OP_DSA_SPARSE_ATTN:   return "GLM-DSA sparse attention";
+        default:                        return nullptr;
+    }
+}
+
+static int llama_glm_dsa_layer_from_named_node(const ggml_tensor * node, const char * prefix) {
+    const size_t prefix_len = strlen(prefix);
+    if (strncmp(node->name, prefix, prefix_len) != 0 || node->name[prefix_len] != '-') {
+        return -1;
+    }
+    return std::stoi(node->name + prefix_len + 1);
+}
+
+static int llama_glm_dsa_required_backend_op_layer(const ggml_tensor * node) {
+    switch (node->op) {
+        case GGML_OP_LIGHTNING_INDEXER:
+            return llama_glm_dsa_layer_from_named_node(node, "indexer_score");
+        case GGML_OP_DSA_SPARSE_MASK:
+            return llama_glm_dsa_layer_from_named_node(node, "dsa_sparse_mask_topk");
+        case GGML_OP_DSA_SPARSE_ATTN:
+            return llama_glm_dsa_layer_from_named_node(node, "dsa_sparse_attn");
+        default:
+            return -1;
+    }
+}
+
+static void llama_glm_dsa_validate_required_backend_ops(
+        const llama_model & model,
+        ggml_backend_sched_t sched,
+        ggml_cgraph * gf) {
+    for (int i = 0; i < ggml_graph_n_nodes(gf); i++) {
+        ggml_tensor * node = ggml_graph_node(gf, i);
+        const char * op_name = llama_glm_dsa_required_backend_op_name(node->op);
+        if (op_name == nullptr) {
+            continue;
+        }
+
+        const int il = llama_glm_dsa_required_backend_op_layer(node);
+        if (il < 0) {
+            throw std::runtime_error(format(
+                    "%s: could not determine layer for %s node '%s'",
+                    __func__, op_name, node->name));
+        }
+
+        ggml_backend_dev_t device_layer = model.dev_layer(il);
+        ggml_backend_dev_t device_op =
+                ggml_backend_get_device(ggml_backend_sched_get_tensor_backend(sched, node));
+        if (device_op != device_layer) {
+            throw std::runtime_error(format(
+                    "%s: layer %d is assigned to device %s but %s is assigned to device %s; "
+                    "backend support is required to avoid CPU fallback",
+                    __func__, il, ggml_backend_dev_name(device_layer), op_name, ggml_backend_dev_name(device_op)));
+        }
+    }
+}
+
+static bool llama_env_enabled(const char * name) {
+    const char * value = getenv(name);
+    return value != nullptr && strcmp(value, "0") != 0 && strcmp(value, "false") != 0 && strcmp(value, "FALSE") != 0;
+}
+
+static bool llama_tensor_name_starts_with(const ggml_tensor * node, const char * prefix) {
+    return node != nullptr && strncmp(node->name, prefix, strlen(prefix)) == 0;
+}
+
+static bool llama_tensor_is_named_compact_glm_dsa_kv(const ggml_tensor * node) {
+    return llama_tensor_name_starts_with(node, "dsa_compact_k_topk_rows") ||
+           llama_tensor_name_starts_with(node, "dsa_compact_v_topk_rows") ||
+           llama_tensor_name_starts_with(node, "dsa_compact_v_topk_view");
+}
+
+static bool llama_glm_dsa_flash_consumes_compact_kv(const ggml_tensor * node) {
+    return node != nullptr &&
+           node->op == GGML_OP_FLASH_ATTN_EXT &&
+           (llama_tensor_is_named_compact_glm_dsa_kv(node->src[1]) ||
+            llama_tensor_is_named_compact_glm_dsa_kv(node->src[2]));
+}
+
+struct llama_glm_dsa_runtime_path_counts {
+    int graph_nodes = 0;
+    int compact_k_rows = 0;
+    int compact_v_rows = 0;
+    int compact_v_view = 0;
+    int compact_flash = 0;
+    int flash_attn = 0;
+    int flash_no_mask = 0;
+    int flash_with_mask = 0;
+    int dsa_sparse_attn = 0;
+    int dsa_sparse_mask = 0;
+    int dense_mask_fill = 0;
+    int dense_mask_topk = 0;
+};
+
+static llama_glm_dsa_runtime_path_counts llama_glm_dsa_count_runtime_path(ggml_cgraph * gf) {
+    llama_glm_dsa_runtime_path_counts counts;
+    counts.graph_nodes = ggml_graph_n_nodes(gf);
+
+    for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+        const ggml_tensor * node = ggml_graph_node(gf, i);
+
+        if (llama_tensor_name_starts_with(node, "dsa_compact_k_topk_rows")) {
+            counts.compact_k_rows += 1;
+        }
+        if (llama_tensor_name_starts_with(node, "dsa_compact_v_topk_rows")) {
+            counts.compact_v_rows += 1;
+        }
+        if (llama_tensor_name_starts_with(node, "dsa_compact_v_topk_view")) {
+            counts.compact_v_view += 1;
+        }
+        if (llama_tensor_name_starts_with(node, "dsa_sparse_mask_fill")) {
+            counts.dense_mask_fill += 1;
+        }
+        if (llama_tensor_name_starts_with(node, "dsa_sparse_mask_topk")) {
+            counts.dense_mask_topk += 1;
+        }
+
+        switch (node->op) {
+            case GGML_OP_FLASH_ATTN_EXT:
+                counts.flash_attn += 1;
+                if (node->src[3] == nullptr) {
+                    counts.flash_no_mask += 1;
+                } else {
+                    counts.flash_with_mask += 1;
+                }
+                if (llama_glm_dsa_flash_consumes_compact_kv(node)) {
+                    counts.compact_flash += 1;
+                }
+                break;
+            case GGML_OP_DSA_SPARSE_ATTN:
+                counts.dsa_sparse_attn += 1;
+                break;
+            case GGML_OP_DSA_SPARSE_MASK:
+                counts.dsa_sparse_mask += 1;
+                break;
+            default:
+                break;
+        }
+    }
+
+    return counts;
+}
+
+static void llama_glm_dsa_log_runtime_path(
+        const llama_model & model,
+        const llama_ubatch & ubatch,
+        ggml_cgraph * gf) {
+    if (model.arch != LLM_ARCH_GLM_DSA || !llama_env_enabled("LLAMA_GLM_DSA_LOG_RUNTIME_PATH")) {
+        return;
+    }
+
+    const llama_glm_dsa_runtime_path_counts counts = llama_glm_dsa_count_runtime_path(gf);
+    const int dense_mask_nodes = counts.dsa_sparse_mask + counts.dense_mask_fill + counts.dense_mask_topk;
+    const bool compact_decode_path =
+            counts.compact_k_rows > 0 &&
+            (counts.compact_v_view > 0 || counts.compact_v_rows > 0) &&
+            counts.compact_flash > 0 &&
+            dense_mask_nodes == 0 &&
+            counts.dsa_sparse_attn == 0;
+
+    LLAMA_LOG_INFO(
+            "llama: glm_dsa_runtime_path tokens=%u graph_nodes=%d compact_decode_path=%d compact_k_rows=%d compact_v_view=%d compact_v_rows=%d compact_flash=%d flash_attn=%d flash_no_mask=%d flash_with_mask=%d dsa_sparse_attn=%d dense_sparse_mask_nodes=%d dsa_sparse_mask=%d dense_mask_fill=%d dense_mask_topk=%d\n",
+            ubatch.n_tokens,
+            counts.graph_nodes,
+            compact_decode_path ? 1 : 0,
+            counts.compact_k_rows,
+            counts.compact_v_view,
+            counts.compact_v_rows,
+            counts.compact_flash,
+            counts.flash_attn,
+            counts.flash_no_mask,
+            counts.flash_with_mask,
+            counts.dsa_sparse_attn,
+            dense_mask_nodes,
+            counts.dsa_sparse_mask,
+            counts.dense_mask_fill,
+            counts.dense_mask_topk);
+}
+
 llama_context::llama_context(
         const llama_model & model,
               llama_context_params params) :
@@ -579,6 +761,22 @@ void llama_context::sched_reserve() {
     LLAMA_LOG_DEBUG("%s: worst-case: n_tokens = %d, n_seqs = %d, n_outputs = %d\n", __func__, n_tokens, n_seqs, n_outputs);
 
     resolve_fused_ops(mctx.get(), n_seqs);
+
+    const char * LLAMA_GLM_DSA_DISABLE_LIGHTNING_INDEXER = getenv("LLAMA_GLM_DSA_DISABLE_LIGHTNING_INDEXER");
+    const bool glm_dsa_disable_lightning_indexer =
+            LLAMA_GLM_DSA_DISABLE_LIGHTNING_INDEXER && atoi(LLAMA_GLM_DSA_DISABLE_LIGHTNING_INDEXER) != 0;
+    if (model.arch == LLM_ARCH_GLM_DSA && glm_dsa_disable_lightning_indexer) {
+        LLAMA_LOG_WARN("%s: GLM-DSA lightning indexer disabled by LLAMA_GLM_DSA_DISABLE_LIGHTNING_INDEXER\n", __func__);
+    } else if (model.arch == LLM_ARCH_GLM_DSA) {
+        LLAMA_LOG_INFO("%s: resolving GLM-DSA required backend op support:\n", __func__);
+
+        auto * gf = graph_reserve(1, n_seqs, n_outputs, mctx.get(), true);
+        if (!gf) {
+            throw std::runtime_error("failed to reserve graph for GLM-DSA required backend op check");
+        }
+
+        llama_glm_dsa_validate_required_backend_ops(model, sched.get(), gf);
+    }
 
     // reserve worst-case graph
     int n_splits_pp = -1;
@@ -1342,6 +1540,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
+
+    llama_glm_dsa_log_runtime_path(model, ubatch, res->get_gf());
 
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
     if (status != GGML_STATUS_SUCCESS) {
@@ -2385,12 +2585,19 @@ llm_graph_params llama_context::graph_params(
                       const llama_ubatch & ubatch,
             const llama_memory_context_i * mctx,
                           llm_graph_type   gtype) const {
+    std::vector<int> layer_backend_device_types;
+    layer_backend_device_types.reserve(model.hparams.n_layer_all);
+    for (uint32_t il = 0; il < model.hparams.n_layer_all; ++il) {
+        layer_backend_device_types.push_back((int) ggml_backend_dev_type(model.dev_layer(il)));
+    }
+
     return {
         /*.arch        =*/ model.arch,
         /*.hparams     =*/ model.hparams,
         /*.cparams     =*/ cparams,
         /*.ubatch      =*/ ubatch,
         /*.gtype       =*/ gtype,
+        /*.layer_backend_device_types =*/ std::move(layer_backend_device_types),
         /*.sched       =*/ sched.get(),
         /*.backend_cpu =*/ backend_cpu,
         /*.cvec        =*/ cvec.get(),

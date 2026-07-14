@@ -12,6 +12,7 @@
 #include "llama-kv-cache-iswa.h"
 #include "llama-kv-cache-dsa.h"
 #include "llama-kv-cache-dsv4.h"
+#include "llama-graph.h"
 #include "llama-memory-hybrid.h"
 #include "llama-memory-hybrid-iswa.h"
 #include "llama-memory-recurrent.h"
@@ -1090,15 +1091,29 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
         ml.get_key(LLM_KV_CONVNEXT_BLOCK_COUNT,      hparams.convnext.n_layer);
     }
 
-    GGML_ASSERT(hparams.n_expert <= LLAMA_MAX_EXPERTS);
-    GGML_ASSERT(hparams.n_expert_used <= hparams.n_expert);
+    if (hparams.n_expert > LLAMA_MAX_EXPERTS) {
+        throw std::runtime_error("expert_count exceeds LLAMA_MAX_EXPERTS");
+    }
+    if (hparams.n_expert_used > hparams.n_expert) {
+        throw std::runtime_error("expert_used_count must be less than or equal to expert_count");
+    }
     if (hparams.n_expert > 0) {
-        GGML_ASSERT(hparams.n_expert_used > 0);
-        GGML_ASSERT(hparams.n_expert_groups < hparams.n_expert);
+        if (hparams.n_expert_used == 0) {
+            throw std::runtime_error("expert_used_count must be positive when expert_count is positive");
+        }
+        if (hparams.n_expert_groups >= hparams.n_expert) {
+            throw std::runtime_error("expert_group_count must be less than expert_count");
+        }
         if (hparams.n_expert_groups > 1) {
-            GGML_ASSERT(hparams.n_expert % hparams.n_expert_groups == 0);
-            GGML_ASSERT(hparams.n_group_used > 0);
-            GGML_ASSERT(hparams.n_group_used < hparams.n_expert_groups);
+            if (hparams.n_expert % hparams.n_expert_groups != 0) {
+                throw std::runtime_error("expert_count must be divisible by expert_group_count");
+            }
+            if (hparams.n_group_used == 0) {
+                throw std::runtime_error("expert_group_used_count must be positive when expert_group_count is greater than one");
+            }
+            if (hparams.n_group_used >= hparams.n_expert_groups) {
+                throw std::runtime_error("expert_group_used_count must be less than expert_group_count");
+            }
         }
     } else {
         GGML_ASSERT(hparams.n_expert_used == 0);
@@ -1112,6 +1127,7 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
     std::fill(hparams.rope_sections.begin(), hparams.rope_sections.end(), 0);
     std::fill(hparams.is_swa_impl.begin(),   hparams.is_swa_impl.end(), 0);
     std::fill(hparams.is_recr_impl.begin(),  hparams.is_recr_impl.end(),  llm_arch_is_recurrent(ml.get_arch()) ? 1 : 0);
+    std::fill(hparams.indexer_types.begin(), hparams.indexer_types.end(), -1);
 
     std::fill(hparams.xielu_alpha_n.begin(), hparams.xielu_alpha_n.end(), 0.0f);
     std::fill(hparams.xielu_alpha_p.begin(), hparams.xielu_alpha_p.end(), 0.0f);
@@ -1234,12 +1250,13 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     const int n_layer_all = hparams.n_layer_all;
     const int n_gpu_layers = this->n_gpu_layers();
 
-    const bool use_mmap_buffer = true;
+    const bool use_mmap_buffer = params.use_mmap_buffer;
 
     this->ml = &ml; // to be used by create_tensor() and load_arch_tensors()
 
-    LLAMA_LOG_INFO("%s: loading model tensors, this can take a while... (mmap = %s, direct_io = %s)\n",
-        __func__, ml.use_mmap ? "true" : "false", ml.use_direct_io ? "true" : "false");
+    LLAMA_LOG_INFO("%s: loading model tensors, this can take a while... (mmap = %s, mmap_prefetch = %s, mmap_buffer = %s, direct_io = %s)\n",
+        __func__, ml.use_mmap ? "true" : "false", params.use_mmap_prefetch ? "true" : "false",
+        params.use_mmap_buffer ? "true" : "false", ml.use_direct_io ? "true" : "false");
 
     // build a list of buffer types for the CPU and GPU devices
     pimpl->cpu_buft_list = make_cpu_buft_list(devices, params.use_extra_bufts, params.no_host);
@@ -1502,7 +1519,11 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
     }
 
-    ml.init_mappings(true, use_mlock ? &pimpl->mlock_mmaps : nullptr);
+    LLAMA_LOG_INFO("%s: initializing mappings for %zu model part(s)\n",
+        __func__, ml.files.size());
+    ml.init_mappings(params.use_mmap_prefetch, use_mlock ? &pimpl->mlock_mmaps : nullptr);
+    LLAMA_LOG_INFO("%s: initialized %zu mapping(s); creating backend buffers for %zu tensor group(s)\n",
+        __func__, ml.mappings.size(), ml.ctx_map.size());
     pimpl->mappings.reserve(ml.mappings.size());
 
     // create the backend buffers
@@ -1513,13 +1534,18 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     const size_t n_max_backend_buffer = ml.ctx_map.size() * ml.files.size();
     pimpl->ctxs_bufs.reserve(n_max_backend_buffer);
 
+    size_t ctx_idx = 0;
     for (auto & [buft, ctx_ptr] : ml.ctx_map) {
+        ++ctx_idx;
         ggml_context * ctx = ctx_ptr.get();
 
         // skip contexts without tensors
         if (ggml_get_first_tensor(ctx) == nullptr) {
             continue;
         }
+
+        LLAMA_LOG_INFO("%s: creating backend buffer group %zu/%zu (%s)\n",
+            __func__, ctx_idx, ml.ctx_map.size(), ggml_backend_buft_name(buft));
 
         llama_buf_map buf_map;
         buf_map.reserve(n_max_backend_buffer);
@@ -1591,6 +1617,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             ggml_backend_buffer_set_usage(buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
         }
 
+        LLAMA_LOG_INFO("%s: created backend buffer group %zu/%zu with %zu buffer(s)\n",
+            __func__, ctx_idx, ml.ctx_map.size(), bufs.size());
+
         pimpl->ctxs_bufs.emplace_back(std::move(ctx_ptr), std::move(bufs));
 
         ctx_buf_maps.emplace_back(ctx, buf_map);
@@ -1625,11 +1654,19 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     }
 
     // load tensor data
+    LLAMA_LOG_INFO("%s: loading tensor data for %zu tensor group(s)\n",
+        __func__, ctx_buf_maps.size());
+    size_t load_ctx_idx = 0;
     for (auto & [ctx, buf_map] : ctx_buf_maps) {
+        ++load_ctx_idx;
+        LLAMA_LOG_INFO("%s: loading tensor data group %zu/%zu\n",
+            __func__, load_ctx_idx, ctx_buf_maps.size());
         if (!ml.load_all_data(ctx, buf_map, use_mlock ? &pimpl->mlock_mmaps : NULL, params.progress_callback, params.progress_callback_user_data)) {
             return false;
         }
     }
+    LLAMA_LOG_INFO("%s: loaded tensor data for %zu tensor group(s)\n",
+        __func__, ctx_buf_maps.size());
 
     if (use_mmap_buffer) {
         for (auto & mapping : ml.mappings) {
@@ -2048,7 +2085,15 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                 res = nullptr;
             } break;
         case LLM_ARCH_DEEPSEEK32:
+        case LLM_ARCH_GLM_DSA:
             {
+                llama_kv_cache::layer_filter_cb filter = nullptr;
+                if (hparams.n_layer_nextn > 0 && params.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
+                    filter = [&](uint32_t il) { return il >= hparams.n_layer(); };
+                } else if (hparams.n_layer_nextn > 0) {
+                    filter = [&](uint32_t il) { return il < hparams.n_layer(); };
+                }
+
                 res = new llama_kv_cache_dsa(
                         *this,
                         params.type_k,
@@ -2061,7 +2106,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                         1,
                         hparams.n_swa,
                         hparams.swa_type,
-                        nullptr,
+                        filter,
                         nullptr);
             } break;
         // Models that need standard caching should rely on recurrent/hybrid
@@ -2310,6 +2355,8 @@ llama_model_params llama_model_default_params() {
         /*.kv_overrides                =*/ nullptr,
         /*.vocab_only                  =*/ false,
         /*.use_mmap                    =*/ true,
+        /*.use_mmap_prefetch           =*/ true,
+        /*.use_mmap_buffer             =*/ true,
         /*.use_direct_io               =*/ false,
         /*.use_mlock                   =*/ false,
         /*.check_tensors               =*/ false,

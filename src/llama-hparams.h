@@ -226,6 +226,10 @@ struct llama_hparams {
     uint32_t indexer_n_head    = 0;
     uint32_t indexer_head_size = 0;
     uint32_t indexer_top_k     = 0;
+    uint32_t indexer_top_k_freq = 0;
+    uint32_t indexer_skip_top_k_offset = 0;
+    bool     indexer_types_present = false;
+    std::array<int32_t, LLAMA_MAX_LAYERS> indexer_types; // -1 unknown, 0 shared, 1 full
 
     // DeepSeek-V4
     uint32_t dsv4_o_group_count        = 0;

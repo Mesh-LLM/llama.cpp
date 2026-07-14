@@ -416,6 +416,10 @@ public:
 
     ggml_tensor * self_k_rot_lid = nullptr;
 
+    bool glm_dsa_compact_decode_mask_eligible = false;
+    bool compact_decode_mla_mask_omitted = false;
+    uint64_t glm_dsa_sparse_attn_route_signature = 0;
+
     const llama_hparams hparams;
     const llama_cparams cparams;
 
@@ -677,6 +681,8 @@ struct llm_graph_params {
 
     llm_graph_type gtype;
 
+    std::vector<int> layer_backend_device_types;
+
     ggml_backend_sched_t sched;
     ggml_backend_t backend_cpu;
 
@@ -776,6 +782,7 @@ struct llm_graph_params {
             cparams.causal_attn             == other.cparams.causal_attn             &&
             arch  == other.arch  &&
             gtype == other.gtype &&
+            layer_backend_device_types == other.layer_backend_device_types &&
             cvec  == other.cvec  &&
             loras == other.loras &&
             cross == other.cross;
@@ -915,6 +922,8 @@ struct llm_graph_context {
 
     const enum llama_pooling_type pooling_type;
     const enum llama_rope_type    rope_type;
+
+    const std::vector<int> & layer_backend_device_types;
 
     ggml_backend_sched_t sched;
 
@@ -1073,6 +1082,25 @@ struct llm_graph_context {
                   float   kq_scale,
                     int   il) const;
 
+    ggml_tensor * build_attn_mha_dsa_sparse(
+            ggml_tensor * q,
+            ggml_tensor * k,
+            ggml_tensor * v,
+            ggml_tensor * kq_mask_rows,
+            ggml_tensor * top_k,
+            ggml_tensor * v_mla,
+                  float   kq_scale,
+                    int   il) const;
+
+    ggml_tensor * build_attn_mha_dsa_compact_flash(
+            ggml_tensor * q,
+            ggml_tensor * k,
+            ggml_tensor * v,
+            ggml_tensor * top_k,
+            ggml_tensor * v_mla,
+                  float   kq_scale,
+                    int   il) const;
+
     llm_graph_input_attn_no_cache * build_attn_inp_no_cache() const;
 
     ggml_tensor * build_attn(
@@ -1134,7 +1162,7 @@ struct llm_graph_context {
             ggml_tensor * kq_b,
             ggml_tensor * sinks, // [n_head_q]
             ggml_tensor * v_mla, // [n_embd_head_v_mla, n_embd_head_v, n_head_v]
-            ggml_tensor * top_k, // [n_indexer_top_k, n_tokens]
+            ggml_tensor * top_k, // runtime layout: I32 [n_top_k, n_batch, 1, n_stream]
                   float   kq_scale,
                     int   il) const;
 

@@ -21,6 +21,787 @@
 #include <string>
 #include <unordered_set>
 
+static bool llama_env_enabled(const char * name) {
+    const char * value = getenv(name);
+    return value != nullptr && strcmp(value, "0") != 0 && strcmp(value, "false") != 0 && strcmp(value, "FALSE") != 0;
+}
+
+static bool llama_env_disabled(const char * name) {
+    const char * value = getenv(name);
+    return value != nullptr && (strcmp(value, "0") == 0 || strcmp(value, "false") == 0 || strcmp(value, "FALSE") == 0);
+}
+
+static bool llama_glm_dsa_fused_sparse_mask_enabled() {
+    return llama_env_enabled("LLAMA_GLM_DSA_ENABLE_FUSED_SPARSE_MASK");
+}
+
+static bool llama_glm_dsa_direct_sparse_attn_enabled() {
+    if (llama_env_disabled("LLAMA_GLM_DSA_ENABLE_DIRECT_SPARSE_ATTN") ||
+        llama_env_enabled("LLAMA_GLM_DSA_DISABLE_DIRECT_SPARSE_ATTN")) {
+        return false;
+    }
+    if (llama_env_enabled("LLAMA_GLM_DSA_ENABLE_DIRECT_SPARSE_ATTN")) {
+        return true;
+    }
+    return true;
+}
+
+static bool llama_glm_dsa_compact_flash_attn_disabled() {
+    return llama_env_enabled("LLAMA_GLM_DSA_DISABLE_COMPACT_FLASH_ATTN");
+}
+
+static bool llama_glm_dsa_top1_attn_disabled() {
+    return llama_env_enabled("LLAMA_GLM_DSA_DISABLE_TOP1_ATTN");
+}
+
+static bool llama_glm_dsa_all_kv_flash_disabled() {
+    return llama_env_enabled("LLAMA_GLM_DSA_DISABLE_ALL_KV_FLASH");
+}
+
+static bool llama_glm_dsa_direct_sparse_prefill_enabled() {
+    if (llama_env_disabled("LLAMA_GLM_DSA_ENABLE_DIRECT_SPARSE_PREFILL") ||
+        llama_env_enabled("LLAMA_GLM_DSA_DISABLE_DIRECT_SPARSE_PREFILL")) {
+        return false;
+    }
+    if (llama_env_enabled("LLAMA_GLM_DSA_ENABLE_DIRECT_SPARSE_PREFILL")) {
+        return true;
+    }
+    return false;
+}
+
+static bool llama_glm_dsa_unproven_large_direct_sparse_prefill_enabled() {
+    return llama_env_enabled("LLAMA_GLM_DSA_ENABLE_UNPROVEN_LARGE_DIRECT_SPARSE_PREFILL");
+}
+
+static int64_t llama_glm_dsa_direct_sparse_prefill_max_tokens() {
+    const char * value = getenv("LLAMA_GLM_DSA_DIRECT_SPARSE_PREFILL_MAX_TOKENS");
+    if (value == nullptr || value[0] == '\0') {
+        return 8;
+    }
+
+    const int64_t parsed = atoll(value);
+    return parsed <= 0 ? INT64_MAX : parsed;
+}
+
+static int64_t llama_glm_dsa_dense_sparse_mask_max_bytes() {
+    const char * value = getenv("LLAMA_GLM_DSA_DENSE_SPARSE_MASK_MAX_BYTES");
+    if (value == nullptr || value[0] == '\0') {
+        return 512LL * 1024LL * 1024LL;
+    }
+
+    const int64_t parsed = atoll(value);
+    return parsed <= 0 ? INT64_MAX : parsed;
+}
+
+static int64_t llama_glm_dsa_compact_flash_min_kv() {
+    const char * value = getenv("LLAMA_GLM_DSA_COMPACT_FLASH_MIN_KV");
+    if (value == nullptr || value[0] == '\0') {
+        return 1;
+    }
+
+    const int64_t parsed = atoll(value);
+    return parsed <= 0 ? 0 : parsed;
+}
+
+static ggml_type llama_glm_dsa_mla_kq_mask_type(const llama_cparams & cparams) {
+    return cparams.flash_attn ? GGML_TYPE_F16 : GGML_TYPE_F32;
+}
+
+static int64_t llama_glm_dsa_kq_mask_nbytes(
+        ggml_type type,
+        int64_t   n_kv,
+        int64_t   n_batch,
+        int64_t   n_stream) {
+    return (int64_t) ggml_row_size(type, n_kv) * n_batch * n_stream;
+}
+
+static bool llama_glm_dsa_verification_batch_shape(
+        const llama_ubatch & ubatch,
+        int64_t             sparse_batch,
+        int64_t             sparse_streams) {
+    if (ubatch.pos == nullptr || ubatch.output == nullptr || ubatch.n_tokens <= 1 || sparse_batch <= 1 || sparse_streams <= 0) {
+        return false;
+    }
+    if (ubatch.n_tokens % sparse_streams != 0 || ubatch.pos[0] <= 0) {
+        return false;
+    }
+    for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+        if (!ubatch.output[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool llama_glm_dsa_direct_sparse_decision_log_enabled() {
+    return llama_env_enabled("LLAMA_GLM_DSA_LOG_DIRECT_SPARSE_DECISIONS");
+}
+
+static bool llama_glm_dsa_compact_flash_policy_log_enabled() {
+    return llama_env_enabled("LLAMA_GLM_DSA_LOG_COMPACT_FLASH_POLICY") ||
+           llama_glm_dsa_direct_sparse_decision_log_enabled();
+}
+
+static bool llama_glm_dsa_moe_weighted_sum_enabled() {
+    return llama_env_enabled("LLAMA_GLM_DSA_ENABLE_MOE_WEIGHTED_SUM");
+}
+
+static bool llama_glm_dsa_native_moe_down_enabled() {
+    return llama_env_enabled("GGML_GLM_DSA_EXPERIMENTAL_NATIVE_MOE_DOWN");
+}
+
+static bool llama_glm_dsa_q3_down_weighted_parallel_enabled() {
+    return llama_env_enabled("LLAMA_GLM_DSA_EXPERIMENTAL_Q3_DOWN_WEIGHTED_PARALLEL");
+}
+
+static bool llama_glm_dsa_q3_down_weighted_parallel_default_enabled() {
+    if (llama_env_enabled("GGML_GLM_DSA_DISABLE_Q3_DOWN_WEIGHTED_PARALLEL_DEFAULT") ||
+            llama_env_enabled("LLAMA_GLM_DSA_DISABLE_Q3_DOWN_WEIGHTED_PARALLEL_DEFAULT")) {
+        return false;
+    }
+    if (llama_env_enabled("GGML_GLM_DSA_ENABLE_Q3_DOWN_WEIGHTED_PARALLEL_DEFAULT") ||
+            llama_env_enabled("LLAMA_GLM_DSA_ENABLE_Q3_DOWN_WEIGHTED_PARALLEL_DEFAULT")) {
+        return true;
+    }
+    return false;
+}
+
+static bool llama_glm_dsa_q2_down_weighted_slots_enabled() {
+    return llama_env_enabled("LLAMA_GLM_DSA_EXPERIMENTAL_Q2_DOWN_WEIGHTED_SLOTS");
+}
+
+static bool llama_glm_dsa_q2_down_f16_act_enabled() {
+    return llama_env_enabled("GGML_METAL_EXPERIMENTAL_Q2_DOWN_F16_ACT") ||
+           llama_env_enabled("LLAMA_GLM_DSA_EXPERIMENTAL_Q2_DOWN_F16_ACT");
+}
+
+static bool llama_glm_dsa_q2_gate_up_prequant_q8_enabled() {
+    return llama_env_enabled("GGML_METAL_EXPERIMENTAL_Q2_GATE_UP_PREQUANT_Q8");
+}
+
+static bool llama_glm_dsa_log_moe_down_weighted_slots_decision() {
+    return llama_env_enabled("LLAMA_GLM_DSA_LOG_MOE_DOWN_WEIGHTED_SLOTS_DECISION");
+}
+
+static bool llama_glm_dsa_moe_route_weights_enabled() {
+    if (llama_env_disabled("LLAMA_GLM_DSA_ENABLE_MOE_ROUTE_WEIGHTS") ||
+        llama_env_enabled("LLAMA_GLM_DSA_DISABLE_MOE_ROUTE_WEIGHTS")) {
+        return false;
+    }
+
+    return true;
+}
+
+static bool llama_glm_dsa_moe_top_k_enabled() {
+    if (llama_env_disabled("LLAMA_GLM_DSA_ENABLE_MOE_TOP_K") ||
+        llama_env_enabled("LLAMA_GLM_DSA_DISABLE_MOE_TOP_K")) {
+        return false;
+    }
+
+    return llama_env_enabled("LLAMA_GLM_DSA_ENABLE_MOE_TOP_K");
+}
+
+static ggml_tensor * llama_glm_dsa_top_k_for_sparse_attn(ggml_context * ctx, ggml_tensor * top_k) {
+    GGML_ASSERT(top_k != nullptr && "GLM-DSA sparse attention requires top-k indices");
+    GGML_ASSERT(top_k->type == GGML_TYPE_I32 && "GLM-DSA top-k indices must be I32");
+    GGML_ASSERT(top_k->ne[0] > 0 && "GLM-DSA top-k must have at least one selected key");
+    GGML_ASSERT(top_k->ne[1] > 0 && "GLM-DSA top-k must have at least one batch row");
+    GGML_ASSERT(top_k->ne[2] == 1 && "GLM-DSA runtime top-k layout must be [n_top_k, n_batch, 1, n_stream]");
+    GGML_ASSERT(top_k->ne[3] > 0 && "GLM-DSA top-k must have at least one stream");
+
+    // Lower-level sparse ops consume [n_top_k, n_batch, n_top_stream, 1].
+    return ggml_view_4d(
+            ctx,
+            top_k,
+            top_k->ne[0], top_k->ne[1], top_k->ne[3], 1,
+            top_k->nb[1], top_k->nb[3], top_k->nb[2],
+            0);
+}
+
+enum class llama_glm_dsa_sparse_attn_route {
+    DENSE_MASK,
+    DIRECT_SPARSE,
+    COMPACT_FLASH,
+};
+
+static bool llama_glm_dsa_backend_supports_native_sparse(int backend_device_type) {
+    switch (backend_device_type) {
+        case GGML_BACKEND_DEVICE_TYPE_GPU:
+        case GGML_BACKEND_DEVICE_TYPE_IGPU:
+        case GGML_BACKEND_DEVICE_TYPE_ACCEL:
+            return true;
+        case GGML_BACKEND_DEVICE_TYPE_CPU:
+        case GGML_BACKEND_DEVICE_TYPE_META:
+            return false;
+    }
+
+    return false;
+}
+
+static bool llama_glm_dsa_backend_supports_compact_flash(int backend_device_type) {
+    switch (backend_device_type) {
+        case GGML_BACKEND_DEVICE_TYPE_CPU:
+        case GGML_BACKEND_DEVICE_TYPE_GPU:
+        case GGML_BACKEND_DEVICE_TYPE_IGPU:
+        case GGML_BACKEND_DEVICE_TYPE_ACCEL:
+            return true;
+        case GGML_BACKEND_DEVICE_TYPE_META:
+            return false;
+    }
+
+    return false;
+}
+
+static bool llama_glm_dsa_layer_backend_supports_native_sparse(
+        const std::vector<int> & layer_backend_device_types,
+        int il) {
+    if (il < 0 || (size_t) il >= layer_backend_device_types.size()) {
+        return false;
+    }
+
+    return llama_glm_dsa_backend_supports_native_sparse(layer_backend_device_types[il]);
+}
+
+static bool llama_glm_dsa_layer_backend_supports_compact_flash(
+        const std::vector<int> & layer_backend_device_types,
+        int il) {
+    if (il < 0 || (size_t) il >= layer_backend_device_types.size()) {
+        return false;
+    }
+
+    return llama_glm_dsa_backend_supports_compact_flash(layer_backend_device_types[il]);
+}
+
+static bool llama_glm_dsa_all_layer_backends_support_native_sparse(
+        const std::vector<int> & layer_backend_device_types) {
+    if (layer_backend_device_types.empty()) {
+        return false;
+    }
+
+    for (int backend_device_type : layer_backend_device_types) {
+        if (!llama_glm_dsa_backend_supports_native_sparse(backend_device_type)) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+static bool llama_glm_dsa_all_layer_backends_support_compact_flash(
+        const std::vector<int> & layer_backend_device_types) {
+    if (layer_backend_device_types.empty()) {
+        return false;
+    }
+
+    for (int backend_device_type : layer_backend_device_types) {
+        if (!llama_glm_dsa_backend_supports_compact_flash(backend_device_type)) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+struct llama_glm_dsa_sparse_attn_policy {
+    llama_glm_dsa_sparse_attn_route route = llama_glm_dsa_sparse_attn_route::DENSE_MASK;
+    const char * phase = "other";
+    const char * direct_selector_reason = "unknown";
+    const char * compact_selector_reason = "unknown";
+    bool direct_enabled = false;
+    bool prefill_enabled = false;
+    bool decode_shape = false;
+    bool verify_shape = false;
+    bool verify_token_shape_allowed = false;
+    bool prefill_observed = false;
+    bool prefill_shape = false;
+    bool large_prefill_shape = false;
+    bool token_shape_allowed = false;
+    bool kq_b_ok = false;
+    bool sinks_ok = false;
+    bool alibi_ok = false;
+    bool soft_cap_ok = false;
+    bool compact_disabled = false;
+    bool compact_large_decode_top_k = false;
+    bool compact_mask_omitted = false;
+    bool compact_kv_ok = false;
+    bool compact_candidate = false;
+    bool backend_sparse_supported = false;
+    bool backend_compact_supported = false;
+    bool flash_attn = false;
+    int64_t direct_sparse_decode_max_top_k = 0;
+    int64_t compact_flash_min_kv = 0;
+
+    bool use_direct_sparse_attn() const {
+        return route == llama_glm_dsa_sparse_attn_route::DIRECT_SPARSE;
+    }
+
+    bool use_compact_flash_attn() const {
+        return route == llama_glm_dsa_sparse_attn_route::COMPACT_FLASH;
+    }
+};
+
+static constexpr int64_t LLAMA_GLM_DSA_DIRECT_SPARSE_DECODE_DEFAULT_MAX_TOP_K = 256;
+
+static int64_t llama_glm_dsa_direct_sparse_decode_max_top_k() {
+    const char * value = getenv("LLAMA_GLM_DSA_DIRECT_SPARSE_DECODE_MAX_TOP_K");
+    if (value == nullptr || value[0] == '\0') {
+        return LLAMA_GLM_DSA_DIRECT_SPARSE_DECODE_DEFAULT_MAX_TOP_K;
+    }
+
+    const int64_t parsed = atoll(value);
+    return parsed <= 0 ? INT64_MAX : parsed;
+}
+
+static llama_glm_dsa_sparse_attn_policy llama_glm_dsa_choose_sparse_attn_policy(
+        int64_t sparse_batch,
+        int64_t sparse_streams,
+        int64_t sparse_kv,
+        int64_t sparse_top_k,
+        int64_t ubatch_tokens,
+        bool    verification_batch,
+        int64_t prefill_cap,
+        int64_t dense_mask_bytes,
+        int64_t dense_mask_limit,
+        bool    direct_sparse_enabled,
+        bool    direct_sparse_prefill_enabled,
+        bool    unproven_large_direct_sparse_prefill_enabled,
+        bool    flash_attn,
+        bool    backend_sparse_supported,
+        bool    backend_compact_supported,
+        bool    compact_flash_disabled,
+        bool    compact_mask_omitted,
+        bool    kq_b_ok,
+        bool    sinks_ok,
+        bool    alibi_ok,
+        bool    soft_cap_ok) {
+    llama_glm_dsa_sparse_attn_policy policy;
+    policy.direct_enabled = direct_sparse_enabled;
+    policy.prefill_enabled = direct_sparse_prefill_enabled;
+    policy.kq_b_ok = kq_b_ok;
+    policy.sinks_ok = sinks_ok;
+    policy.alibi_ok = alibi_ok;
+    policy.soft_cap_ok = soft_cap_ok;
+    policy.compact_disabled = compact_flash_disabled;
+    policy.compact_mask_omitted = compact_mask_omitted;
+    policy.backend_sparse_supported = backend_sparse_supported;
+    policy.backend_compact_supported = backend_compact_supported;
+    policy.flash_attn = flash_attn;
+    policy.direct_sparse_decode_max_top_k = llama_glm_dsa_direct_sparse_decode_max_top_k();
+    policy.compact_flash_min_kv = llama_glm_dsa_compact_flash_min_kv();
+
+    policy.decode_shape =
+            sparse_streams > 0 &&
+            sparse_batch == 1 &&
+            ubatch_tokens == sparse_streams;
+    policy.verify_shape = verification_batch;
+    policy.prefill_observed =
+            (!policy.decode_shape && !policy.verify_shape && sparse_batch > 1);
+    policy.verify_token_shape_allowed =
+            policy.verify_shape &&
+            direct_sparse_prefill_enabled &&
+            sparse_batch <= prefill_cap;
+    policy.prefill_shape =
+            policy.prefill_observed &&
+            direct_sparse_prefill_enabled &&
+            sparse_batch <= prefill_cap;
+    policy.large_prefill_shape =
+            policy.prefill_observed &&
+            direct_sparse_prefill_enabled &&
+            unproven_large_direct_sparse_prefill_enabled &&
+            sparse_batch > prefill_cap &&
+            dense_mask_bytes > dense_mask_limit;
+    policy.token_shape_allowed =
+            policy.decode_shape ||
+            policy.verify_token_shape_allowed ||
+            policy.prefill_shape ||
+            policy.large_prefill_shape;
+    policy.phase =
+            policy.decode_shape ? "decode" :
+            policy.verify_shape ? "verify" :
+            policy.prefill_observed ? "prefill" :
+            "other";
+
+    policy.compact_large_decode_top_k =
+            policy.decode_shape &&
+            sparse_top_k > policy.direct_sparse_decode_max_top_k;
+    policy.compact_kv_ok = sparse_kv >= policy.compact_flash_min_kv;
+    policy.compact_candidate =
+            !compact_flash_disabled &&
+            policy.decode_shape &&
+            policy.compact_kv_ok &&
+            (policy.compact_large_decode_top_k || compact_mask_omitted);
+    const bool compact_ready =
+            policy.compact_candidate &&
+            backend_compact_supported &&
+            flash_attn &&
+            kq_b_ok &&
+            sinks_ok &&
+            alibi_ok &&
+            soft_cap_ok;
+    if (compact_ready) {
+        policy.route = llama_glm_dsa_sparse_attn_route::COMPACT_FLASH;
+        policy.direct_selector_reason = "compact_flash_selected";
+        policy.compact_selector_reason =
+                compact_mask_omitted ? "decode_compact_mask_omitted" :
+                "decode_compact_large_top_k";
+        return policy;
+    }
+
+    const bool direct_ready =
+            direct_sparse_enabled &&
+            backend_sparse_supported &&
+            policy.token_shape_allowed &&
+            !policy.compact_large_decode_top_k &&
+            !compact_mask_omitted &&
+            kq_b_ok &&
+            sinks_ok &&
+            alibi_ok &&
+            soft_cap_ok;
+    if (direct_ready) {
+        policy.route = llama_glm_dsa_sparse_attn_route::DIRECT_SPARSE;
+        policy.direct_selector_reason =
+                policy.decode_shape ? "decode" :
+                policy.verify_shape ? "verify" :
+                policy.prefill_shape ? "short_prefill" :
+                policy.large_prefill_shape ? "dense_mask_guard_large_prefill" :
+                "unknown";
+    } else {
+        policy.direct_selector_reason =
+                !direct_sparse_enabled ? "direct_sparse_disabled" :
+                !backend_sparse_supported ? "backend_sparse_unsupported" :
+                policy.verify_shape && !direct_sparse_prefill_enabled ? "verify_sparse_disabled" :
+                policy.verify_shape && sparse_batch > prefill_cap ? "verify_batch_over_cap" :
+                policy.prefill_observed && !direct_sparse_prefill_enabled ? "prefill_sparse_disabled" :
+                policy.prefill_observed && sparse_batch > prefill_cap ? "prefill_batch_over_cap" :
+                !policy.token_shape_allowed ? "token_shape_not_allowed" :
+                policy.compact_large_decode_top_k ? "direct_sparse_top_k_too_large" :
+                compact_mask_omitted ? "mla_kq_mask_omitted" :
+                !kq_b_ok ? "kq_b_present" :
+                !sinks_ok ? "sinks_present" :
+                !alibi_ok ? "alibi_present" :
+                !soft_cap_ok ? "soft_cap_present" :
+                "unknown";
+    }
+
+    policy.compact_selector_reason =
+            compact_flash_disabled ? "disabled" :
+            !backend_compact_supported ? "backend_compact_unsupported" :
+            !flash_attn ? "flash_attn_disabled" :
+            !policy.decode_shape ? "not_decode" :
+            !policy.compact_kv_ok ? "kv_below_min" :
+            !policy.compact_large_decode_top_k && !compact_mask_omitted ? "small_decode_top_k" :
+            !kq_b_ok ? "kq_b_present" :
+            !sinks_ok ? "sinks_present" :
+            !alibi_ok ? "alibi_present" :
+            !soft_cap_ok ? "soft_cap_present" :
+            "unknown";
+
+    return policy;
+}
+
+static bool llama_glm_dsa_can_skip_mla_kq_mask_for_compact_decode(
+        const llama_hparams & hparams,
+        const llama_cparams & cparams,
+        const llama_ubatch  & ubatch,
+        const llama_kv_cache_context * mctx_mla,
+        bool backend_compact_supported,
+        bool eligible) {
+    if (!eligible || mctx_mla == nullptr) {
+        return false;
+    }
+
+    const int64_t n_stream = cparams.kv_unified ? 1 : ubatch.n_seqs_unq;
+    if (n_stream <= 0 || ubatch.n_tokens % n_stream != 0) {
+        return false;
+    }
+
+    const int64_t n_batch  = ubatch.n_tokens / n_stream;
+    const int64_t n_kv     = mctx_mla->get_n_kv();
+    const int64_t top_k    = std::min<int64_t>(n_kv, hparams.indexer_top_k);
+    const int64_t nbytes   = llama_glm_dsa_kq_mask_nbytes(
+            llama_glm_dsa_mla_kq_mask_type(cparams),
+            n_kv,
+            n_batch,
+            n_stream);
+
+    const llama_glm_dsa_sparse_attn_policy policy = llama_glm_dsa_choose_sparse_attn_policy(
+            n_batch,
+            n_stream,
+            n_kv,
+            top_k,
+            ubatch.n_tokens,
+            false,
+            llama_glm_dsa_direct_sparse_prefill_max_tokens(),
+            nbytes,
+            llama_glm_dsa_dense_sparse_mask_max_bytes(),
+            llama_glm_dsa_direct_sparse_attn_enabled(),
+            llama_glm_dsa_direct_sparse_prefill_enabled(),
+            llama_glm_dsa_unproven_large_direct_sparse_prefill_enabled(),
+            cparams.flash_attn,
+            false,
+            backend_compact_supported,
+            llama_glm_dsa_compact_flash_attn_disabled(),
+            false,
+            true,
+            true,
+            hparams.f_max_alibi_bias == 0.0f,
+            !hparams.attn_soft_cap);
+
+    return policy.use_compact_flash_attn();
+}
+
+static uint64_t llama_glm_dsa_sparse_attn_route_signature(
+        const llama_hparams & hparams,
+        const llama_cparams & cparams,
+        const llama_ubatch  & ubatch,
+        const llama_kv_cache_context * mctx_mla,
+        int64_t n_kv_used,
+        const std::vector<int> & layer_backend_device_types,
+        bool compact_decode_mla_mask_omitted,
+        bool eligible) {
+    if (!eligible || mctx_mla == nullptr) {
+        return 0;
+    }
+
+    const int64_t n_stream = cparams.kv_unified ? 1 : ubatch.n_seqs_unq;
+    if (n_stream <= 0 || ubatch.n_tokens % n_stream != 0) {
+        return 0;
+    }
+
+    const int64_t n_batch = ubatch.n_tokens / n_stream;
+    const int64_t n_kv    = mctx_mla->get_n_kv();
+    const int64_t top_k = std::min<int64_t>(n_kv_used, hparams.indexer_top_k);
+    const int64_t nbytes = llama_glm_dsa_kq_mask_nbytes(
+            llama_glm_dsa_mla_kq_mask_type(cparams),
+            n_kv,
+            n_batch,
+            n_stream);
+
+    uint64_t signature = 17;
+    signature = signature*31 + (uint64_t) n_batch;
+    signature = signature*31 + (uint64_t) n_stream;
+    signature = signature*31 + (uint64_t) n_kv;
+    signature = signature*31 + (uint64_t) top_k;
+    signature = signature*31 + (compact_decode_mla_mask_omitted ? 1 : 0);
+
+    for (size_t il = 0; il < layer_backend_device_types.size(); ++il) {
+        const llama_glm_dsa_sparse_attn_policy policy = llama_glm_dsa_choose_sparse_attn_policy(
+                n_batch,
+                n_stream,
+                n_kv,
+                top_k,
+                ubatch.n_tokens,
+                llama_glm_dsa_verification_batch_shape(ubatch, n_batch, n_stream),
+                llama_glm_dsa_direct_sparse_prefill_max_tokens(),
+                nbytes,
+                llama_glm_dsa_dense_sparse_mask_max_bytes(),
+                llama_glm_dsa_direct_sparse_attn_enabled(),
+                llama_glm_dsa_direct_sparse_prefill_enabled(),
+                llama_glm_dsa_unproven_large_direct_sparse_prefill_enabled(),
+                cparams.flash_attn,
+                llama_glm_dsa_layer_backend_supports_native_sparse(layer_backend_device_types, (int) il),
+                llama_glm_dsa_layer_backend_supports_compact_flash(layer_backend_device_types, (int) il),
+                llama_glm_dsa_compact_flash_attn_disabled(),
+                compact_decode_mla_mask_omitted,
+                true,
+                true,
+                hparams.f_max_alibi_bias == 0.0f,
+                !hparams.attn_soft_cap);
+        signature = signature*31 + (uint64_t) static_cast<int>(policy.route);
+    }
+
+    return signature;
+}
+
+static bool llama_glm_dsa_can_view_compact_v_from_k(
+        const ggml_tensor * k,
+        const ggml_tensor * v,
+        const ggml_tensor * k_top_k,
+        bool                v_trans) {
+    if (v_trans || k == nullptr || v == nullptr || k_top_k == nullptr) {
+        return false;
+    }
+
+    if (k->type != GGML_TYPE_F16 || v->type != GGML_TYPE_F16 || k_top_k->type != GGML_TYPE_F16) {
+        return false;
+    }
+
+    if (v->ne[0] <= 0 || v->ne[0] > k->ne[0]) {
+        return false;
+    }
+
+    if (k_top_k->ne[0] != k->ne[0] || k_top_k->ne[2] != k->ne[2] || k_top_k->ne[3] != k->ne[3]) {
+        return false;
+    }
+
+    for (int i = 1; i < GGML_MAX_DIMS; ++i) {
+        if (v->ne[i] != k->ne[i]) {
+            return false;
+        }
+    }
+
+    for (int i = 0; i < GGML_MAX_DIMS; ++i) {
+        if (v->nb[i] != k->nb[i]) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+static void llama_glm_dsa_log_direct_sparse_decision(
+        int     layer,
+        int64_t ubatch_tokens,
+        int64_t sparse_batch,
+        int64_t sparse_streams,
+        int64_t sparse_kv,
+        int64_t sparse_top_k,
+        int64_t prefill_cap,
+        int64_t decode_max_top_k,
+        int64_t dense_mask_bytes,
+        int64_t dense_mask_limit,
+        bool    direct_enabled,
+        bool    prefill_enabled,
+        bool    decode_shape,
+        bool    verify_shape,
+        bool    prefill_shape,
+        bool    large_prefill_shape,
+        bool    token_shape_allowed,
+        bool    backend_sparse_supported,
+        bool    kq_b_ok,
+        bool    sinks_ok,
+        bool    alibi_ok,
+        bool    soft_cap_ok,
+        bool    use_direct,
+        const char * phase,
+        const char * selector_reason) {
+    if (!llama_glm_dsa_direct_sparse_decision_log_enabled()) {
+        return;
+    }
+
+    const int64_t kv_topk_ratio = sparse_top_k > 0 ? sparse_kv / sparse_top_k : 0;
+
+    LLAMA_LOG_INFO(
+            "llama: glm_dsa_direct_sparse_decision layer=%d ubatch_tokens=%lld sparse_batch=%lld sparse_streams=%lld prefill_cap=%lld decode_max_top_k=%lld sparse_kv=%lld sparse_top_k=%lld min_kv_topk_ratio=%lld kv_topk_ratio=%lld dense_mask_bytes=%lld dense_mask_limit=%lld phase=%s selector_reason=%s direct_enabled=%d prefill_enabled=%d decode_shape=%d verify_shape=%d prefill_shape=%d large_prefill_shape=%d token_shape_allowed=%d backend_sparse_supported=%d kq_b_ok=%d sinks_ok=%d alibi_ok=%d soft_cap_ok=%d use_direct=%d\n",
+            layer,
+            (long long) ubatch_tokens,
+            (long long) sparse_batch,
+            (long long) sparse_streams,
+            (long long) prefill_cap,
+            (long long) decode_max_top_k,
+            (long long) sparse_kv,
+            (long long) sparse_top_k,
+            0LL,
+            (long long) kv_topk_ratio,
+            (long long) dense_mask_bytes,
+            (long long) dense_mask_limit,
+            phase,
+            selector_reason,
+            direct_enabled ? 1 : 0,
+            prefill_enabled ? 1 : 0,
+            decode_shape ? 1 : 0,
+            verify_shape ? 1 : 0,
+            prefill_shape ? 1 : 0,
+            large_prefill_shape ? 1 : 0,
+            token_shape_allowed ? 1 : 0,
+            backend_sparse_supported ? 1 : 0,
+            kq_b_ok ? 1 : 0,
+            sinks_ok ? 1 : 0,
+            alibi_ok ? 1 : 0,
+            soft_cap_ok ? 1 : 0,
+            use_direct ? 1 : 0);
+}
+
+static void llama_glm_dsa_log_compact_flash_policy(
+        int     layer,
+        int64_t ubatch_tokens,
+        int64_t visible_kv,
+        int64_t top_k,
+        int64_t decode_max_top_k,
+        int64_t compact_min_kv,
+        bool    disabled,
+        bool    large_decode_top_k,
+        bool    kv_ok,
+        bool    enabled,
+        bool    backend_compact_supported,
+        bool    flash_attn,
+        bool    decode_shape,
+        bool    no_mask,
+        bool    kq_b_ok,
+        bool    sinks_ok,
+        bool    alibi_ok,
+        bool    soft_cap_ok,
+        bool    use_compact,
+        const char * selector_reason) {
+    if (!llama_glm_dsa_compact_flash_policy_log_enabled()) {
+        return;
+    }
+
+    LLAMA_LOG_INFO(
+            "llama: glm_dsa_compact_flash_policy layer=%d ubatch_tokens=%lld visible_kv=%lld top_k=%lld decode_max_top_k=%lld compact_min_kv=%lld kv_topk_ratio=%lld forced=%d disabled=%d large_decode_top_k=%d kv_ok=%d enabled=%d backend_compact_supported=%d flash_attn=%d phase=%s decode_shape=%d kq_b_ok=%d sinks_ok=%d alibi_ok=%d soft_cap_ok=%d no_mask=%d use_compact=%d selector_reason=%s\n",
+            layer,
+            (long long) ubatch_tokens,
+            (long long) visible_kv,
+            (long long) top_k,
+            (long long) decode_max_top_k,
+            (long long) compact_min_kv,
+            top_k > 0 ? (long long) (visible_kv/top_k) : 0LL,
+            0,
+            disabled ? 1 : 0,
+            large_decode_top_k ? 1 : 0,
+            kv_ok ? 1 : 0,
+            enabled ? 1 : 0,
+            backend_compact_supported ? 1 : 0,
+            flash_attn ? 1 : 0,
+            decode_shape ? "decode" : "other",
+            decode_shape ? 1 : 0,
+            kq_b_ok ? 1 : 0,
+            sinks_ok ? 1 : 0,
+            alibi_ok ? 1 : 0,
+            soft_cap_ok ? 1 : 0,
+            no_mask ? 1 : 0,
+            use_compact ? 1 : 0,
+            selector_reason);
+}
+
+static void llama_glm_dsa_log_compact_flash_mask(
+        int     layer,
+        bool    omitted_mla_kq_mask,
+        int64_t visible_kv,
+        int64_t ubatch_tokens,
+        int64_t streams,
+        int64_t max_top_k) {
+    if (!llama_glm_dsa_compact_flash_policy_log_enabled()) {
+        return;
+    }
+
+    LLAMA_LOG_INFO(
+            "llama: glm_dsa_compact_flash_mask layer=%d omitted_mla_kq_mask=%d visible_kv=%lld ubatch_tokens=%lld streams=%lld max_top_k=%lld\n",
+            layer,
+            omitted_mla_kq_mask ? 1 : 0,
+            (long long) visible_kv,
+            (long long) ubatch_tokens,
+            (long long) streams,
+            (long long) max_top_k);
+}
+
+static void llama_glm_dsa_log_all_kv_flash(
+        int     layer,
+        int64_t visible_kv,
+        int64_t top_k,
+        bool    v_trans) {
+    if (!llama_glm_dsa_compact_flash_policy_log_enabled()) {
+        return;
+    }
+
+    LLAMA_LOG_INFO(
+            "llama: glm_dsa_all_kv_flash layer=%d visible_kv=%lld top_k=%lld v_trans=%d reason=top_k_covers_visible_kv\n",
+            layer,
+            (long long) visible_kv,
+            (long long) top_k,
+            v_trans ? 1 : 0);
+}
+
 // dedup helpers
 
 static ggml_tensor * build_attn_inp_kq_mask(
@@ -519,15 +1300,25 @@ bool llm_graph_input_attn_k::can_reuse(const llm_graph_params & params) {
 }
 
 void llm_graph_input_attn_k_dsa::set_input(const llama_ubatch * ubatch) {
-    mctx->get_mla()->set_input_k_idxs(self_k_idxs_mla, ubatch);
+    if (self_k_idxs_mla && self_k_idxs_mla->buffer) {
+        mctx->get_mla()->set_input_k_idxs(self_k_idxs_mla, ubatch);
+    }
 
-    mctx->get_mla()->set_input_kq_mask(self_kq_mask_mla, ubatch, cparams.causal_attn);
+    if (self_kq_mask_mla && self_kq_mask_mla->buffer) {
+        mctx->get_mla()->set_input_kq_mask(self_kq_mask_mla, ubatch, cparams.causal_attn);
+    }
 
-    mctx->get_lid()->set_input_k_idxs(self_k_idxs_lid, ubatch);
+    if (self_k_idxs_lid && self_k_idxs_lid->buffer) {
+        mctx->get_lid()->set_input_k_idxs(self_k_idxs_lid, ubatch);
+    }
 
-    mctx->get_lid()->set_input_kq_mask(self_kq_mask_lid, ubatch, cparams.causal_attn);
+    if (self_kq_mask_lid && self_kq_mask_lid->buffer) {
+        mctx->get_lid()->set_input_kq_mask(self_kq_mask_lid, ubatch, cparams.causal_attn);
+    }
 
-    mctx->get_lid()->set_input_k_rot(self_k_rot_lid);
+    if (self_k_rot_lid && self_k_rot_lid->buffer) {
+        mctx->get_lid()->set_input_k_rot(self_k_rot_lid);
+    }
 }
 
 bool llm_graph_input_attn_k_dsa::can_reuse(const llm_graph_params & params) {
@@ -536,12 +1327,38 @@ bool llm_graph_input_attn_k_dsa::can_reuse(const llm_graph_params & params) {
     this->mctx = mctx;
 
     bool res = true;
+    const bool skip_mla_mask = llama_glm_dsa_can_skip_mla_kq_mask_for_compact_decode(
+            hparams,
+            params.cparams,
+            params.ubatch,
+            mctx->get_mla(),
+            llama_glm_dsa_all_layer_backends_support_compact_flash(params.layer_backend_device_types),
+            glm_dsa_compact_decode_mask_eligible);
 
-    res &= self_k_idxs_mla->ne[0] == params.ubatch.n_tokens;
-    res &= self_k_idxs_lid->ne[0] == params.ubatch.n_tokens;
+    res &= compact_decode_mla_mask_omitted == skip_mla_mask;
+    res &= glm_dsa_sparse_attn_route_signature == llama_glm_dsa_sparse_attn_route_signature(
+            hparams,
+            params.cparams,
+            params.ubatch,
+            mctx->get_mla(),
+            mctx->get_lid()->get_n_kv_used(),
+            params.layer_backend_device_types,
+            skip_mla_mask,
+            glm_dsa_compact_decode_mask_eligible);
 
-    res &= can_reuse_kq_mask(self_kq_mask_mla, mctx->get_mla(), params.ubatch, params.cparams);
-    res &= can_reuse_kq_mask(self_kq_mask_lid, mctx->get_lid(), params.ubatch, params.cparams);
+    if (self_k_idxs_mla && self_k_idxs_mla->buffer) {
+        res &= self_k_idxs_mla->ne[0] == params.ubatch.n_tokens;
+    }
+    if (self_k_idxs_lid && self_k_idxs_lid->buffer) {
+        res &= self_k_idxs_lid->ne[0] == params.ubatch.n_tokens;
+    }
+
+    if (self_kq_mask_mla && self_kq_mask_mla->buffer) {
+        res &= can_reuse_kq_mask(self_kq_mask_mla, mctx->get_mla(), params.ubatch, params.cparams);
+    }
+    if (self_kq_mask_lid && self_kq_mask_lid->buffer) {
+        res &= can_reuse_kq_mask(self_kq_mask_lid, mctx->get_lid(), params.ubatch, params.cparams);
+    }
 
     return res;
 }
@@ -1351,6 +2168,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     n_ctx_orig       (cparams.n_ctx_orig_yarn),
     pooling_type     (cparams.pooling_type),
     rope_type        (hparams.rope_type),
+    layer_backend_device_types(params.layer_backend_device_types),
     sched            (params.sched),
     backend_cpu      (params.backend_cpu),
     cvec             (params.cvec),
@@ -1796,6 +2614,71 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     );
 }
 
+struct llm_routed_moe_decode_motif {
+    const char * family = "generic";
+    bool matched = false;
+    bool exact_glm_dsa_q3_decode = false;
+    bool weighted_down_input_compatible = false;
+};
+
+static llm_routed_moe_decode_motif llm_match_routed_moe_decode_motif(
+             llm_arch   arch,
+          ggml_tensor * cur,
+          ggml_tensor * weights,
+          ggml_tensor * down_exps,
+          ggml_tensor * down_exps_b,
+          ggml_tensor * down_exps_s,
+              int64_t   n_embd,
+              int64_t   n_expert_used,
+              int64_t   n_tokens,
+                 bool   weight_before_ffn) {
+    llm_routed_moe_decode_motif motif;
+
+    if (arch == LLM_ARCH_GLM_DSA) {
+        motif.family = "glm_dsa";
+    }
+
+    const bool has_route_weights =
+        weights != nullptr &&
+        weights->type == GGML_TYPE_F32 &&
+        weights->ne[0] == 1 &&
+        weights->ne[1] == n_expert_used &&
+        weights->ne[2] == n_tokens;
+
+    const bool has_selected_act =
+        cur != nullptr &&
+        cur->type == GGML_TYPE_F32 &&
+        cur->ne[1] == n_expert_used &&
+        cur->ne[2] == n_tokens;
+
+    motif.matched =
+        !weight_before_ffn &&
+        n_tokens == 1 &&
+        n_expert_used > 1 &&
+        has_route_weights &&
+        has_selected_act &&
+        down_exps != nullptr &&
+        down_exps_b == nullptr &&
+        down_exps_s == nullptr;
+
+    if (!motif.matched) {
+        return motif;
+    }
+
+    motif.weighted_down_input_compatible =
+        down_exps->type == GGML_TYPE_Q3_K ||
+        down_exps->type == GGML_TYPE_Q2_K;
+
+    motif.exact_glm_dsa_q3_decode =
+        arch == LLM_ARCH_GLM_DSA &&
+        down_exps->type == GGML_TYPE_Q3_K &&
+        n_expert_used == 8 &&
+        n_embd == 6144 &&
+        cur->ne[0] == 2048;
+
+    return motif;
+}
+
 ggml_tensor * llm_graph_context::build_moe_ffn(
          ggml_tensor * cur,
          ggml_tensor * gate_inp,
@@ -1912,8 +2795,15 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     // select experts
     ggml_tensor * selected_experts = selected_experts_in;
     if (selected_experts == nullptr) {
-        selected_experts = ggml_argsort_top_k(ctx0, selection_probs, n_expert_used); // [n_expert_used, n_tokens]
-        cb(selected_experts->src[0], "ffn_moe_argsort", il);
+        const bool use_moe_top_k =
+                arch == LLM_ARCH_GLM_DSA &&
+                llama_glm_dsa_moe_top_k_enabled();
+        selected_experts = use_moe_top_k
+                ? ggml_top_k(ctx0, selection_probs, n_expert_used)
+                : ggml_argsort_top_k(ctx0, selection_probs, n_expert_used);
+        if (!use_moe_top_k) {
+            cb(selected_experts->src[0], "ffn_moe_argsort", il);
+        }
     }
     cb(selected_experts, "ffn_moe_topk", il);
 
@@ -1926,41 +2816,68 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         probs = ggml_reshape_3d(ctx0, probs, 1, n_expert, n_tokens);
     }
 
-    ggml_tensor * weights = ggml_get_rows(ctx0, probs, selected_experts); // [1, n_expert_used, n_tokens]
-    cb(weights, "ffn_moe_weights", il);
+    const bool use_moe_route_weights =
+            arch == LLM_ARCH_GLM_DSA &&
+            llama_glm_dsa_moe_route_weights_enabled() &&
+            gating_op != LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX_WEIGHT;
 
+    ggml_tensor * weights = nullptr;
+    if (use_moe_route_weights) {
+        const float route_scale = w_scale != 0.0f ? w_scale : 1.0f;
+        weights = ggml_moe_route_weights(ctx0, probs, selected_experts, norm_w, 6.103515625e-5, route_scale);
+        cb(weights, "ffn_moe_route_weights", il);
+    } else {
+        weights = ggml_get_rows(ctx0, probs, selected_experts); // [1, n_expert_used, n_tokens]
+        cb(weights, "ffn_moe_weights", il);
 
-    if (gating_op == LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX_WEIGHT) {
-        weights = ggml_reshape_2d(ctx0, weights, n_expert_used, n_tokens);
-        weights = ggml_soft_max(ctx0, weights); // [n_expert_used, n_tokens]
-        weights = ggml_reshape_3d(ctx0, weights, 1, n_expert_used, n_tokens);
-        cb(weights, "ffn_moe_weights_softmax", il);
-    }
+        if (gating_op == LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX_WEIGHT) {
+            weights = ggml_reshape_2d(ctx0, weights, n_expert_used, n_tokens);
+            weights = ggml_soft_max(ctx0, weights); // [n_expert_used, n_tokens]
+            weights = ggml_reshape_3d(ctx0, weights, 1, n_expert_used, n_tokens);
+            cb(weights, "ffn_moe_weights_softmax", il);
+        }
 
-    if (norm_w) {
-        weights = ggml_reshape_2d(ctx0, weights, n_expert_used, n_tokens);
+        if (norm_w) {
+            weights = ggml_reshape_2d(ctx0, weights, n_expert_used, n_tokens);
 
-        ggml_tensor * weights_sum = ggml_sum_rows(ctx0, weights); // [1, n_tokens]
-        cb(weights_sum, "ffn_moe_weights_sum", il);
+            ggml_tensor * weights_sum = ggml_sum_rows(ctx0, weights); // [1, n_tokens]
+            cb(weights_sum, "ffn_moe_weights_sum", il);
 
-        // Avoid division by zero, clamp to smallest number representable by F16
-        weights_sum = ggml_clamp(ctx0, weights_sum, 6.103515625e-5, INFINITY);
-        cb(weights_sum, "ffn_moe_weights_sum_clamped", il);
+            // Avoid division by zero, clamp to smallest number representable by F16
+            weights_sum = ggml_clamp(ctx0, weights_sum, 6.103515625e-5, INFINITY);
+            cb(weights_sum, "ffn_moe_weights_sum_clamped", il);
 
-        weights = ggml_div(ctx0, weights, weights_sum); // [n_expert_used, n_tokens]
-        cb(weights, "ffn_moe_weights_norm", il);
+            weights = ggml_div(ctx0, weights, weights_sum); // [n_expert_used, n_tokens]
+            cb(weights, "ffn_moe_weights_norm", il);
 
-        weights = ggml_reshape_3d(ctx0, weights, 1, n_expert_used, n_tokens);
-    }
-    if (w_scale != 0.0f && w_scale != 1.0f) {
-        weights = ggml_scale(ctx0, weights, w_scale);
-        cb(weights, "ffn_moe_weights_scaled", il);
+            weights = ggml_reshape_3d(ctx0, weights, 1, n_expert_used, n_tokens);
+        }
+        if (w_scale != 0.0f && w_scale != 1.0f) {
+            weights = ggml_scale(ctx0, weights, w_scale);
+            cb(weights, "ffn_moe_weights_scaled", il);
+        }
     }
 
     //call early so that topk-moe can be used
     ggml_build_forward_expand(gf, weights);
 
     cur = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
+
+    ggml_tensor * gate_up_q8 = nullptr;
+    if (arch == LLM_ARCH_GLM_DSA &&
+            llama_glm_dsa_q2_gate_up_prequant_q8_enabled() &&
+            gate_up_exps == nullptr &&
+            gate_exps != nullptr &&
+            up_exps != nullptr &&
+            gate_exps_s == nullptr &&
+            up_exps_s == nullptr &&
+            gate_exps->type == GGML_TYPE_Q2_K &&
+            up_exps->type == GGML_TYPE_Q2_K &&
+            cur->type == GGML_TYPE_F32 &&
+            n_tokens == 1) {
+        gate_up_q8 = ggml_cast(ctx0, cur, GGML_TYPE_Q8_0);
+        cb(gate_up_q8, "ffn_moe_gate_up_q8", il);
+    }
 
     if (weight_before_ffn) {
         // repeat cur to [n_embd, n_expert_used, n_tokens]
@@ -1994,6 +2911,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     } else {
         // separate gate and up path
         up = build_lora_mm_id(up_exps, cur, selected_experts, up_exps_s); // [n_ff, n_expert_used, n_tokens]
+        if (gate_up_q8 != nullptr && up->op == GGML_OP_MUL_MAT_ID) {
+            up->src[3] = gate_up_q8;
+        }
         cb(up, "ffn_moe_up", il);
 
         if (up_exps_s) {
@@ -2007,6 +2927,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
         if (gate_exps) {
             cur = build_lora_mm_id(gate_exps, cur, selected_experts, gate_exps_s); // [n_ff, n_expert_used, n_tokens]
+            if (gate_up_q8 != nullptr && cur->op == GGML_OP_MUL_MAT_ID) {
+                cur->src[3] = gate_up_q8;
+            }
             cb(cur, "ffn_moe_gate", il);
         } else {
             cur = up;
@@ -2095,7 +3018,94 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             GGML_ABORT("fatal error");
     }
 
+    const llm_routed_moe_decode_motif routed_moe_decode_motif =
+        llm_match_routed_moe_decode_motif(
+            arch,
+            cur,
+            weights,
+            down_exps,
+            down_exps_b,
+            down_exps_s,
+            n_embd,
+            n_expert_used,
+            n_tokens,
+            weight_before_ffn);
+
+    const bool glm_dsa_q3_decode_weighted_down_default =
+        routed_moe_decode_motif.exact_glm_dsa_q3_decode &&
+        llama_glm_dsa_q3_down_weighted_parallel_default_enabled();
+
+    const bool use_down_weighted_slots =
+        routed_moe_decode_motif.weighted_down_input_compatible &&
+        arch == LLM_ARCH_GLM_DSA &&
+        (glm_dsa_q3_decode_weighted_down_default ||
+         llama_glm_dsa_q3_down_weighted_parallel_enabled() ||
+         (llama_glm_dsa_q2_down_weighted_slots_enabled() && down_exps->type == GGML_TYPE_Q2_K)) &&
+        routed_moe_decode_motif.matched;
+
+    if (arch == LLM_ARCH_GLM_DSA &&
+            llama_glm_dsa_q3_down_weighted_parallel_enabled() &&
+            llama_glm_dsa_log_moe_down_weighted_slots_decision()) {
+        fprintf(stderr,
+            "llama: glm_dsa_moe_down_weighted_slots_decision layer=%d use=%d down_type=%s has_down_bias=%d has_down_scale=%d weights_type=%s weights_shape=[%lld,%lld,%lld] cur_type=%s cur_shape=[%lld,%lld,%lld] n_expert_used=%lld n_tokens=%lld\n",
+            il,
+            use_down_weighted_slots ? 1 : 0,
+            ggml_type_name(down_exps->type),
+            down_exps_b != nullptr ? 1 : 0,
+            down_exps_s != nullptr ? 1 : 0,
+            ggml_type_name(weights->type),
+            (long long) weights->ne[0],
+            (long long) weights->ne[1],
+            (long long) weights->ne[2],
+            ggml_type_name(cur->type),
+            (long long) cur->ne[0],
+            (long long) cur->ne[1],
+            (long long) cur->ne[2],
+            (long long) n_expert_used,
+            (long long) n_tokens);
+    }
+
+    if (use_down_weighted_slots) {
+        cur = ggml_mul(ctx0, cur, weights);
+        cb(cur, "ffn_moe_down_weighted_input", il);
+    }
+
+    const bool use_q2_down_f16_act =
+        routed_moe_decode_motif.matched &&
+        arch == LLM_ARCH_GLM_DSA &&
+        down_exps->type == GGML_TYPE_Q2_K &&
+        !use_down_weighted_slots &&
+        llama_glm_dsa_q2_down_f16_act_enabled();
+
+    if (use_q2_down_f16_act) {
+        cur = ggml_cast(ctx0, cur, GGML_TYPE_F16);
+        cb(cur, "ffn_moe_swiglu_f16", il);
+    }
+
+    const bool use_native_moe_down =
+        llama_glm_dsa_native_moe_down_enabled() &&
+        arch == LLM_ARCH_GLM_DSA &&
+        n_tokens == 1 &&
+        !weight_before_ffn &&
+        !use_down_weighted_slots &&
+        down_exps_b == nullptr &&
+        down_exps_s == nullptr &&
+        loras->empty() &&
+        (down_exps->type == GGML_TYPE_Q2_K || down_exps->type == GGML_TYPE_Q3_K) &&
+        (cur->type == GGML_TYPE_F32 || cur->type == GGML_TYPE_F16) &&
+        weights->type == GGML_TYPE_F32;
+
+    if (use_native_moe_down) {
+        ggml_tensor * moe_out = ggml_moe_mul_mat_id(ctx0, down_exps, cur, selected_experts, weights);
+        cb(moe_out, "ffn_moe_out", il);
+        ggml_build_forward_expand(gf, moe_out);
+        return moe_out;
+    }
+
     experts = build_lora_mm_id(down_exps, cur, selected_experts, down_exps_s); // [n_embd, n_expert_used, n_tokens]
+    if (use_down_weighted_slots && experts->op == GGML_OP_MUL_MAT_ID) {
+        experts->op_params[0] = 1;
+    }
     cb(experts, "ffn_moe_down", il);
 
     if (down_exps_s) {
@@ -2107,6 +3117,29 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(experts, "ffn_moe_down_biased", il);
     }
 
+    const bool use_moe_weighted_sum =
+        !weight_before_ffn &&
+        (arch == LLM_ARCH_GLM_DSA || llama_glm_dsa_moe_weighted_sum_enabled()) &&
+        n_expert_used == hparams.n_expert_used &&
+        n_expert_used > 1 &&
+        weights->type == GGML_TYPE_F32 &&
+        experts->type == GGML_TYPE_F32 &&
+        weights->ne[0] == 1 &&
+        weights->ne[1] == n_expert_used &&
+        weights->ne[2] == n_tokens &&
+        experts->ne[0] == n_embd &&
+        experts->ne[1] == n_expert_used &&
+        experts->ne[2] == n_tokens;
+
+    if (use_moe_weighted_sum) {
+        ggml_tensor * moe_out = ggml_moe_weighted_sum(ctx0, experts, weights);
+        if (use_down_weighted_slots) {
+            moe_out->op_params[0] = 1;
+        }
+        ggml_build_forward_expand(gf, moe_out);
+        cb(moe_out, "ffn_moe_out", il);
+        return moe_out;
+    }
     if (!weight_before_ffn) {
         experts = ggml_mul(ctx0, experts, weights);
         cb(experts, "ffn_moe_weighted", il);
@@ -2516,6 +3549,170 @@ ggml_tensor * llm_graph_context::build_attn_mha(
     return cur;
 }
 
+ggml_tensor * llm_graph_context::build_attn_mha_dsa_sparse(
+         ggml_tensor * q,
+         ggml_tensor * k,
+         ggml_tensor * v,
+         ggml_tensor * kq_mask_rows,
+         ggml_tensor * top_k,
+         ggml_tensor * v_mla,
+               float   kq_scale,
+                 int   il) const {
+    const bool v_trans = v->nb[1] > v->nb[2];
+
+    const auto n_stream = k->ne[3];
+
+    q = ggml_view_4d(ctx0, q, q->ne[0], q->ne[1], q->ne[2]/n_stream, n_stream, q->nb[1], q->nb[2], q->nb[3]/n_stream, 0);
+
+    q = ggml_permute(ctx0, q, 0, 2, 1, 3);
+    k = ggml_permute(ctx0, k, 0, 2, 1, 3);
+    v = ggml_permute(ctx0, v, 0, 2, 1, 3);
+
+    GGML_UNUSED(v_trans);
+
+    ggml_tensor * cur = ggml_dsa_sparse_attn(ctx0, q, k, v, kq_mask_rows, top_k, kq_scale);
+    cb(cur, "dsa_sparse_attn", il);
+
+    if (v_mla) {
+        cur = ggml_mul_mat(ctx0, v_mla, cur);
+        cb(cur, "kqv_mla", il);
+    }
+
+    cur = ggml_permute(ctx0, cur, 0, 2, 1, 3);
+    cur = ggml_cont_2d(ctx0, cur, cur->ne[0]*cur->ne[1], cur->ne[2]*cur->ne[3]);
+
+    ggml_build_forward_expand(gf, cur);
+
+    return cur;
+}
+
+ggml_tensor * llm_graph_context::build_attn_mha_dsa_compact_flash(
+         ggml_tensor * q,
+         ggml_tensor * k,
+         ggml_tensor * v,
+         ggml_tensor * top_k,
+         ggml_tensor * v_mla,
+               float   kq_scale,
+                 int   il) const {
+    const bool v_trans = v->nb[1] > v->nb[2];
+
+    const auto n_stream = k->ne[3];
+
+    q = ggml_view_4d(ctx0, q, q->ne[0], q->ne[1], q->ne[2]/n_stream, n_stream, q->nb[1], q->nb[2], q->nb[3]/n_stream, 0);
+
+    q = ggml_permute(ctx0, q, 0, 2, 1, 3);
+    k = ggml_permute(ctx0, k, 0, 2, 1, 3);
+    v = ggml_permute(ctx0, v, 0, 2, 1, 3);
+
+    if (v_trans) {
+        v = ggml_transpose(ctx0, v);
+    }
+
+    GGML_ASSERT(top_k->ne[1] == k->ne[2]);
+    GGML_ASSERT(top_k->ne[2] == k->ne[3]);
+    GGML_ASSERT(top_k->ne[1] == v->ne[2]);
+    GGML_ASSERT(top_k->ne[2] == v->ne[3]);
+
+    if (!llama_glm_dsa_all_kv_flash_disabled() && top_k->ne[0] >= k->ne[1]) {
+        llama_glm_dsa_log_all_kv_flash(il, k->ne[1], top_k->ne[0], v_trans);
+
+        ggml_tensor * cur = ggml_flash_attn_ext(
+                ctx0,
+                q,
+                k,
+                v,
+                nullptr,
+                kq_scale,
+                hparams.f_max_alibi_bias,
+                hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
+        cb(cur, "fattn", il);
+        ggml_flash_attn_ext_set_prec(cur, GGML_PREC_F32);
+
+        if (v_mla) {
+            cur = ggml_permute(ctx0, cur, 0, 2, 1, 3);
+            cur = ggml_mul_mat(ctx0, v_mla, cur);
+            cb(cur, "fattn_mla", il);
+            cur = ggml_permute(ctx0, cur, 0, 2, 1, 3);
+            cur = ggml_cont(ctx0, cur);
+        }
+
+        cur = ggml_reshape_2d(ctx0, cur, cur->ne[0]*cur->ne[1], cur->ne[2]*cur->ne[3]);
+
+        ggml_build_forward_expand(gf, cur);
+
+        return cur;
+    }
+
+    if (!llama_glm_dsa_top1_attn_disabled() && top_k->ne[0] == 1) {
+        ggml_tensor * cur = ggml_dsa_top1_attn(ctx0, q, v, top_k);
+        cb(cur, "dsa_top1_attn", il);
+
+        if (v_mla) {
+            cur = ggml_mul_mat(ctx0, v_mla, cur);
+            cb(cur, "fattn_mla", il);
+            cur = ggml_permute(ctx0, cur, 0, 2, 1, 3);
+            cur = ggml_cont(ctx0, cur);
+        }
+
+        cur = ggml_reshape_2d(ctx0, cur, cur->ne[0]*cur->ne[1], cur->ne[2]*cur->ne[3]);
+
+        ggml_build_forward_expand(gf, cur);
+
+        return cur;
+    }
+
+    ggml_tensor * k_top_k = ggml_get_rows_typed(ctx0, k, top_k);
+    cb(k_top_k, "dsa_compact_k_topk_rows", il);
+    if (k_top_k->type == GGML_TYPE_F32) {
+        k_top_k = ggml_cast(ctx0, k_top_k, GGML_TYPE_F16);
+        cb(k_top_k, "dsa_compact_k_topk_rows_f16", il);
+    }
+
+    ggml_tensor * v_top_k = nullptr;
+    if (llama_glm_dsa_can_view_compact_v_from_k(k, v, k_top_k, v_trans)) {
+        v_top_k = ggml_view_4d(
+                ctx0,
+                k_top_k,
+                v->ne[0], k_top_k->ne[1], k_top_k->ne[2], k_top_k->ne[3],
+                k_top_k->nb[1], k_top_k->nb[2], k_top_k->nb[3],
+                0);
+        cb(v_top_k, "dsa_compact_v_topk_view", il);
+    } else {
+        v_top_k = ggml_get_rows_typed(ctx0, v, top_k);
+        cb(v_top_k, "dsa_compact_v_topk_rows", il);
+        if (v_top_k->type == GGML_TYPE_F32) {
+            v_top_k = ggml_cast(ctx0, v_top_k, GGML_TYPE_F16);
+            cb(v_top_k, "dsa_compact_v_topk_rows_f16", il);
+        }
+    }
+
+    ggml_tensor * cur = ggml_flash_attn_ext(
+            ctx0,
+            q,
+            k_top_k,
+            v_top_k,
+            nullptr,
+            kq_scale,
+            hparams.f_max_alibi_bias,
+            hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
+    cb(cur, "fattn", il);
+    ggml_flash_attn_ext_set_prec(cur, GGML_PREC_F32);
+
+    if (v_mla) {
+        cur = ggml_permute(ctx0, cur, 0, 2, 1, 3);
+        cur = ggml_mul_mat(ctx0, v_mla, cur);
+        cb(cur, "fattn_mla", il);
+        cur = ggml_permute(ctx0, cur, 0, 2, 1, 3);
+        cur = ggml_cont(ctx0, cur);
+    }
+
+    cur = ggml_reshape_2d(ctx0, cur, cur->ne[0]*cur->ne[1], cur->ne[2]*cur->ne[3]);
+
+    ggml_build_forward_expand(gf, cur);
+
+    return cur;
+}
+
 llm_graph_input_attn_no_cache * llm_graph_context::build_attn_inp_no_cache() const {
     auto inp = std::make_unique<llm_graph_input_attn_no_cache>(hparams, cparams);
 
@@ -2818,50 +4015,219 @@ ggml_tensor * llm_graph_context::build_attn(
         ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il));
     }
 
-    const auto & kq_mask = inp->get_kq_mask_mla();
+    ggml_tensor * top_k_3d = llama_glm_dsa_top_k_for_sparse_attn(ctx0, top_k);
 
-    // prepare new kq mask - starts filled with -INFINITY
-    ggml_tensor * kq_mask_all = ggml_fill(ctx0, kq_mask, -INFINITY);
+    const bool roofline_bypass_terminal = ubatch.n_tokens == 1 &&
+            llama_env_enabled("LLAMA_GLM_DSA_ROOFLINE_BYPASS_ATTN_TERMINAL");
+    const bool roofline_bypass_value_tail = ubatch.n_tokens == 1 &&
+            llama_env_enabled("LLAMA_GLM_DSA_ROOFLINE_BYPASS_ATTN_VALUE_TAIL");
+    const bool roofline_bypass_output = ubatch.n_tokens == 1 &&
+            llama_env_enabled("LLAMA_GLM_DSA_ROOFLINE_BYPASS_ATTN_OUTPUT");
+    GGML_ASSERT(
+            (roofline_bypass_terminal ? 1 : 0) +
+            (roofline_bypass_value_tail ? 1 : 0) +
+            (roofline_bypass_output ? 1 : 0) <= 1);
+    const auto roofline_zero_output = [&](ggml_tensor * source, size_t token_stride, const char * name) {
+        GGML_ASSERT(ggml_nelements(source) >= hparams.n_embd*ubatch.n_tokens);
+        ggml_tensor * slice = ggml_view_2d(
+                ctx0, source, hparams.n_embd, ubatch.n_tokens, token_stride, 0);
+        ggml_tensor * result = ggml_scale(ctx0, slice, 0.0f);
+        cb(result, name, il);
+        return result;
+    };
+    const auto finish_attn_output = [&](ggml_tensor * cur) {
+        if (roofline_bypass_output) {
+            return roofline_zero_output(cur, cur->nb[1], "attn_output_roofline_zero");
+        }
+        if (wo) {
+            cur = build_lora_mm(wo, cur, wo_s);
+        }
+        if (wo_b) {
+            cur = ggml_add(ctx0, cur, wo_b);
+        }
+        return cur;
+    };
+    const auto finish_attn_value_tail = [&](ggml_tensor * cur) {
+        if (roofline_bypass_value_tail) {
+            return roofline_zero_output(cur, cur->nb[1], "attn_value_tail_roofline_zero");
+        }
+        return finish_attn_output(cur);
+    };
 
-    // reshape KQ mask into tensor with rows of size 1:
-    // [n_kv, n_batch, 1, n_stream] -> [1, n_kv, n_batch, n_stream]
-    kq_mask_all = ggml_view_4d(ctx0, kq_mask_all, 1, kq_mask_all->ne[0], kq_mask_all->ne[1], kq_mask_all->ne[3], kq_mask_all->nb[0], kq_mask_all->nb[1], kq_mask_all->nb[2], 0);
+    if (roofline_bypass_terminal) {
+        ggml_build_forward_expand(gf, top_k_3d);
+        return roofline_zero_output(q_cur, q_cur->nb[2], "attn_terminal_roofline_zero");
+    }
 
-    // reshape top_k indices: [n_top_k, n_batch, 1, n_stream] -> [n_top_k, n_batch, n_stream, 1]
-    ggml_tensor * top_k_3d = ggml_view_4d(ctx0, top_k, top_k->ne[0], top_k->ne[1], top_k->ne[3], 1, top_k->nb[1], top_k->nb[2], top_k->ne[3]*top_k->nb[3], 0);
+    ggml_tensor * q = q_cur;
+    ggml_tensor * k = mctx_cur->get_k(ctx0, il);
+    ggml_tensor * v = ggml_view_4d(ctx0, k, v_cur->ne[0], k->ne[1], k->ne[2], k->ne[3], k->nb[1], k->nb[2], k->nb[3], 0);
+    ggml_tensor * value_projection = roofline_bypass_value_tail ? nullptr : v_mla;
 
-    // prepare zero-filled tensor with rows of size 1: [1, n_top_k, n_batch, n_stream]
-    // this will be our source of zero values for unmasking top k mask elements
-    ggml_tensor * zeros = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, 1, top_k_3d->ne[0], top_k_3d->ne[1], top_k_3d->ne[2]);
-    zeros = ggml_fill(ctx0, zeros, 0.0f);
+    ggml_tensor * kq_mask = inp->get_kq_mask_mla();
+    ggml_tensor * kq_mask_rows = nullptr;
+    const auto ensure_kq_mask_rows = [&]() -> ggml_tensor * {
+        if (kq_mask == nullptr) {
+            throw std::runtime_error("GLM_DSA compact decode omitted the MLA KQ mask but selected a mask-dependent attention route");
+        }
+        if (kq_mask_rows == nullptr) {
+            // reshape KQ mask into tensor with rows of size 1:
+            // [n_kv, n_batch, 1, n_stream] -> [1, n_kv, n_batch, n_stream]
+            kq_mask_rows = ggml_view_4d(
+                    ctx0, kq_mask,
+                    1, kq_mask->ne[0], kq_mask->ne[1], kq_mask->ne[3],
+                    kq_mask->nb[0], kq_mask->nb[1], kq_mask->nb[2], 0);
+        }
+        return kq_mask_rows;
+    };
 
-    // modify KQ mask by unmasking elements that are in top_k indices
-    // ggml_set_rows([1, n_kv, n_batch, n_stream], [1, n_top_k, n_batch, n_stream], [n_top_k, n_batch, n_stream, 1])
-    ggml_tensor * kq_mask_top_k = ggml_set_rows(ctx0, kq_mask_all, zeros, top_k_3d);
+    const int64_t n_direct_sparse_stream = cparams.kv_unified ? 1 : ubatch.n_seqs_unq;
+    const int64_t n_direct_sparse_batch = top_k_3d->ne[1];
+    const int64_t n_sparse_kv = mctx_cur->get_n_kv();
+    const int64_t n_sparse_top_k = top_k_3d->ne[0];
+    const int64_t dense_sparse_mask_bytes = llama_glm_dsa_kq_mask_nbytes(
+            llama_glm_dsa_mla_kq_mask_type(cparams),
+            n_sparse_kv,
+            n_direct_sparse_batch,
+            n_direct_sparse_stream);
+    const int64_t direct_sparse_prefill_max_tokens = llama_glm_dsa_direct_sparse_prefill_max_tokens();
+    const int64_t dense_sparse_mask_limit = llama_glm_dsa_dense_sparse_mask_max_bytes();
+    const bool direct_sparse_enabled = llama_glm_dsa_direct_sparse_attn_enabled();
+    const bool direct_sparse_prefill_enabled = llama_glm_dsa_direct_sparse_prefill_enabled();
+    const bool direct_sparse_kq_b_ok = kq_b == nullptr;
+    const bool direct_sparse_sinks_ok = sinks == nullptr;
+    const bool direct_sparse_alibi_ok = hparams.f_max_alibi_bias == 0.0f;
+    const bool direct_sparse_soft_cap_ok = !hparams.attn_soft_cap;
+    const bool backend_sparse_supported =
+            llama_glm_dsa_layer_backend_supports_native_sparse(layer_backend_device_types, il);
+    const bool backend_compact_supported =
+            llama_glm_dsa_layer_backend_supports_compact_flash(layer_backend_device_types, il);
+    const bool verification_batch = llama_glm_dsa_verification_batch_shape(
+            ubatch,
+            n_direct_sparse_batch,
+            n_direct_sparse_stream);
+    const llama_glm_dsa_sparse_attn_policy sparse_policy = llama_glm_dsa_choose_sparse_attn_policy(
+            n_direct_sparse_batch,
+            n_direct_sparse_stream,
+            n_sparse_kv,
+            n_sparse_top_k,
+            ubatch.n_tokens,
+            verification_batch,
+            direct_sparse_prefill_max_tokens,
+            dense_sparse_mask_bytes,
+            dense_sparse_mask_limit,
+            direct_sparse_enabled,
+            direct_sparse_prefill_enabled,
+            llama_glm_dsa_unproven_large_direct_sparse_prefill_enabled(),
+            cparams.flash_attn,
+            backend_sparse_supported,
+            backend_compact_supported,
+            llama_glm_dsa_compact_flash_attn_disabled(),
+            kq_mask == nullptr,
+            direct_sparse_kq_b_ok,
+            direct_sparse_sinks_ok,
+            direct_sparse_alibi_ok,
+            direct_sparse_soft_cap_ok);
+
+    llama_glm_dsa_log_direct_sparse_decision(
+            il,
+            ubatch.n_tokens,
+            n_direct_sparse_batch,
+            n_direct_sparse_stream,
+            n_sparse_kv,
+            n_sparse_top_k,
+            direct_sparse_prefill_max_tokens,
+            sparse_policy.direct_sparse_decode_max_top_k,
+            dense_sparse_mask_bytes,
+            dense_sparse_mask_limit,
+            sparse_policy.direct_enabled,
+            sparse_policy.prefill_enabled,
+            sparse_policy.decode_shape,
+            sparse_policy.verify_shape,
+            sparse_policy.prefill_shape,
+            sparse_policy.large_prefill_shape,
+            sparse_policy.token_shape_allowed,
+            sparse_policy.backend_sparse_supported,
+            sparse_policy.kq_b_ok,
+            sparse_policy.sinks_ok,
+            sparse_policy.alibi_ok,
+            sparse_policy.soft_cap_ok,
+            sparse_policy.use_direct_sparse_attn(),
+            sparse_policy.phase,
+            sparse_policy.direct_selector_reason);
+
+    llama_glm_dsa_log_compact_flash_policy(
+            il,
+            ubatch.n_tokens,
+            n_sparse_kv,
+            n_sparse_top_k,
+            sparse_policy.direct_sparse_decode_max_top_k,
+            sparse_policy.compact_flash_min_kv,
+            sparse_policy.compact_disabled,
+            sparse_policy.compact_large_decode_top_k,
+            sparse_policy.compact_kv_ok,
+            sparse_policy.compact_candidate,
+            sparse_policy.backend_compact_supported,
+            sparse_policy.flash_attn,
+            sparse_policy.decode_shape,
+            kq_mask == nullptr,
+            sparse_policy.kq_b_ok,
+            sparse_policy.sinks_ok,
+            sparse_policy.alibi_ok,
+            sparse_policy.soft_cap_ok,
+            sparse_policy.use_compact_flash_attn(),
+            sparse_policy.compact_selector_reason);
+
+    if (sparse_policy.use_compact_flash_attn()) {
+        llama_glm_dsa_log_compact_flash_mask(
+                il,
+                kq_mask == nullptr,
+                n_sparse_kv,
+                ubatch.n_tokens,
+                n_direct_sparse_stream,
+                n_sparse_top_k);
+
+        ggml_tensor * cur = build_attn_mha_dsa_compact_flash(q, k, v, top_k_3d, value_projection, kq_scale, il);
+        cb(cur, "kqv_out", il);
+        return finish_attn_value_tail(cur);
+    }
+
+    if (sparse_policy.use_direct_sparse_attn()) {
+        ggml_tensor * cur = build_attn_mha_dsa_sparse(q, k, v, ensure_kq_mask_rows(), top_k_3d, value_projection, kq_scale, il);
+        cb(cur, "kqv_out", il);
+        return finish_attn_value_tail(cur);
+    }
+
+    ensure_kq_mask_rows();
+
+    ggml_tensor * kq_mask_top_k = nullptr;
+    if (llama_glm_dsa_fused_sparse_mask_enabled()) {
+        kq_mask_top_k = ggml_dsa_sparse_mask(ctx0, kq_mask_rows, top_k_3d);
+        cb(kq_mask_top_k, "dsa_sparse_mask_topk", il);
+    } else {
+        // prepare new kq mask - starts filled with -INFINITY
+        ggml_tensor * kq_mask_all = ggml_fill(ctx0, kq_mask, -INFINITY);
+        cb(kq_mask_all, "dsa_sparse_mask_fill", il);
+
+        kq_mask_all = ggml_view_4d(
+                ctx0, kq_mask_all,
+                1, kq_mask_all->ne[0], kq_mask_all->ne[1], kq_mask_all->ne[3],
+                kq_mask_all->nb[0], kq_mask_all->nb[1], kq_mask_all->nb[2], 0);
+
+        ggml_tensor * kq_mask_top_k_values = ggml_get_rows(ctx0, kq_mask_rows, top_k_3d);
+        cb(kq_mask_top_k_values, "dsa_sparse_mask_topk", il);
+
+        kq_mask_top_k = ggml_set_rows(ctx0, kq_mask_all, kq_mask_top_k_values, top_k_3d);
+        cb(kq_mask_top_k, "dsa_sparse_mask_topk", il);
+    }
 
     // reshape to restore the original shape of KQ mask:
     // [1, n_kv, n_batch, n_stream] -> [n_kv, n_batch, 1, n_stream]
     kq_mask_top_k = ggml_view_4d(ctx0, kq_mask_top_k, kq_mask_top_k->ne[1], kq_mask_top_k->ne[2], 1, kq_mask_top_k->ne[3], kq_mask_top_k->nb[2], kq_mask_top_k->nb[3], kq_mask_top_k->nb[3], 0);
 
-    // combine with the original kq mask
-    kq_mask_top_k = ggml_add(ctx0, kq_mask_top_k, kq_mask);
-
-    ggml_tensor * q = q_cur;
-    ggml_tensor * k = mctx_cur->get_k(ctx0, il);
-    ggml_tensor * v = ggml_view_4d(ctx0, k, v_cur->ne[0], k->ne[1], k->ne[2], k->ne[3], k->nb[1], k->nb[2], k->nb[3], 0);
-
-    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask_top_k, sinks, v_mla, kq_scale, il);
+    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask_top_k, sinks, value_projection, kq_scale, il);
     cb(cur, "kqv_out", il);
-
-    if (wo) {
-        cur = build_lora_mm(wo, cur, wo_s);
-    }
-
-    if (wo_b) {
-        cur = ggml_add(ctx0, cur, wo_b);
-    }
-
-    return cur;
+    return finish_attn_value_tail(cur);
 }
 
 ggml_tensor * llm_graph_context::build_attn(
@@ -3014,12 +4380,38 @@ llm_graph_input_attn_k_dsa * llm_graph_context::build_attn_inp_k_dsa() const {
     const auto * mctx_cur = static_cast<const llama_kv_cache_dsa_context *>(mctx);
 
     auto inp = std::make_unique<llm_graph_input_attn_k_dsa>(hparams, cparams, mctx_cur);
+    inp->glm_dsa_compact_decode_mask_eligible = arch == LLM_ARCH_GLM_DSA;
+    inp->compact_decode_mla_mask_omitted = llama_glm_dsa_can_skip_mla_kq_mask_for_compact_decode(
+            hparams,
+            cparams,
+            ubatch,
+            mctx_cur->get_mla(),
+            llama_glm_dsa_all_layer_backends_support_compact_flash(layer_backend_device_types),
+            inp->glm_dsa_compact_decode_mask_eligible);
+    inp->glm_dsa_sparse_attn_route_signature = llama_glm_dsa_sparse_attn_route_signature(
+            hparams,
+            cparams,
+            ubatch,
+            mctx_cur->get_mla(),
+            mctx_cur->get_lid()->get_n_kv_used(),
+            layer_backend_device_types,
+            inp->compact_decode_mla_mask_omitted,
+            inp->glm_dsa_compact_decode_mask_eligible);
 
     {
         inp->self_k_idxs_mla = mctx_cur->get_mla()->build_input_k_idxs(ctx0, ubatch);
 
-        inp->self_kq_mask_mla = build_attn_inp_kq_mask(ctx0, mctx_cur->get_mla(), ubatch, cparams);
-        inp->self_kq_mask_mla_cnv = inp->self_kq_mask_mla;
+        if (!inp->compact_decode_mla_mask_omitted) {
+            inp->self_kq_mask_mla = build_attn_inp_kq_mask(ctx0, mctx_cur->get_mla(), ubatch, cparams);
+            inp->self_kq_mask_mla_cnv = inp->self_kq_mask_mla;
+        } else if (llama_glm_dsa_compact_flash_policy_log_enabled()) {
+            LLAMA_LOG_INFO(
+                    "llama: glm_dsa_compact_flash_mask layer=-1 omitted_mla_kq_mask=1 visible_kv=%u ubatch_tokens=%u streams=%u max_top_k=%u\n",
+                    mctx_cur->get_mla()->get_n_kv(),
+                    ubatch.n_tokens,
+                    cparams.kv_unified ? 1 : ubatch.n_seqs_unq,
+                    std::min<uint32_t>(mctx_cur->get_mla()->get_n_kv(), hparams.indexer_top_k));
+        }
     }
 
     {

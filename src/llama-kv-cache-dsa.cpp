@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <stdexcept>
 
 //
 // llama_kv_cache_dsa
@@ -25,12 +26,32 @@ llama_kv_cache_dsa::llama_kv_cache_dsa(
            llama_swa_type   swa_type,
     const layer_filter_cb & filter,
     const  layer_reuse_cb & reuse) :
-    hparams_lid(model.hparams), n_stream(unified ? 1 : n_seq_max) {
+    hparams_mla(model.hparams),
+    hparams_lid(model.hparams),
+    n_stream(unified ? 1 : n_seq_max) {
 
     LLAMA_LOG_INFO("%s: creating main KV cache, size = %u cells\n", __func__, kv_size);
 
+    if (model.arch == LLM_ARCH_GLM_DSA) {
+        const uint32_t n_embd_head_k_cache = model.hparams.n_lora_kv + model.hparams.n_rot();
+        if (n_embd_head_k_cache == 0) {
+            throw std::runtime_error("GLM_DSA MLA KV cache key width must be positive");
+        }
+
+        // GLM-DSA stores compressed MLA keys as one KV head:
+        // [kv_lora_rank + rope_dim, 1, n_tokens].
+        std::fill(hparams_mla.n_head_kv_arr.begin(), hparams_mla.n_head_kv_arr.end(), 1);
+        hparams_mla.n_embd_head_k_full = n_embd_head_k_cache;
+        LLAMA_LOG_INFO(
+                "%s: GLM_DSA MLA KV cache key width = %u (kv_lora_rank = %u, rope_dim = %u)\n",
+                __func__,
+                n_embd_head_k_cache,
+                model.hparams.n_lora_kv,
+                model.hparams.n_rot());
+    }
+
     kv_mla = std::make_unique<llama_kv_cache>(
-            model, model.hparams, type_k, type_v,
+            model, hparams_mla, type_k, type_v,
             v_trans, offload, unified, kv_size, n_seq_max, n_pad,
             n_swa, swa_type, nullptr, filter, reuse, nullptr);
 
