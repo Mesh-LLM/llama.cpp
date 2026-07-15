@@ -2819,6 +2819,116 @@ template [[host_name("kernel_gated_delta_net_f32_2")]] kernel kernel_gated_delta
 template [[host_name("kernel_gated_delta_net_f32_4")]] kernel kernel_gated_delta_net_t kernel_gated_delta_net_impl<float4, 4>;
 #endif
 
+static inline float lightning_indexer_mask(
+        constant ggml_metal_kargs_lightning_indexer & args,
+        device const char * mask,
+        int i_kv,
+        int i_batch,
+        int i_stream) {
+    const int i_mask_stream = i_stream % args.ne33;
+    device const half * value = (device const half *) (
+        mask + i_kv * args.nb30 + i_batch * args.nb31 + i_mask_stream * args.nb33);
+    return float(*value);
+}
+
+template<typename K>
+kernel void kernel_lightning_indexer_impl(
+        constant ggml_metal_kargs_lightning_indexer & args,
+        device const char * q,
+        device const char * k,
+        device const char * weights,
+        device const char * mask,
+        device       char * dst,
+        uint3 gid [[thread_position_in_grid]]) {
+    const int i_kv = gid.x;
+    const int i_batch = gid.y;
+    const int i_stream = gid.z;
+
+    if (i_kv >= args.ne0 || i_batch >= args.ne1 || i_stream >= args.ne3) {
+        return;
+    }
+
+    float score = 0.0f;
+    for (int i_head = 0; i_head < args.ne01; ++i_head) {
+        float qk = 0.0f;
+        for (int i_embd = 0; i_embd < args.ne00; ++i_embd) {
+            device const float * q_ptr = (device const float *) (
+                q + i_embd * args.nb00 + i_head * args.nb01 + i_batch * args.nb02 + i_stream * args.nb03);
+            device const K * k_ptr = (device const K *) (
+                k + i_embd * args.nb10 + i_kv * args.nb12 + i_stream * args.nb13);
+            qk += *q_ptr * float(*k_ptr);
+        }
+
+        device const float * weight_ptr = (device const float *) (
+            weights + i_head * args.nb20 + i_batch * args.nb21 + i_stream * args.nb23);
+        score += max(qk, 0.0f) * *weight_ptr;
+    }
+
+    device float * dst_ptr = (device float *) (
+        dst + i_kv * args.nb0 + i_batch * args.nb1 + i_stream * args.nb3);
+    *dst_ptr = score + lightning_indexer_mask(args, mask, i_kv, i_batch, i_stream);
+}
+
+template<typename K, short epb, void (*deq_t4)(device const K *, short, thread float4 &)>
+kernel void kernel_lightning_indexer_quantized_impl(
+        constant ggml_metal_kargs_lightning_indexer & args,
+        device const char * q,
+        device const char * k,
+        device const char * weights,
+        device const char * mask,
+        device       char * dst,
+        uint3 gid [[thread_position_in_grid]]) {
+    const int i_kv = gid.x;
+    const int i_batch = gid.y;
+    const int i_stream = gid.z;
+
+    if (i_kv >= args.ne0 || i_batch >= args.ne1 || i_stream >= args.ne3) {
+        return;
+    }
+
+    device const char * k_row = k + i_kv * args.nb12 + i_stream * args.nb13;
+
+    float score = 0.0f;
+    for (int i_head = 0; i_head < args.ne01; ++i_head) {
+        float qk = 0.0f;
+        for (int i_embd = 0; i_embd < args.ne00; i_embd += 4) {
+            device const K * k_block = (device const K *) (
+                k_row + (i_embd / epb) * args.nb10);
+            float4 k_values;
+            deq_t4(k_block, short((i_embd % epb) / 4), k_values);
+
+            device const float4 * q_values = (device const float4 *) (
+                q + i_embd * args.nb00 + i_head * args.nb01 +
+                i_batch * args.nb02 + i_stream * args.nb03);
+            qk += dot(*q_values, k_values);
+        }
+
+        device const float * weight_ptr = (device const float *) (
+            weights + i_head * args.nb20 + i_batch * args.nb21 + i_stream * args.nb23);
+        score += max(qk, 0.0f) * *weight_ptr;
+    }
+
+    device float * dst_ptr = (device float *) (
+        dst + i_kv * args.nb0 + i_batch * args.nb1 + i_stream * args.nb3);
+    *dst_ptr = score + lightning_indexer_mask(args, mask, i_kv, i_batch, i_stream);
+}
+
+typedef decltype(kernel_lightning_indexer_impl<float>) kernel_lightning_indexer_t;
+typedef decltype(kernel_lightning_indexer_quantized_impl<block_q4_0, QK4_0, dequantize_q4_0_t4>)
+    kernel_lightning_indexer_quantized_t;
+
+template [[host_name("kernel_lightning_indexer_f32")]] kernel kernel_lightning_indexer_t kernel_lightning_indexer_impl<float>;
+template [[host_name("kernel_lightning_indexer_f16")]] kernel kernel_lightning_indexer_t kernel_lightning_indexer_impl<half>;
+#if defined(GGML_METAL_HAS_BF16)
+template [[host_name("kernel_lightning_indexer_bf16")]] kernel kernel_lightning_indexer_t kernel_lightning_indexer_impl<bfloat>;
+#endif
+template [[host_name("kernel_lightning_indexer_q8_0")]] kernel kernel_lightning_indexer_quantized_t kernel_lightning_indexer_quantized_impl<block_q8_0, QK8_0, dequantize_q8_0_t4>;
+template [[host_name("kernel_lightning_indexer_q5_1")]] kernel kernel_lightning_indexer_quantized_t kernel_lightning_indexer_quantized_impl<block_q5_1, QK5_1, dequantize_q5_1_t4>;
+template [[host_name("kernel_lightning_indexer_q5_0")]] kernel kernel_lightning_indexer_quantized_t kernel_lightning_indexer_quantized_impl<block_q5_0, QK5_0, dequantize_q5_0_t4>;
+template [[host_name("kernel_lightning_indexer_q4_1")]] kernel kernel_lightning_indexer_quantized_t kernel_lightning_indexer_quantized_impl<block_q4_1, QK4_1, dequantize_q4_1_t4>;
+template [[host_name("kernel_lightning_indexer_q4_0")]] kernel kernel_lightning_indexer_quantized_t kernel_lightning_indexer_quantized_impl<block_q4_0, QK4_0, dequantize_q4_0_t4>;
+template [[host_name("kernel_lightning_indexer_iq4_nl")]] kernel kernel_lightning_indexer_quantized_t kernel_lightning_indexer_quantized_impl<block_iq4_nl, QK4_NL, dequantize_iq4_nl_t4>;
+
 constant short FC_solve_tri_nsg [[function_constant(FC_SOLVE_TRI + 0)]];
 constant short FC_solve_tri_n   [[function_constant(FC_SOLVE_TRI + 1)]];
 constant short FC_solve_tri_k   [[function_constant(FC_SOLVE_TRI + 2)]];

@@ -1272,6 +1272,28 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
             return true;
         case GGML_OP_GATED_DELTA_NET:
             return has_simdgroup_reduction && op->src[2]->ne[0] % 32 == 0;
+        case GGML_OP_LIGHTNING_INDEXER:
+            {
+                const enum ggml_type k_type = op->src[1]->type;
+                const bool k_type_supported =
+                    k_type == GGML_TYPE_F32 ||
+                    k_type == GGML_TYPE_F16 ||
+                    (k_type == GGML_TYPE_BF16 && has_bfloat) ||
+                    k_type == GGML_TYPE_Q8_0 ||
+                    k_type == GGML_TYPE_Q5_1 ||
+                    k_type == GGML_TYPE_Q5_0 ||
+                    k_type == GGML_TYPE_Q4_1 ||
+                    k_type == GGML_TYPE_Q4_0 ||
+                    k_type == GGML_TYPE_IQ4_NL;
+
+                return op->type == GGML_TYPE_F32 &&
+                    op->src[0]->type == GGML_TYPE_F32 &&
+                    k_type_supported &&
+                    op->src[2]->type == GGML_TYPE_F32 &&
+                    op->src[3]->type == GGML_TYPE_F16 &&
+                    ggml_is_contiguous_rows(op->src[0]) &&
+                    ggml_is_contiguous_rows(op->src[1]);
+            }
         case GGML_OP_SOLVE_TRI:
         case GGML_OP_MUL_MAT:
         case GGML_OP_MUL_MAT_ID:
