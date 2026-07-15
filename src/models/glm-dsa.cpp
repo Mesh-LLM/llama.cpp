@@ -1,4 +1,54 @@
+#include "llama-kv-cache-dsa.h"
 #include "models.h"
+
+// https://huggingface.co/zai-org/GLM-5.2/blob/main/config.json#L26
+const std::array<uint32_t, LLAMA_MAX_LAYERS> GLM_DSA_DEFAULT_INDEXER_TYPES = {
+    1, 1, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1,
+    0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0,
+};
+
+static void load_indexer_types(llama_model_loader & ml, llama_hparams & hparams) {
+    hparams.is_indexer_full_impl = GLM_DSA_DEFAULT_INDEXER_TYPES;
+
+    const std::string key    = ml.llm_kv(LLM_KV_ATTENTION_INDEXER_TYPES);
+    const int         key_id = gguf_find_key(ml.metadata, key.c_str());
+    if (key_id < 0) {
+        return;
+    }
+    if (gguf_get_kv_type(ml.metadata, key_id) != GGUF_TYPE_ARRAY) {
+        throw std::runtime_error(key + " must be an array");
+    }
+
+    const enum gguf_type element_type = gguf_get_arr_type(ml.metadata, key_id);
+    if (element_type == GGUF_TYPE_STRING) {
+        std::vector<std::string> values;
+        ml.get_arr(LLM_KV_ATTENTION_INDEXER_TYPES, values);
+        if (values.size() != hparams.n_layer()) {
+            throw std::runtime_error(format("%s has wrong array length; expected %u, got %u", key.c_str(),
+                                            hparams.n_layer(), static_cast<uint32_t>(values.size())));
+        }
+        for (uint32_t il = 0; il < hparams.n_layer(); ++il) {
+            if (values[il] == "full") {
+                hparams.is_indexer_full_impl[il] = 1;
+            } else if (values[il] == "shared") {
+                hparams.is_indexer_full_impl[il] = 0;
+            } else {
+                throw std::runtime_error(format("%s[%u] must be 'full' or 'shared'", key.c_str(), il));
+            }
+        }
+        return;
+    }
+
+    if (element_type != GGUF_TYPE_BOOL && element_type != GGUF_TYPE_UINT32 && element_type != GGUF_TYPE_INT32) {
+        throw std::runtime_error(key + " must contain strings, bools, or 32-bit integers");
+    }
+    ml.get_key_or_arr(LLM_KV_ATTENTION_INDEXER_TYPES, hparams.is_indexer_full_impl, hparams.n_layer(), false);
+    for (uint32_t il = 0; il < hparams.n_layer(); ++il) {
+        if (hparams.is_indexer_full_impl[il] > 1) {
+            throw std::runtime_error(format("%s[%u] must be 0 or 1", key.c_str(), il));
+        }
+    }
+}
 
 void llama_model_glm_dsa::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_EXPERT_FEED_FORWARD_LENGTH,     hparams.n_ff_exp);
@@ -36,8 +86,13 @@ void llama_model_glm_dsa::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_NEXTN_PREDICT_LAYERS, hparams.n_layer_nextn, false);
     GGML_ASSERT(hparams.n_layer_nextn < hparams.n_layer_all && "n_layer_nextn must be < n_layer_impl");
 
+    load_indexer_types(ml, hparams);
+    if (!hparams.is_indexer_full(0)) {
+        throw std::runtime_error("GLM-DSA indexer schedule must start with a full layer");
+    }
+
     switch (hparams.n_layer()) {
-        case 79: type = LLM_TYPE_744B_A40B; break;
+        case 78: type = LLM_TYPE_744B_A40B; break;
         default: type = LLM_TYPE_UNKNOWN;
     }
 }

@@ -237,6 +237,12 @@ class GlmMoeDsaModel(DeepseekV2Model):
         self.gguf_writer.add_indexer_head_count(self.hparams["index_n_heads"])
         self.gguf_writer.add_indexer_key_length(self.hparams["index_head_dim"])
         self.gguf_writer.add_indexer_top_k(self.hparams["index_topk"])
+        if (indexer_types := self.hparams.get("indexer_types")) is not None:
+            if len(indexer_types) != self.hparams["num_hidden_layers"]:
+                raise ValueError("indexer_types must contain one entry per target layer")
+            if invalid := set(indexer_types) - {"full", "shared"}:
+                raise ValueError(f"unsupported indexer_types values: {sorted(invalid)}")
+            self.gguf_writer.add_indexer_types([indexer_type == "full" for indexer_type in indexer_types])
 
 
 @ModelBase.register("SolarOpenForCausalLM")
