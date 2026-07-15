@@ -1161,6 +1161,75 @@ void ggml_set_f32_nd(const struct ggml_tensor * tensor, int i0, int i1, int i2, 
 
 // ggml_compute_forward_mul_mat
 
+static bool ggml_compute_forward_mul_mat_precise_ref_type(enum ggml_type type) {
+    return ggml_is_quantized(type) || type == GGML_TYPE_F16 || type == GGML_TYPE_BF16;
+}
+
+static float ggml_compute_forward_mul_mat_precise_ref_dot(const struct ggml_type_traits * traits,
+                                                          const void *                    weight,
+                                                          const float *                   activation,
+                                                          float *                         row,
+                                                          int64_t                         n_input) {
+    traits->to_float(weight, row, n_input);
+
+    double sum = 0.0;
+    for (int64_t input = 0; input < n_input; ++input) {
+        sum += (double) row[input] * (double) activation[input];
+    }
+    return (float) sum;
+}
+
+static bool ggml_compute_forward_mul_mat_precise_ref(const struct ggml_compute_params * params,
+                                                     struct ggml_tensor *               dst) {
+    const struct ggml_tensor * src0 = dst->src[0];
+    const struct ggml_tensor * src1 = dst->src[1];
+
+    if (!params->use_ref || src1->type != GGML_TYPE_F32 || !ggml_compute_forward_mul_mat_precise_ref_type(src0->type)) {
+        return false;
+    }
+
+    GGML_ASSERT(src0->ne[0] == src1->ne[0]);
+    GGML_ASSERT(dst->ne[0] == src0->ne[1]);
+    GGML_ASSERT(dst->ne[1] == src1->ne[1]);
+    GGML_ASSERT(dst->ne[2] == src1->ne[2]);
+    GGML_ASSERT(dst->ne[3] == src1->ne[3]);
+    GGML_ASSERT(src1->ne[2] % src0->ne[2] == 0);
+    GGML_ASSERT(src1->ne[3] % src0->ne[3] == 0);
+
+    const struct ggml_type_traits * traits = ggml_get_type_traits(src0->type);
+    GGML_ASSERT(traits->to_float != NULL);
+
+    const int64_t n_input   = src0->ne[0];
+    const int64_t n_output  = dst->ne[0];
+    const int64_t n_columns = dst->ne[1];
+    const int64_t n_tasks   = ggml_nelements(dst);
+    const int64_t r2        = src1->ne[2] / src0->ne[2];
+    const int64_t r3        = src1->ne[3] / src0->ne[3];
+
+    float * row = (float *) malloc(n_input * sizeof(float));
+    GGML_ASSERT(row != NULL);
+
+    for (int64_t task = params->ith; task < n_tasks; task += params->nth) {
+        const int64_t output = task % n_output;
+        int64_t       rest   = task / n_output;
+        const int64_t column = rest % n_columns;
+        rest /= n_columns;
+        const int64_t i2 = rest % dst->ne[2];
+        const int64_t i3 = rest / dst->ne[2];
+
+        const void * weight =
+            (const char *) src0->data + output * src0->nb[1] + (i2 / r2) * src0->nb[2] + (i3 / r3) * src0->nb[3];
+        const float * activation =
+            (const float *) ((const char *) src1->data + column * src1->nb[1] + i2 * src1->nb[2] + i3 * src1->nb[3]);
+        float * result = (float *) ((char *) dst->data + output * dst->nb[0] + column * dst->nb[1] + i2 * dst->nb[2] +
+                                    i3 * dst->nb[3]);
+        *result        = ggml_compute_forward_mul_mat_precise_ref_dot(traits, weight, activation, row, n_input);
+    }
+
+    free(row);
+    return true;
+}
+
 static void ggml_compute_forward_mul_mat_one_chunk(
     const struct ggml_compute_params * params,
     struct ggml_tensor * dst,
@@ -1254,6 +1323,9 @@ static void ggml_compute_forward_mul_mat_one_chunk(
 void ggml_compute_forward_mul_mat(
         const struct ggml_compute_params * params,
               struct ggml_tensor * dst) {
+    if (ggml_compute_forward_mul_mat_precise_ref(params, dst)) {
+        return;
+    }
 
     const struct ggml_tensor * src0 = dst->src[0];
     const struct ggml_tensor * src1 = dst->src[1];
@@ -1523,6 +1595,56 @@ static void ggml_compute_forward_mul_mat_id_one_chunk(
     }
 }
 
+static bool ggml_compute_forward_mul_mat_id_precise_ref(const struct ggml_compute_params * params,
+                                                        struct ggml_tensor *               dst) {
+    const struct ggml_tensor * src0 = dst->src[0];
+    const struct ggml_tensor * src1 = dst->src[1];
+    const struct ggml_tensor * ids  = dst->src[2];
+
+    if (!params->use_ref || src1->type != GGML_TYPE_F32 || !ggml_compute_forward_mul_mat_precise_ref_type(src0->type)) {
+        return false;
+    }
+
+    GGML_ASSERT(src0->ne[0] == src1->ne[0]);
+    GGML_ASSERT(dst->ne[0] == src0->ne[1]);
+    GGML_ASSERT(dst->ne[1] == ids->ne[0]);
+    GGML_ASSERT(dst->ne[2] == ids->ne[1]);
+    GGML_ASSERT(src1->ne[1] == 1 || src1->ne[1] == ids->ne[0]);
+    GGML_ASSERT(src1->ne[2] == ids->ne[1]);
+    GGML_ASSERT(src0->ne[3] == 1 && src1->ne[3] == 1 && dst->ne[3] == 1);
+
+    const struct ggml_type_traits * traits = ggml_get_type_traits(src0->type);
+    GGML_ASSERT(traits->to_float != NULL);
+
+    const int64_t n_input  = src0->ne[0];
+    const int64_t n_output = src0->ne[1];
+    const int64_t n_ids    = ids->ne[0];
+    const int64_t n_tokens = ids->ne[1];
+    const int64_t n_tasks  = n_output * n_ids * n_tokens;
+
+    float * row = (float *) malloc(n_input * sizeof(float));
+    GGML_ASSERT(row != NULL);
+
+    for (int64_t task = params->ith; task < n_tasks; task += params->nth) {
+        const int64_t output  = task % n_output;
+        const int64_t rest    = task / n_output;
+        const int64_t id      = rest % n_ids;
+        const int64_t token   = rest / n_ids;
+        const int64_t src1_id = src1->ne[1] == 1 ? 0 : id;
+        const int32_t expert  = *(const int32_t *) ((const char *) ids->data + id * ids->nb[0] + token * ids->nb[1]);
+        GGML_ASSERT(expert >= 0 && expert < src0->ne[2]);
+
+        const void *  weight = (const char *) src0->data + output * src0->nb[1] + expert * src0->nb[2];
+        const float * activation =
+            (const float *) ((const char *) src1->data + src1_id * src1->nb[1] + token * src1->nb[2]);
+        float * result = (float *) ((char *) dst->data + output * dst->nb[0] + id * dst->nb[1] + token * dst->nb[2]);
+        *result        = ggml_compute_forward_mul_mat_precise_ref_dot(traits, weight, activation, row, n_input);
+    }
+
+    free(row);
+    return true;
+}
+
 static void * incr_ptr_aligned(void ** p, size_t size, size_t align) {
 
     void * ptr = *p;
@@ -1534,6 +1656,9 @@ static void * incr_ptr_aligned(void ** p, size_t size, size_t align) {
 static void ggml_compute_forward_mul_mat_id(
         const struct ggml_compute_params * params,
               struct ggml_tensor * dst) {
+    if (ggml_compute_forward_mul_mat_id_precise_ref(params, dst)) {
+        return;
+    }
 
     const struct ggml_tensor * src0 = dst->src[0];
     const struct ggml_tensor * src1 = dst->src[1];

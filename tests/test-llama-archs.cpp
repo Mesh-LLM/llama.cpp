@@ -10,7 +10,10 @@
 // TODO: replace with #include "llama-ext.h" in the future
 #include "../src/llama-arch.h"
 #include "../src/llama-model-saver.h"
+#include "../src/llama-model.h"
 
+#include <algorithm>
+#include <array>
 #include <cinttypes>
 #include <cstddef>
 #include <cstdio>
@@ -77,7 +80,7 @@ static std::vector<llama_token> get_tokens(const uint32_t n_tokens, const uint32
     return ret;
 }
 
-static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
+static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const bool glm_string_indexer_types = false) {
     gguf_context_ptr ret(gguf_init_empty());
     llama_model_saver ms(arch, ret.get());
     const uint32_t n_ctx = 128;
@@ -101,12 +104,16 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
         n_layer = 22; // hparams.n_layer_kv_from_start = 20 is hardcoded
     } else if (arch == LLM_ARCH_DEEPSEEK2
             || arch == LLM_ARCH_DEEPSEEK32
-            || arch == LLM_ARCH_GLM_DSA
             || arch == LLM_ARCH_KIMI_LINEAR
             || arch == LLM_ARCH_MISTRAL4) {
         n_embd = 128;
         n_head = 1;
         n_ff   = 192;
+    } else if (arch == LLM_ARCH_GLM_DSA) {
+        n_embd  = 128;
+        n_head  = 1;
+        n_ff    = 192;
+        n_layer = 7; // cover the default Full/Shared cadence through the second full indexer
     } else if (arch == LLM_ARCH_NEMOTRON_H || arch == LLM_ARCH_NEMOTRON_H_MOE) {
         n_layer = 3;
     } else if (arch == LLM_ARCH_CHAMELEON) {
@@ -199,6 +206,10 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
     ms.add_kv(LLM_KV_ATTENTION_INDEXER_HEAD_COUNT, uint32_t(1));
     ms.add_kv(LLM_KV_ATTENTION_INDEXER_KEY_LENGTH, uint32_t(64));
     ms.add_kv(LLM_KV_ATTENTION_INDEXER_TOP_K,      uint32_t(8));
+    if (arch == LLM_ARCH_GLM_DSA && glm_string_indexer_types) {
+        ms.add_kv(LLM_KV_ATTENTION_INDEXER_TYPES,
+                std::vector<std::string>({ "full", "full", "full", "shared", "shared", "shared", "full" }));
+    }
     ms.add_kv(LLM_KV_ROPE_DIMENSION_SECTIONS, std::vector<uint32_t>({n_embd_head/4, n_embd_head/4, n_embd_head/4, n_embd_head/4}));
     ms.add_kv(LLM_KV_TOKENIZER_MODEL,         "no_vocab");
     // ms.add_kv(LLM_KV_DENSE_2_FEAT_OUT,     n_embd);
@@ -252,9 +263,55 @@ static bool silent_model_load_progress(float /*progress*/, void * /*user_data*/)
     return true;
 }
 
+struct glm_decode_observer {
+    int      lightning_indexer_count  = 0;
+    int      k_selected_count         = 0;
+    int      v_selected_count         = 0;
+    int64_t  selected_rows            = 0;
+    uint64_t lightning_indexer_layers = 0;
+};
+
+static bool observe_glm_decode(ggml_tensor * tensor, bool ask, void * user_data) {
+    if (!ask) {
+        return true;
+    }
+
+    auto * observer = static_cast<glm_decode_observer *>(user_data);
+    if (tensor->op == GGML_OP_LIGHTNING_INDEXER) {
+        ++observer->lightning_indexer_count;
+        uint32_t il = 0;
+        if (sscanf(tensor->name, "indexer_score-%u", &il) == 1 && il < 64) {
+            observer->lightning_indexer_layers |= 1ULL << il;
+        }
+    } else if (tensor->op == GGML_OP_GET_ROWS && strstr(tensor->name, "k_selected")) {
+        ++observer->k_selected_count;
+        observer->selected_rows = tensor->ne[1];
+    } else if (tensor->op == GGML_OP_GET_ROWS && strstr(tensor->name, "v_selected")) {
+        ++observer->v_selected_count;
+    }
+    return false;
+}
+
+static void require_glm_decode_observed(const glm_decode_observer & observer) {
+    constexpr uint64_t full_indexer_layers = (1ULL << 0) | (1ULL << 1) | (1ULL << 2) | (1ULL << 6);
+    GGML_ASSERT(observer.lightning_indexer_count >= 12);
+    GGML_ASSERT(observer.lightning_indexer_count % 4 == 0);
+    GGML_ASSERT(observer.lightning_indexer_layers == full_indexer_layers);
+    GGML_ASSERT(observer.k_selected_count == 14);
+    GGML_ASSERT(observer.v_selected_count == 14);
+    GGML_ASSERT(observer.selected_rows == 8);
+}
+
+static bool has_metal_device(const std::vector<ggml_backend_dev_t> & devices) {
+    return std::any_of(devices.begin(), devices.end(), [](ggml_backend_dev_t device) {
+        return strncmp(ggml_backend_dev_name(device), "MTL", 3) == 0;
+    });
+}
+
 static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
         struct gguf_context * gguf_ctx, FILE * file, const size_t seed, const std::vector<ggml_backend_dev_t> & devs,
-        const llama_split_mode split_mode = LLAMA_SPLIT_MODE_LAYER, bool encode = false) {
+        const llama_split_mode split_mode = LLAMA_SPLIT_MODE_LAYER, bool encode = false,
+        glm_decode_observer * decode_observer = nullptr) {
     GGML_ASSERT((gguf_ctx == nullptr) != (file == nullptr));
     llama_model_params model_params = llama_model_default_params();
     model_params.progress_callback = silent_model_load_progress;
@@ -270,6 +327,10 @@ static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
     if (!encode) {
         ctx_params.n_ubatch = 64;
     }
+    if (decode_observer) {
+        ctx_params.cb_eval = observe_glm_decode;
+        ctx_params.cb_eval_user_data = decode_observer;
+    }
 
     size_t tmp = seed;
     llama_model_ptr model(gguf_ctx != nullptr ?
@@ -278,24 +339,60 @@ static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
     if (!model) {
         throw std::runtime_error("failed to create llama model");
     }
+    if (model->arch == LLM_ARCH_GLM_DSA) {
+        static constexpr std::array<bool, 7> expected = { true, true, true, false, false, false, true };
+        GGML_ASSERT(model->hparams.n_layer() == expected.size());
+        for (uint32_t il = 0; il < expected.size(); ++il) {
+            GGML_ASSERT(model->hparams.is_indexer_full(il) == expected[il]);
+        }
+    }
     llama_context_ptr lctx(llama_init_from_model(model.get(), ctx_params));
     if (!lctx) {
         throw std::runtime_error("failed to create llama context");
     }
+    if (decode_observer) {
+        *decode_observer = {};
+    }
     return std::make_pair(std::move(model), std::move(lctx));
 }
 
-static std::vector<float> get_logits(
-        llama_model * model, llama_context * lctx, const std::vector<llama_token> & tokens, bool encode = false) {
-    const uint32_t n_vocab  = llama_vocab_n_tokens(llama_model_get_vocab(model));
-    const uint32_t n_ctx    = llama_n_ctx(lctx);
-    const uint32_t n_tokens = tokens.size();
+static void test_glm_indexer_metadata_compatibility(const size_t seed) {
+    {
+        gguf_context_ptr gguf_ctx = get_gguf_ctx(LLM_ARCH_GLM_DSA, true);
+        auto model_and_ctx = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, {});
+        GGML_ASSERT(model_and_ctx.first);
+        GGML_ASSERT(model_and_ctx.second);
+    }
+
+    {
+        gguf_context_ptr gguf_ctx = get_gguf_ctx(LLM_ARCH_GLM_DSA, true);
+        static constexpr std::array<bool, 7> indexer_types = { true, true, true, false, false, false, true };
+        const std::string key = std::string(llm_arch_name(LLM_ARCH_GLM_DSA)) + ".attention.indexer.types";
+        gguf_set_arr_data(gguf_ctx.get(), key.c_str(), GGUF_TYPE_BOOL, indexer_types.data(), indexer_types.size());
+        auto model_and_ctx = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, {});
+        GGML_ASSERT(model_and_ctx.first);
+        GGML_ASSERT(model_and_ctx.second);
+    }
+
+    {
+        gguf_context_ptr gguf_ctx = get_gguf_ctx(LLM_ARCH_GLM_DSA, true, true);
+        auto model_and_ctx = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, {});
+        GGML_ASSERT(model_and_ctx.first);
+        GGML_ASSERT(model_and_ctx.second);
+    }
+}
+
+static void append_logits(
+        llama_model * model, llama_context * lctx, const std::vector<llama_token> & tokens,
+        uint32_t begin, uint32_t end, bool encode, std::vector<float> & logits) {
+    const uint32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
+    const uint32_t n_ctx   = llama_n_ctx(lctx);
     llama_batch batch = llama_batch_init(n_ctx, 0, 1);
-    GGML_ASSERT(n_tokens <= n_ctx);
-    for (uint32_t pos = 0; pos < n_tokens; pos++) {
+    GGML_ASSERT(begin < end && end <= n_ctx);
+    for (uint32_t pos = begin; pos < end; pos++) {
         common_batch_add(batch, tokens[pos], pos, {0}, true);
     }
-    batch.n_tokens = n_tokens;
+    batch.n_tokens = end - begin;
     if (encode) {
         if (llama_encode(lctx, batch)) {
             llama_batch_free(batch);
@@ -307,15 +404,29 @@ static std::vector<float> get_logits(
         throw std::runtime_error("failed to decode batch");
     }
 
-    std::vector<float> ret;
-    ret.reserve(n_tokens*n_vocab);
-    for (uint32_t i = 0; i < n_tokens; i++) {
+    for (int32_t i = 0; i < batch.n_tokens; i++) {
         const float * logits_ith = llama_get_logits_ith(lctx, i);
         for (uint32_t j = 0; j < n_vocab; j++) {
-            ret.push_back(logits_ith[j]);
+            logits.push_back(logits_ith[j]);
         }
     }
     llama_batch_free(batch);
+}
+
+static std::vector<float> get_logits(
+        llama_model * model, llama_context * lctx, const std::vector<llama_token> & tokens, bool encode = false) {
+    const uint32_t n_tokens = tokens.size();
+    std::vector<float> ret;
+    ret.reserve(n_tokens*llama_vocab_n_tokens(llama_model_get_vocab(model)));
+
+    const bool dsa_decode = model->arch == LLM_ARCH_GLM_DSA || model->arch == LLM_ARCH_DEEPSEEK32;
+    if (dsa_decode && !encode && n_tokens >= 3) {
+        append_logits(model, lctx, tokens, 0, n_tokens - 2, false, ret);
+        append_logits(model, lctx, tokens, n_tokens - 2, n_tokens - 1, false, ret);
+        append_logits(model, lctx, tokens, n_tokens - 1, n_tokens, false, ret);
+    } else {
+        append_logits(model, lctx, tokens, 0, n_tokens, encode, ret);
+    }
     return ret;
 }
 
@@ -497,6 +608,10 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const gg
         ud->original_logger.callback(level_eff, text, ud->original_logger.user_data);
     }, &ud);
 
+    if (target_arch == LLM_ARCH_UNKNOWN || target_arch == LLM_ARCH_GLM_DSA) {
+        test_glm_indexer_metadata_compatibility(seed);
+    }
+
     const std::vector<llama_token> tokens = get_tokens(128, 128, seed);
 
     struct device_config {
@@ -573,9 +688,10 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const gg
                 continue;
             }
             const std::string config_name = moe ? "MoE" : "Dense";
-            gguf_context_ptr gguf_ctx = get_gguf_ctx(arch, moe);
+            gguf_context_ptr gguf_ctx = get_gguf_ctx(arch, moe, arch == LLM_ARCH_GLM_DSA);
             std::pair<llama_model_ptr, llama_context_ptr> model_and_ctx_cpu;
             std::vector<float> logits_cpu;
+            glm_decode_observer decode_observer_cpu;
             for (device_config & dc : dev_configs) {
                 // print test config first; should anything fail during model loading or inference, at least we know which test case caused it
                 printf(template_row_cfg.c_str(),
@@ -584,6 +700,7 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const gg
 
                 std::pair<llama_model_ptr, llama_context_ptr> model_and_ctx_dev;
                 std::vector<float> logits_dev;
+                glm_decode_observer decode_observer_dev;
                 std::string status_nmse      = "\033[1;33mSKIP\033[0m";
                 std::string status_roundtrip = "\033[1;33mSKIP\033[0m";
                 char nmse_str[12] = {0};
@@ -593,12 +710,23 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const gg
 #endif // GGML_USE_WEBGPU
                 if (!skip) {
                     if (logits_cpu.empty()) {
-                        model_and_ctx_cpu = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, {}, LLAMA_SPLIT_MODE_LAYER, encode);
+                        model_and_ctx_cpu = get_model_and_ctx(
+                                gguf_ctx.get(), nullptr, seed, {}, LLAMA_SPLIT_MODE_LAYER, encode,
+                                arch == LLM_ARCH_GLM_DSA ? &decode_observer_cpu : nullptr);
                         logits_cpu = get_logits(model_and_ctx_cpu.first.get(), model_and_ctx_cpu.second.get(), tokens, encode);
+                        if (arch == LLM_ARCH_GLM_DSA) {
+                            require_glm_decode_observed(decode_observer_cpu);
+                        }
                     }
                     if (dc.split_mode != LLAMA_SPLIT_MODE_TENSOR || llm_arch_supports_sm_tensor(arch)) {
-                        model_and_ctx_dev = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, dc.devs, dc.split_mode, encode);
+                        const bool expect_compact_decode = arch == LLM_ARCH_GLM_DSA && has_metal_device(dc.devs);
+                        model_and_ctx_dev = get_model_and_ctx(
+                                gguf_ctx.get(), nullptr, seed, dc.devs, dc.split_mode, encode,
+                                expect_compact_decode ? &decode_observer_dev : nullptr);
                         logits_dev = get_logits(model_and_ctx_dev.first.get(), model_and_ctx_dev.second.get(), tokens, encode);
+                        if (expect_compact_decode) {
+                            require_glm_decode_observed(decode_observer_dev);
+                        }
                         const double nmse_val = nmse(logits_cpu, logits_dev);
                         snprintf(nmse_str, sizeof(nmse_str), "(%.2e)", nmse_val);
                         status_nmse = "\033[1;32mOK\033[0m";
@@ -619,9 +747,16 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const gg
                         ms.save(file);
                         rewind(file);
 
-                        auto model_and_ctx_roundtrip = get_model_and_ctx(nullptr, file, seed, dc.devs, dc.split_mode, encode);
+                        glm_decode_observer decode_observer_roundtrip;
+                        const bool expect_compact_decode = arch == LLM_ARCH_GLM_DSA && has_metal_device(dc.devs);
+                        auto model_and_ctx_roundtrip = get_model_and_ctx(
+                                nullptr, file, seed, dc.devs, dc.split_mode, encode,
+                                expect_compact_decode ? &decode_observer_roundtrip : nullptr);
                         const std::vector<float> logits_roundtrip = get_logits(
                             model_and_ctx_roundtrip.first.get(), model_and_ctx_roundtrip.second.get(), tokens, encode);
+                        if (expect_compact_decode) {
+                            require_glm_decode_observed(decode_observer_roundtrip);
+                        }
                         status_roundtrip = "\033[1;32mOK\033[0m";
                         GGML_ASSERT(logits_roundtrip.size() == logits_dev.size());
                         for (size_t i = 0; i < logits_roundtrip.size(); i++) {

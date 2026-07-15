@@ -401,6 +401,9 @@ llama_model_glm_dsa::graph::graph(const llama_model & model, const llm_graph_par
 
                     // mask indexer scores
                     ggml_tensor * indexer_kq_mask = inp_attn_dsa->get_kq_mask_lid();
+                    if (indexer_kq_mask->type != indexer_score->type) {
+                        indexer_kq_mask = ggml_cast(ctx0, indexer_kq_mask, indexer_score->type);
+                    }
                     indexer_score                 = ggml_add(ctx0, indexer_score, indexer_kq_mask);
                     cb(indexer_score, "indexer_score", il);
                 }
