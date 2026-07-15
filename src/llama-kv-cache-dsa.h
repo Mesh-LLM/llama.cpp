@@ -72,7 +72,8 @@ public:
     llama_kv_cache * get_lid() const;
 
 private:
-    // we keep indexer KV cache hparams instance here as llama_kv_cache stores only reference to it
+    // We keep private hparams instances because llama_kv_cache stores references to them.
+    llama_hparams hparams_mla;
     llama_hparams hparams_lid;
     const uint32_t n_stream  = 1;
 
